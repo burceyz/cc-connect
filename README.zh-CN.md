@@ -444,6 +444,8 @@ cc-connect update           # 稳定版
 cc-connect update --pre     # 含预发布版本
 ```
 
+`ipc-bridge` 分支新增了[原会话 IPC 接续](docs/session-ipc.zh-CN.md)。使用此扩展的部署，升级时需保留分支补丁和 App Server 配置，并重新核对 IPC 能力及两种收件路径。
+
 
 ## 📊 支持状态
 

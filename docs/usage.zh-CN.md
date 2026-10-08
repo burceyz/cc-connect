@@ -24,6 +24,7 @@ cc-connect 完整功能使用指南。
 - [多工作区模式](#多工作区模式)
 - [Web 管理后台（Beta）](#web-管理后台beta)
 - [Bridge — 外部适配器接入（Beta）](#bridge--外部适配器接入beta)
+- [原会话 IPC（ipc-bridge 分支）](#原会话-ipcipc-bridge-分支)
 - [配置参考](#配置参考)
 
 ---
@@ -1060,6 +1061,12 @@ WebSocket 支持双向通信 —— 向 Agent 发送消息，并实时接收 Age
 |------|---------|--------|
 | 管理后台（Web UI + API） | 9820 | `[management]` |
 | Bridge（WebSocket + REST） | 9810 | `[bridge]` |
+
+---
+
+## 原会话 IPC（ipc-bridge 分支）
+
+本分支通过本机私有 Unix API，把后台任务通知送回固定的 Codex 会话：空闲时恢复原 thread，活跃时向当前 turn 追加输入。配置、目标绑定、持久回执、收件确认和升级验证见[原会话 IPC 接续](session-ipc.zh-CN.md)。
 
 ---
 
