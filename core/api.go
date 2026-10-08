@@ -36,6 +36,9 @@ type APIServer struct {
 	// expansion + envelope). Defaults to DefaultMaxAttachmentSize.
 	maxAttachmentBytes int64
 	mu                 sync.RWMutex
+	ipcMu              sync.Mutex
+	ipcDir             string
+	ipcBoot            string
 }
 
 // SendRequest is the JSON body for POST /send.
@@ -105,6 +108,15 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	s.mux.HandleFunc("/relay/send", s.handleRelaySend)
 	s.mux.HandleFunc("/relay/bind", s.handleRelayBind)
 	s.mux.HandleFunc("/relay/binding", s.handleRelayBinding)
+	if err := s.initSessionIPC(filepath.Join(dataDir, "session-ipc")); err != nil {
+		_ = listener.Close()
+		_ = os.Remove(sockPath)
+		return nil, err
+	}
+	s.mux.HandleFunc("/ipc/health", s.handleIPCHealth)
+	s.mux.HandleFunc("/ipc/target", s.handleIPCTarget)
+	s.mux.HandleFunc("/ipc/event", s.handleIPCEvent)
+	s.mux.HandleFunc("/ipc/ack", s.handleIPCAck)
 
 	return s, nil
 }

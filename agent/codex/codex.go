@@ -118,6 +118,9 @@ func normalizeBackend(raw string) string {
 	}
 }
 
+// SupportsLiveInput reports the configured capability without starting a model.
+func (a *Agent) SupportsLiveInput() bool { return a.backend == "app_server" }
+
 func normalizeAppServerURL(raw string) string {
 	url := strings.TrimSpace(raw)
 	if url == "" {

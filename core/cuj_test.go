@@ -1127,6 +1127,7 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	defer e.cancel()
 
 	msg := &Message{
 		SessionKey: "test:img", Platform: "test", MessageID: "img1",
@@ -1142,7 +1143,9 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 		agent.mu.Lock()
 		n := len(agent.sessions)
 		agent.mu.Unlock()
-		if n > 0 {
+		// Session creation precedes Send and asynchronous history persistence.
+		// Wait for the visible reply and released turn before TempDir cleanup.
+		if n > 0 && len(plat.getSent()) > 0 && !e.sessions.GetOrCreateActive(msg.SessionKey).Busy() {
 			break
 		}
 		select {
@@ -1191,6 +1194,7 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	defer e.cancel()
 
 	msg := &Message{
 		SessionKey: "test:file", Platform: "test", MessageID: "f1",
@@ -1206,7 +1210,8 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 		agent.mu.Lock()
 		n := len(agent.sessions)
 		agent.mu.Unlock()
-		if n > 0 {
+		// Do not remove the temporary store while the turn is still saving it.
+		if n > 0 && len(plat.getSent()) > 0 && !e.sessions.GetOrCreateActive(msg.SessionKey).Busy() {
 			return
 		}
 		select {

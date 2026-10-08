@@ -3740,6 +3740,9 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}()
 
 	if e.ctx.Err() != nil {
+		if msg.OnAgentInput != nil {
+			msg.OnAgentInput(e.ctx.Err())
+		}
 		return
 	}
 
@@ -3782,6 +3785,9 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	defer stopRecallMonitor()
 
 	if state.agentSession == nil {
+		if msg.OnAgentInput != nil {
+			msg.OnAgentInput(fmt.Errorf("agent session failed to start"))
+		}
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
 		return
 	}
@@ -3852,11 +3858,21 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	// EventPermissionRequest while blocked — the event loop must run in parallel.
 	sendDone := make(chan error, 1)
 	go func() {
+		finishInput := func(err error) {
+			if msg.OnAgentInput != nil {
+				msg.OnAgentInput(err)
+			}
+			sendDone <- err
+		}
 		if as == nil {
-			sendDone <- fmt.Errorf("agent session became nil")
+			finishInput(fmt.Errorf("agent session became nil"))
 			return
 		}
-		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+		if msg.ExpectedAgentSessionID != "" && as.CurrentSessionID() != msg.ExpectedAgentSessionID {
+			finishInput(fmt.Errorf("ipc target session changed before input"))
+			return
+		}
+		finishInput(as.Send(promptContent, msg.MessageID, msg.Images, msg.Files))
 	}()
 
 	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
