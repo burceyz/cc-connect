@@ -68,6 +68,9 @@ func New(opts map[string]any) (core.Agent, error) {
 	mode = normalizeMode(mode)
 	backend = normalizeBackend(backend)
 	appServerURL = normalizeAppServerURL(appServerURL)
+	if backend == "app_server" && appServerURL != "stdio://" {
+		return nil, fmt.Errorf("codex: app_server backend requires app_server_url=stdio; socket transports are not supported by this adapter")
+	}
 
 	cmd, cliExtraArgs := core.ParseCmdOpts(opts, "codex")
 
@@ -123,10 +126,9 @@ func (a *Agent) SupportsLiveInput() bool { return a.backend == "app_server" }
 
 func normalizeAppServerURL(raw string) string {
 	url := strings.TrimSpace(raw)
-	if url == "" {
-		return "ws://127.0.0.1:3845"
-	}
-	if strings.EqualFold(url, "stdio") {
+	// This adapter exchanges JSONL over the child's stdin/stdout. A socket
+	// listener cannot reply on those pipes and would time out at initialize.
+	if url == "" || strings.EqualFold(url, "stdio") || strings.EqualFold(url, "stdio://") {
 		return "stdio://"
 	}
 	return url
@@ -505,7 +507,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 
 	if backend == "app_server" {
-		return newAppServerSession(ctx, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
+		return newAppServerSession(ctx, cliBin, cliExtraArgs, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
 	}
 	if codexHome != "" {
 		extraEnv = append(extraEnv, "CODEX_HOME="+codexHome)

@@ -669,6 +669,53 @@ func TestCUJ_G1_LLMFailureSurfacesErrorToUser(t *testing.T) {
 	}
 }
 
+func TestCUJ_G1_RetryAfterStartupFailureResumesOriginal(t *testing.T) {
+	env := newCUJEnv(t)
+	var mu sync.Mutex
+	calls := 0
+	env.engine.agent = &controllableAgent{
+		startSessionFn: func(_ context.Context, id string) (AgentSession, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			calls++
+			if calls == 2 || calls == 3 {
+				return nil, errors.New("app-server initialize timed out")
+			}
+			s := newCUJAgentSession()
+			if calls == 1 {
+				s.reply = "Remembered the original conversation."
+			} else if id == "cuj-agent-session" {
+				s.reply = "Resumed the original conversation."
+			} else {
+				s.reply = "Started without the original conversation."
+			}
+			return s, nil
+		},
+	}
+	key := env.userSends("startup-retry", "remember this conversation")
+	waitIdle := func() {
+		env.waitFor("turn to release the session", 3*time.Second, func() bool {
+			return !env.engine.sessions.GetOrCreateActive(key).Busy()
+		})
+	}
+	env.waitFor("initial reply", 3*time.Second, func() bool { return env.sentContains("Remembered") })
+	waitIdle()
+	env.userSends("startup-retry", "/stop")
+	env.plat.clearSent()
+	env.userSends("startup-retry", "continue while the server is unavailable")
+	env.waitFor("startup failure reply", 3*time.Second, func() bool {
+		return env.sentContains("failed to start") || env.sentContains("❌")
+	})
+	waitIdle()
+	env.plat.clearSent()
+	env.userSends("startup-retry", "retry after the server recovers")
+	env.waitFor("retry reply", 3*time.Second, func() bool { return len(env.plat.getSent()) > 0 })
+	waitIdle()
+	if !env.sentContains("Resumed the original conversation.") {
+		t.Fatalf("retry lost the user's conversation: %v", env.plat.getSent())
+	}
+}
+
 // ===========================================================================
 // CUJ-E2 · A cron job created (programmatically by the agent or directly
 // via the store) shows up in /cron output for the same SessionKey.

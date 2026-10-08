@@ -7884,6 +7884,32 @@ func TestResumeFallback_ClearsStaleSessionID(t *testing.T) {
 	}
 }
 
+func TestResumeFallback_PreservesOriginalWhenBothStartsFail(t *testing.T) {
+	agent := &controllableAgent{
+		startSessionFn: func(_ context.Context, _ string) (AgentSession, error) {
+			return nil, errors.New("app-server initialize timed out")
+		},
+	}
+	p := &stubPlatformEngine{n: "test"}
+	store := filepath.Join(t.TempDir(), "sessions.json")
+	e := NewEngine("test", agent, []Platform{p}, store, LangEnglish)
+	session := e.sessions.GetOrCreateActive("test:user1")
+	session.SetAgentSessionID("original-thread", agent.Name())
+	e.sessions.Save()
+
+	state := e.getOrCreateInteractiveStateWith("test:user1", p, "ctx", session, e.sessions, nil, "")
+	if state.agentSession != nil {
+		t.Fatal("failed startup must not produce a live agent session")
+	}
+	if got := session.GetAgentSessionID(); got != "original-thread" {
+		t.Fatalf("original binding lost after startup failure: %q", got)
+	}
+	reloaded := NewSessionManager(store)
+	if got := reloaded.GetOrCreateActive("test:user1").GetAgentSessionID(); got != "original-thread" {
+		t.Fatalf("persisted original binding lost after startup failure: %q", got)
+	}
+}
+
 // TestStaleGoroutineCleanup_RaceSimulation simulates the full race scenario:
 // old turn still processing → /new creates new Session → new turn starts →
 // old turn exits and calls cleanup. Verifies the new state survives.
