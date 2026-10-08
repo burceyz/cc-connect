@@ -238,13 +238,23 @@ func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []stri
 	return s, nil
 }
 
+// appServerListenURL returns an empty value for stdio transports so the
+// subprocess continues serving the adapter's stdin/stdout pipes. A socket
+// listener would leave those pipes unresponsive (see #1781).
+func appServerListenURL(url string) string {
+	listenURL := strings.TrimSpace(url)
+	if strings.EqualFold(listenURL, "stdio://") || strings.EqualFold(listenURL, "stdio") {
+		return ""
+	}
+	return listenURL
+}
+
 func (s *appServerSession) connect() error {
-	transport := normalizeAppServerURL(s.url)
-	if transport != "stdio://" {
+	if appServerListenURL(normalizeAppServerURL(s.url)) != "" {
 		return fmt.Errorf("codex app-server: stdin/stdout transport requires app_server_url=stdio")
 	}
-	args := append([]string(nil), s.cliExtraArgs...)
-	args = append(args, "app-server", "--listen", transport)
+	// Omit --listen for stdio, matching upstream's CLI compatibility fix.
+	args := []string{"app-server"}
 	if model := strings.TrimSpace(s.model); model != "" {
 		args = append(args, "-c", fmt.Sprintf("model=%q", model))
 	}
@@ -257,10 +267,11 @@ func (s *appServerSession) connect() error {
 	if baseURL := strings.TrimSpace(s.baseURL); baseURL != "" {
 		args = append(args, "-c", fmt.Sprintf("openai_base_url=%q", baseURL))
 	}
-	bin := s.cliBin
-	if bin == "" {
-		bin = "codex"
+	bin, err := resolveCodexExecutable(s.cliBin)
+	if err != nil {
+		return fmt.Errorf("codex app-server resolve CLI: %w", err)
 	}
+	args = append(append([]string(nil), s.cliExtraArgs...), args...)
 	cmd := exec.CommandContext(s.ctx, bin, args...)
 	cmd.Dir = s.workDir
 	env := append([]string(nil), s.extraEnv...)

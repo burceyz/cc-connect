@@ -161,6 +161,38 @@ func TestIPC_IdleResumesPinnedSessionAndAcknowledges(t *testing.T) {
 	if ipcReceipt(t, api, input.EventID).AcknowledgedAt == "" {
 		t.Fatal("no explicit ack")
 	}
+	session := e.sessions.GetOrCreateActive(input.Target.SessionKey)
+	deadline = time.Now().Add(2 * time.Second)
+	for session.Busy() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if session.Busy() {
+		t.Fatal("completed IPC turn did not release its session lock")
+	}
+}
+
+func TestIPC_IdleReplyTargetFailureReleasesSessionLock(t *testing.T) {
+	api, e, as, input := ipcFixture(t, false)
+	// A platform without reply-context reconstruction must reject delivery
+	// without leaving the session locked against subsequent user input.
+	e.platforms = []Platform{&stubPlatformEngine{n: "test"}}
+	session := e.sessions.GetOrCreateActive(input.Target.SessionKey)
+	updatedAt := session.UpdatedAt
+	ipcPost(t, api.handleIPCEvent, input)
+	if receipt := ipcReceipt(t, api, input.EventID); receipt.Status != "blocked" || receipt.Code != "ipc_reply_target_unavailable" {
+		t.Fatalf("unexpected receipt: %+v", receipt)
+	}
+	if session.Busy() || !session.UpdatedAt.Equal(updatedAt) {
+		t.Fatal("rejected IPC delivery left a lock or updated conversation activity")
+	}
+	if len(as.input) != 0 {
+		t.Fatal("rejected IPC delivery reached the agent")
+	}
+	gen, locked := session.TryLock()
+	if !locked {
+		t.Fatal("next turn cannot acquire the session")
+	}
+	session.UnlockWithoutUpdate(gen)
 }
 
 func TestIPC_PinRejectsProjectThreadSessionAndDirectoryChanges(t *testing.T) {
@@ -199,7 +231,7 @@ func TestIPC_BusyUnsupportedWaitsWithoutSendingThenIdleStarts(t *testing.T) {
 		t.Fatal("busy input was not retained")
 	}
 	e.interactiveStates[input.Target.SessionKey].agentSession = as
-	e.sessions.GetOrCreateActive(input.Target.SessionKey).Unlock()
+	e.sessions.GetOrCreateActive(input.Target.SessionKey).ForceUnlock()
 	ipcPost(t, api.handleIPCEvent, input)
 	select {
 	case <-as.input:

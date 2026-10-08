@@ -19,7 +19,7 @@ func TestAppServerStartup_StdIOAndConfiguredCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, transport := range []string{"", "stdio", "stdio://"} {
+	for _, transport := range []string{"", "stdio", "stdio://", " STDIO ", "STDIO://"} {
 		t.Run("transport="+transport, func(t *testing.T) {
 			dir := t.TempDir()
 			argsFile := filepath.Join(dir, "args.json")
@@ -55,7 +55,7 @@ func TestAppServerStartup_StdIOAndConfiguredCommand(t *testing.T) {
 			if err := json.Unmarshal(data, &got); err != nil {
 				t.Fatal(err)
 			}
-			want := []string{"argument with spaces", "app-server", "--listen", "stdio://"}
+			want := []string{"argument with spaces", "app-server"}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("child arguments = %q, want %q", got, want)
 			}

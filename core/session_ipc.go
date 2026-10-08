@@ -288,13 +288,14 @@ func (s *APIServer) finishIPC(id, status, method, turn, code string) {
 }
 
 func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput) {
-	if !session.TryLock() {
+	lockGen, locked := session.TryLock()
+	if !locked {
 		s.steerIPC(e, input)
 		return
 	}
 	// Revalidate after obtaining the idle-session lease; no implicit /switch.
 	if _, current, err := s.resolveIPCTarget(&input.Target, false); err != nil || current != session {
-		session.UnlockWithoutUpdate()
+		session.UnlockWithoutUpdate(lockGen)
 		s.finishIPC(input.EventID, "blocked", "", "", "ipc_target_changed")
 		return
 	}
@@ -307,13 +308,13 @@ func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput) {
 	}
 	rc, ok := platform.(ReplyContextReconstructor)
 	if !ok {
-		session.UnlockWithoutUpdate()
+		session.UnlockWithoutUpdate(lockGen)
 		s.finishIPC(input.EventID, "blocked", "", "", "ipc_reply_target_unavailable")
 		return
 	}
 	replyCtx, err := rc.ReconstructReplyCtx(input.Target.SessionKey)
 	if err != nil {
-		session.UnlockWithoutUpdate()
+		session.UnlockWithoutUpdate(lockGen)
 		s.finishIPC(input.EventID, "blocked", "", "", "ipc_reply_target_unavailable")
 		return
 	}
@@ -331,7 +332,7 @@ func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput) {
 		},
 	}
 	e.ensureInteractiveStateForQueueing(input.Target.SessionKey, platform, replyCtx)
-	go e.processInteractiveMessage(platform, msg, session)
+	go e.processInteractiveMessage(platform, msg, session, lockGen)
 }
 
 func (s *APIServer) steerIPC(e *Engine, input IPCInput) {
