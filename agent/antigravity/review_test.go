@@ -50,13 +50,18 @@ func TestAgyReviewHelper(t *testing.T) {
 	if json.NewDecoder(os.Stdin).Decode(&request) != nil || request.Protocol != agyReviewProtocol {
 		os.Exit(2)
 	}
-	if request.Op != "begin" && request.Op != "check" {
+	if request.Op != "begin" && request.Op != "check" && request.Op != "bind" && request.Op != "refresh" {
 		os.Exit(2)
 	}
 	_ = os.WriteFile(filepath.Join(dir, "review-"+request.Op+".json"), mustJSON(request), 0o600)
 	_ = os.WriteFile(filepath.Join(dir, "review-args.json"), mustJSON(os.Args), 0o600)
 	response := map[string]any{"protocol": agyReviewProtocol, "task_id": request.TaskID}
-	if request.Op == "begin" {
+	if request.Op == "bind" || request.Op == "refresh" {
+		taskDir := filepath.Join(dir, "tasks", request.TaskID)
+		response["task_dir"], response["manifest_path"] = taskDir, filepath.Join(taskDir, "manifest.json")
+		response["instructions"] = "FIXED REVIEW INSTRUCTIONS"
+		response["status"], response["allow_publish"] = "pending_review", false
+	} else if request.Op == "begin" {
 		if textSHA256(request.RequestText) != request.RequestSHA256 || (request.EventID != "") != request.Continuation {
 			os.Exit(2)
 		}
@@ -158,7 +163,8 @@ func TestAgyReviewPendingKeepsCandidatePrivateAndAllowsCallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	event, streamed := terminalEvent(t, session)
-	if event.Type != core.EventError || streamed != "" || event.Content != "" || !strings.Contains(event.Error.Error(), "等待 Hermes 复核") || !session.Alive() {
+	if event.Type != core.EventPending || streamed != "" || event.Content != "" || event.Pending == nil ||
+		event.Pending.Stage != "review_waiting" || !session.Alive() {
 		t.Fatalf("pending leaked candidate or closed session: %+v, %q", event, streamed)
 	}
 	setReviewMode(t, dir, "same-task")
@@ -190,10 +196,11 @@ func TestAgyReviewMissingManifestDoesNotClaimHermesWasDispatched(t *testing.T) {
 	if err := session.Send("original task", "", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	event, streamed := terminalEvent(t, session)
-	if event.Type != core.EventError || event.Error == nil ||
-		!strings.Contains(event.Error.Error(), "manifest.json 尚未写入") ||
-		!strings.Contains(event.Error.Error(), "Hermes 尚未派发") ||
+	// Missing materials now allow two bounded repair runs. Account for all
+	// three helper processes, including the race runtime's exit delay.
+	event, streamed := recoveryTerminalEvent(t, session)
+	if event.Type != core.EventPending || event.Pending == nil ||
+		event.Pending.Stage != "preparation" || event.Pending.Code != "manifest_missing" ||
 		event.Content != "" || streamed != "" {
 		t.Fatalf("missing manifest was reported as dispatched review or leaked candidate: %+v, %q", event, streamed)
 	}
@@ -233,7 +240,7 @@ func TestAgyReviewRejectsMissingOrIncompleteFinalResponse(t *testing.T) {
 				t.Fatal(err)
 			}
 			event, streamed := terminalEvent(t, session)
-			if event.Type != core.EventError || event.Error == nil || event.Content != "" || streamed != "" || !session.Alive() {
+			if (event.Type != core.EventError && event.Type != core.EventPending) || event.Content != "" || streamed != "" || !session.Alive() {
 				t.Fatalf("incomplete response escaped the gate: %+v, %q", event, streamed)
 			}
 			if _, err := os.Stat(filepath.Join(dir, "review-check.json")); !os.IsNotExist(err) {
@@ -371,6 +378,9 @@ func TestAgyReviewUsesArgvAndBoundsExecution(t *testing.T) {
 }
 
 func TestAgyOptionsValidateEffortAndReviewArgv(t *testing.T) {
+	if _, err := New(map[string]any{"cmd": os.Args[0], "review_command": []string{filepath.Join(t.TempDir(), "missing-gate")}}); err == nil {
+		t.Fatal("missing configured gate was accepted at startup")
+	}
 	for _, input := range []any{nil, "", "low", "medium", "high", " High "} {
 		if _, err := parseAgyEffort(input); err != nil {
 			t.Fatalf("valid effort %v: %v", input, err)

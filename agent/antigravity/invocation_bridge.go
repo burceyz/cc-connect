@@ -51,6 +51,7 @@ type agyRun struct {
 	inputs        map[string]*agyQueuedInput
 	order         []string
 	reviewTask    *agyReviewTask
+	reviewRepairs int
 }
 
 func newAgyRun(ctx context.Context, cancel context.CancelFunc, expectedID string) (*agyRun, error) {

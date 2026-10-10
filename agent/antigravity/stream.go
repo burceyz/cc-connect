@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -109,6 +110,17 @@ func (s *agyStream) handleLine(line []byte) error {
 		}
 		s.session.chatID.Store(id)
 		s.session.emit(core.Event{Type: core.EventText, SessionID: id, ToolName: event.Init.Model})
+		if len(s.session.reviewCommand) > 0 {
+			s.run.mu.Lock()
+			task := s.run.reviewTask
+			s.run.mu.Unlock()
+			if task == nil {
+				return fmt.Errorf("antigravity: review task is unavailable at init")
+			}
+			if err := s.session.syncReview(s.run.ctx, task, id, "bind", event.Init.Model); err != nil {
+				return err
+			}
+		}
 	case "step_update":
 		if event.Step == nil {
 			return fmt.Errorf("antigravity: step payload is missing")
@@ -322,14 +334,23 @@ func (as *antigravitySession) readLoop(run *agyRun, cmd *exec.Cmd, stdout io.Rea
 		}
 	}
 	if streamErr == nil && len(as.reviewCommand) > 0 {
-		result.Response, streamErr = stream.reviewCandidate()
+		for _, step := range stream.auxiliary {
+			if !step.done {
+				streamErr = fmt.Errorf("antigravity: review auxiliary step is incomplete; candidate withheld")
+				break
+			}
+		}
 	}
-	as.completeRun(run, result, streamErr)
+	var candidateErr error
+	if streamErr == nil && len(as.reviewCommand) > 0 {
+		result.Response, candidateErr = stream.reviewCandidate()
+	}
+	as.completeRun(run, result, streamErr, candidateErr)
 }
 
 // completeRun is the only path that can publish a candidate answer. A configured
 // completion-review gate runs here before the terminal event is constructed.
-func (as *antigravitySession) completeRun(run *agyRun, result agyResult, err error) {
+func (as *antigravitySession) completeRun(run *agyRun, result agyResult, err, candidateErr error) {
 	run.end(as.ctx.Err() != nil)
 	run.mu.Lock()
 	accepted := run.inputAccepted
@@ -341,8 +362,36 @@ func (as *antigravitySession) completeRun(run *agyRun, result agyResult, err err
 	if err == nil && len(as.reviewCommand) > 0 {
 		if task == nil {
 			err = fmt.Errorf("antigravity: review task is unavailable; candidate withheld")
+		} else if task.revision != "" {
+			var finalized string
+			finalized, err = as.finalizeReview(run.ctx, task, result.ConversationID)
+			if err == nil {
+				result.Response = finalized
+			} else {
+				var pending *agyReviewPending
+				if errors.As(err, &pending) && candidateErr == nil {
+					manifest, readErr := readReviewManifest(task.manifestPath)
+					changed := readErr == nil && textSHA256(string(manifest)) != task.manifestSHA
+					if changed || pending.code == "candidate_revision_required" || pending.code == "candidate_materials_changed" {
+						err = as.checkReview(run.ctx, task, result.ConversationID, result.Response)
+					}
+				}
+			}
+		} else if candidateErr != nil {
+			err = &agyReviewPending{code: "candidate_missing", stage: "preparation", repair: true, instructions: task.instructions}
 		} else {
 			err = as.checkReview(run.ctx, task, result.ConversationID, result.Response)
+		}
+	}
+	var pending *agyReviewPending
+	if errors.As(err, &pending) && task != nil {
+		continued, repairErr := as.continueReviewRun(run, task, pending)
+		if continued {
+			return
+		}
+		if repairErr != nil {
+			err = repairErr
+			pending = nil
 		}
 	}
 	run.acceptOnce.Do(func() { run.accepted <- err })
@@ -351,6 +400,11 @@ func (as *antigravitySession) completeRun(run *agyRun, result agyResult, err err
 		as.activeRun = nil
 	}
 	as.startMu.Unlock()
+	if pending != nil {
+		as.emit(core.Event{Type: core.EventPending, SessionID: result.ConversationID,
+			Pending: &core.PendingInfo{TaskID: task.taskID, Reviewer: "Hermes", Stage: pending.stage, Code: pending.code}})
+		return
+	}
 	if err != nil {
 		// Core's EventError path ends a turn while keeping this session alive.
 		// EventResult.Error alone is not a completion gate in the engine.
@@ -360,5 +414,9 @@ func (as *antigravitySession) completeRun(run *agyRun, result agyResult, err err
 	event := core.Event{Type: core.EventResult, SessionID: result.ConversationID, Done: true,
 		InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens, CacheReadInputTokens: result.Usage.CacheReadTokens}
 	event.Content = result.Response
+	if task != nil && task.revision != "" {
+		event.Metadata = map[string]any{"verified_review": map[string]any{
+			"reviewer": "Hermes", "task_id": task.taskID, "revision": task.revision}}
+	}
 	as.emit(event)
 }

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -22,6 +23,8 @@ import (
 const agyReviewProtocol = "cc-connect-review-gate-v1"
 
 var errAgyReviewGateBusy = errors.New("antigravity: review gate is busy before task acquisition")
+
+var reviewCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,99}$`)
 
 type agyReviewOrigin struct {
 	Project    string `json:"project"`
@@ -35,6 +38,70 @@ type agyReviewTask struct {
 	manifestPath string
 	instructions string
 	origin       agyReviewOrigin
+	revision     string
+	candidateSHA string
+	manifestSHA  string
+}
+
+type agyReviewResponse struct {
+	Protocol        string   `json:"protocol"`
+	TaskID          string   `json:"task_id"`
+	TaskDir         string   `json:"task_dir"`
+	ManifestPath    string   `json:"manifest_path"`
+	Instructions    string   `json:"instructions"`
+	Revision        string   `json:"revision"`
+	CandidateSHA256 string   `json:"candidate_sha256"`
+	ManifestSHA256  string   `json:"manifest_sha256"`
+	CandidatePath   string   `json:"candidate_path"`
+	Status          string   `json:"status"`
+	AllowPublish    *bool    `json:"allow_publish"`
+	Reasons         []string `json:"reasons"`
+}
+
+// A pending review ends the current execution turn without publishing a draft.
+// Only explicitly recoverable author/material errors start an internal repair.
+type agyReviewPending struct {
+	code         string
+	stage        string
+	instructions string
+	repair       bool
+}
+
+func (p *agyReviewPending) Error() string { return "antigravity: review pending: " + p.code }
+
+func pendingReview(response agyReviewResponse) *agyReviewPending {
+	code := "review_pending"
+	if len(response.Reasons) > 0 && reviewCodePattern.MatchString(response.Reasons[0]) {
+		code = response.Reasons[0]
+	}
+	p := &agyReviewPending{code: code, stage: "review_waiting", instructions: response.Instructions}
+	switch code {
+	case "manifest_missing", "candidate_missing", "candidate_decision_missing", "candidate_revision_required",
+		"candidate_materials_changed", "dorothy_response_missing", "dorothy_response_invalid_json", "dorothy_response_binding_mismatch",
+		"dorothy_review_not_read", "dorothy_findings_not_answered", "dorothy_response_schema_mismatch",
+		"manifest_schema_mismatch", "manifest_task_mismatch", "explicit_manifest_mode_required",
+		"independent_judgment_missing", "invalid_manifest_files", "invalid_manifest_file",
+		"artifact_hash_mismatch", "source_changed_after_review", "hermes_launch_failed":
+		p.stage, p.repair = "preparation", true
+	case "hermes_changes_or_unresolved", "prior_findings_not_verified", "dorothy_findings_unresolved",
+		"dorothy_resolution_requires_review":
+		p.stage, p.repair = "changes_required", true
+	default:
+		if response.Status == "blocked" {
+			p.stage = "changes_required"
+		}
+	}
+	return p
+}
+
+func isReviewResumeRequest(prompt string) bool {
+	prompt = strings.ToLower(strings.Trim(strings.TrimSpace(prompt), "。！!？?，,；; ."))
+	switch prompt {
+	case "继续", "继续执行", "继续执行任务", "继续完成", "继续完成任务", "接着做", "重试", "重试一下",
+		"继续刚才的任务", "继续上一个任务", "continue", "resume", "retry":
+		return true
+	}
+	return false
 }
 
 func (t *agyReviewTask) Env() []string {
@@ -129,6 +196,11 @@ func (as *antigravitySession) reviewOrigin() (agyReviewOrigin, error) {
 }
 
 func (as *antigravitySession) beginReview(ctx context.Context, prompt, eventID, conversationID string) (*agyReviewTask, error) {
+	resume := eventID == "" && conversationID != "" && isReviewResumeRequest(prompt)
+	return as.beginReviewRequest(ctx, prompt, eventID, conversationID, resume)
+}
+
+func (as *antigravitySession) beginReviewRequest(ctx context.Context, prompt, eventID, conversationID string, resume bool) (*agyReviewTask, error) {
 	origin, err := as.reviewOrigin()
 	if err != nil {
 		return nil, err
@@ -147,19 +219,16 @@ func (as *antigravitySession) beginReview(ctx context.Context, prompt, eventID, 
 		Continuation   bool            `json:"continuation"`
 		EventID        string          `json:"event_id"`
 		ConversationID string          `json:"conversation_id"`
-	}{agyReviewProtocol, "begin", id, origin, prompt, textSHA256(prompt), eventID != "", eventID, conversationID}
-	var response struct {
-		Protocol     string   `json:"protocol"`
-		TaskID       string   `json:"task_id"`
-		TaskDir      string   `json:"task_dir"`
-		ManifestPath string   `json:"manifest_path"`
-		Instructions string   `json:"instructions"`
-		Status       string   `json:"status"`
-		AllowPublish *bool    `json:"allow_publish"`
-		Reasons      []string `json:"reasons"`
-	}
+		Resume         bool            `json:"resume"`
+	}{agyReviewProtocol, "begin", id, origin, prompt, textSHA256(prompt), eventID != "", eventID, conversationID, resume}
+	var response agyReviewResponse
 	if err := as.callReview(ctx, request, &response, 5*time.Second); err != nil {
 		return nil, fmt.Errorf("antigravity: review begin failed: %w", err)
+	}
+	if resume && response.Protocol == agyReviewProtocol && response.TaskID == id &&
+		response.AllowPublish != nil && !*response.AllowPublish && response.Status == "blocked" &&
+		len(response.Reasons) == 1 && response.Reasons[0] == "no_pending_review" {
+		return as.beginReviewRequest(ctx, prompt, eventID, conversationID, false)
 	}
 	if response.Protocol == agyReviewProtocol && response.TaskID == id && response.Status == "pending_review" &&
 		response.AllowPublish != nil && !*response.AllowPublish && response.TaskDir == "" && response.ManifestPath == "" &&
@@ -169,11 +238,11 @@ func (as *antigravitySession) beginReview(ctx context.Context, prompt, eventID, 
 	if response.Protocol != agyReviewProtocol || response.TaskID == "" || len(response.TaskID) > 256 ||
 		strings.ContainsAny(response.TaskID, "\r\n\x00") || !filepath.IsAbs(response.TaskDir) ||
 		response.ManifestPath != filepath.Join(response.TaskDir, "manifest.json") ||
-		(eventID == "" && response.TaskID != id) || response.AllowPublish == nil || *response.AllowPublish {
+		(eventID == "" && !resume && response.TaskID != id) || response.AllowPublish == nil || *response.AllowPublish {
 		return nil, fmt.Errorf("antigravity: invalid review begin response")
 	}
 	if response.Status == "blocked" {
-		return nil, fmt.Errorf("antigravity: 复核任务已阻塞，未接纳新输入（任务 %s）", response.TaskID)
+		return nil, fmt.Errorf("antigravity: review begin blocked (%s)", pendingReview(response).code)
 	}
 	if response.Status != "pending_review" {
 		return nil, fmt.Errorf("antigravity: invalid review begin status")
@@ -181,8 +250,50 @@ func (as *antigravitySession) beginReview(ctx context.Context, prompt, eventID, 
 	if len(response.Instructions)+len(prompt) > 63<<10 {
 		return nil, fmt.Errorf("antigravity: review instructions exceed supported size")
 	}
-	return &agyReviewTask{taskID: response.TaskID, taskDir: response.TaskDir, manifestPath: response.ManifestPath,
-		instructions: response.Instructions, origin: origin}, nil
+	task := &agyReviewTask{taskID: response.TaskID, taskDir: response.TaskDir, manifestPath: response.ManifestPath,
+		instructions: response.Instructions, origin: origin}
+	if err := task.update(response); err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+func (t *agyReviewTask) update(response agyReviewResponse) error {
+	if response.Revision != "" {
+		if !agyEventIDPattern.MatchString(response.Revision) || !agyEventIDPattern.MatchString(response.CandidateSHA256) ||
+			!agyEventIDPattern.MatchString(response.ManifestSHA256) {
+			return fmt.Errorf("antigravity: invalid review revision identity")
+		}
+		t.revision, t.candidateSHA, t.manifestSHA = response.Revision, response.CandidateSHA256, response.ManifestSHA256
+	}
+	if response.Instructions != "" {
+		if len(response.Instructions) > 60<<10 {
+			return fmt.Errorf("antigravity: review instructions exceed supported size")
+		}
+		t.instructions = response.Instructions
+	}
+	return nil
+}
+
+func (as *antigravitySession) syncReview(ctx context.Context, task *agyReviewTask, conversationID, op, observedModel string) error {
+	request := map[string]any{"protocol": agyReviewProtocol, "op": op, "task_id": task.taskID,
+		"origin": task.origin, "conversation_id": conversationID}
+	if observedModel != "" && as.model != "" && as.effort != "" {
+		request["runtime_evidence"] = map[string]string{"configured_model": as.model,
+			"observed_model": observedModel, "effort": as.effort, "mode": as.mode}
+	}
+	var response agyReviewResponse
+	if err := as.callReview(ctx, request, &response, 60*time.Second); err != nil {
+		return fmt.Errorf("antigravity: review %s failed: %w", op, err)
+	}
+	if response.Protocol != agyReviewProtocol || response.TaskID != task.taskID || response.AllowPublish == nil ||
+		*response.AllowPublish || response.TaskDir != task.taskDir || response.ManifestPath != task.manifestPath {
+		return fmt.Errorf("antigravity: invalid review %s identity", op)
+	}
+	if response.Status != "pending_review" {
+		return fmt.Errorf("antigravity: review %s blocked (%s)", op, pendingReview(response).code)
+	}
+	return task.update(response)
 }
 
 func appendReviewInstructions(prompt, instructions string) string {
@@ -195,7 +306,7 @@ func appendReviewInstructions(prompt, instructions string) string {
 func (as *antigravitySession) checkReview(ctx context.Context, task *agyReviewTask, conversationID, candidate string) error {
 	manifest, manifestErr := readReviewManifest(task.manifestPath)
 	if manifestErr != nil && !os.IsNotExist(manifestErr) {
-		return fmt.Errorf("antigravity: 无法固定复核材料，候选结果未发布（任务 %s）", task.taskID)
+		return fmt.Errorf("antigravity: review manifest cannot be read safely")
 	}
 	expectedManifestSHA := textSHA256(string(manifest))
 	request := struct {
@@ -208,40 +319,83 @@ func (as *antigravitySession) checkReview(ctx context.Context, task *agyReviewTa
 		CandidateSHA256 string          `json:"candidate_sha256"`
 		ManifestPath    string          `json:"manifest_path"`
 	}{agyReviewProtocol, "check", task.taskID, task.origin, conversationID, candidate, textSHA256(candidate), task.manifestPath}
-	var response struct {
-		Protocol        string   `json:"protocol"`
-		TaskID          string   `json:"task_id"`
-		CandidateSHA256 string   `json:"candidate_sha256"`
-		ManifestSHA256  string   `json:"manifest_sha256"`
-		Status          string   `json:"status"`
-		AllowPublish    bool     `json:"allow_publish"`
-		Reasons         []string `json:"reasons"`
-	}
+	var response agyReviewResponse
 	if err := as.callReview(ctx, request, &response, 60*time.Second); err != nil {
-		return fmt.Errorf("antigravity: 复核关口执行失败，候选结果未发布（任务 %s）", task.taskID)
+		return fmt.Errorf("antigravity: review check failed: %w", err)
 	}
-	if response.Protocol != agyReviewProtocol || response.TaskID != task.taskID || response.CandidateSHA256 != request.CandidateSHA256 {
-		return fmt.Errorf("antigravity: 复核回执身份不匹配，候选结果未发布（任务 %s）", task.taskID)
+	if response.Protocol != agyReviewProtocol || response.TaskID != task.taskID || response.CandidateSHA256 != request.CandidateSHA256 ||
+		response.AllowPublish == nil || (*response.AllowPublish && response.Status != "verified") {
+		return fmt.Errorf("antigravity: review receipt identity mismatch")
+	}
+	if err := task.update(response); err != nil {
+		return err
 	}
 	switch response.Status {
 	case "verified":
 		current, err := readReviewManifest(task.manifestPath)
-		if response.AllowPublish && manifestErr == nil && err == nil &&
+		if *response.AllowPublish && manifestErr == nil && err == nil &&
 			response.ManifestSHA256 == expectedManifestSHA && bytes.Equal(current, manifest) {
 			return nil
 		}
-	case "pending_review":
-		if len(response.Reasons) == 1 && response.Reasons[0] == "manifest_missing" {
-			return fmt.Errorf("antigravity: 结果已保存，但复核清单 manifest.json 尚未写入，Hermes 尚未派发（任务 %s）", task.taskID)
-		}
-		return fmt.Errorf("antigravity: 结果已保存，等待 Hermes 复核（任务 %s）", task.taskID)
-	case "blocked":
-		return fmt.Errorf("antigravity: 结果已保存，复核尚未通过（任务 %s）", task.taskID)
+	case "pending_review", "blocked":
+		return pendingReview(response)
 	}
-	return fmt.Errorf("antigravity: 复核回执无效，候选结果未发布（任务 %s）", task.taskID)
+	return fmt.Errorf("antigravity: invalid review receipt")
+}
+
+// The model may finish a review callback by writing response.json, without
+// reproducing a final response. Only the gate can authorize these frozen bytes.
+func (as *antigravitySession) finalizeReview(ctx context.Context, task *agyReviewTask, conversationID string) (string, error) {
+	if !agyEventIDPattern.MatchString(task.revision) {
+		return "", fmt.Errorf("antigravity: finalize revision is unavailable")
+	}
+	manifest, manifestErr := readReviewManifest(task.manifestPath)
+	if manifestErr != nil && !os.IsNotExist(manifestErr) {
+		return "", fmt.Errorf("antigravity: review manifest cannot be read safely")
+	}
+	request := map[string]any{"protocol": agyReviewProtocol, "op": "finalize", "task_id": task.taskID,
+		"origin": task.origin, "conversation_id": conversationID, "revision": task.revision}
+	var response agyReviewResponse
+	if err := as.callReview(ctx, request, &response, 60*time.Second); err != nil {
+		return "", fmt.Errorf("antigravity: review finalize failed: %w", err)
+	}
+	if response.Protocol != agyReviewProtocol || response.TaskID != task.taskID || response.Revision != task.revision ||
+		response.CandidateSHA256 != task.candidateSHA || response.ManifestSHA256 != task.manifestSHA ||
+		response.AllowPublish == nil || (*response.AllowPublish && response.Status != "verified") {
+		return "", fmt.Errorf("antigravity: finalize receipt identity mismatch")
+	}
+	if response.Status == "pending_review" || response.Status == "blocked" {
+		if err := task.update(response); err != nil {
+			return "", err
+		}
+		return "", pendingReview(response)
+	}
+	expectedPath := filepath.Join(task.taskDir, "revisions", task.revision, "materials", "candidate.txt")
+	if response.Status != "verified" || !*response.AllowPublish || manifestErr != nil || response.CandidatePath != expectedPath ||
+		textSHA256(string(manifest)) != task.manifestSHA {
+		return "", fmt.Errorf("antigravity: invalid finalized candidate")
+	}
+	root, rootErr := filepath.EvalSymlinks(task.taskDir)
+	resolved, pathErr := filepath.EvalSymlinks(expectedPath)
+	if rootErr != nil || pathErr != nil || resolved != filepath.Join(root, "revisions", task.revision, "materials", "candidate.txt") {
+		return "", fmt.Errorf("antigravity: finalized candidate path escaped its revision")
+	}
+	candidate, err := readReviewFile(expectedPath, 8<<20)
+	if err != nil || len(candidate) == 0 || textSHA256(string(candidate)) != task.candidateSHA {
+		return "", fmt.Errorf("antigravity: finalized candidate hash mismatch")
+	}
+	current, err := readReviewManifest(task.manifestPath)
+	if err != nil || !bytes.Equal(current, manifest) {
+		return "", fmt.Errorf("antigravity: manifest changed during finalization")
+	}
+	return string(candidate), nil
 }
 
 func readReviewManifest(path string) ([]byte, error) {
+	return readReviewFile(path, 4<<20)
+}
+
+func readReviewFile(path string, limit int64) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
@@ -258,8 +412,8 @@ func readReviewManifest(path string) ([]byte, error) {
 	if err != nil || !os.SameFile(info, opened) {
 		return nil, fmt.Errorf("review manifest changed while opening")
 	}
-	data, err := io.ReadAll(io.LimitReader(file, (4<<20)+1))
-	if err != nil || len(data) > 4<<20 {
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil || int64(len(data)) > limit {
 		return nil, fmt.Errorf("review manifest exceeds supported size")
 	}
 	return data, nil
@@ -302,7 +456,14 @@ func (as *antigravitySession) callReview(ctx context.Context, input, output any,
 	if err := cmd.Run(); err != nil {
 		// Gate output can include private paths or candidate contents; do not
 		// copy raw stdout/stderr into platform errors or logs.
-		return fmt.Errorf("review command failed")
+		if callCtx.Err() != nil {
+			return fmt.Errorf("review_command_timeout_or_cancelled")
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return fmt.Errorf("review_command_exit_%d", exitErr.ExitCode())
+		}
+		return fmt.Errorf("review_command_start_failed")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(stdout.Bytes()))
 	if err := decoder.Decode(output); err != nil || decoder.Decode(new(any)) != io.EOF {

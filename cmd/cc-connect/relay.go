@@ -111,7 +111,7 @@ func runRelaySend(args []string) {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
+	if !relayResponseAccepted(resp.StatusCode) {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", strings.TrimSpace(string(body)))
 		os.Exit(1)
 	}
@@ -124,6 +124,10 @@ func runRelaySend(args []string) {
 		os.Exit(1)
 	}
 	fmt.Print(result.Response)
+}
+
+func relayResponseAccepted(status int) bool {
+	return status == http.StatusOK || status == http.StatusAccepted
 }
 
 func printRelayUsage() {

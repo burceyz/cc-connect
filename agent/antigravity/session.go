@@ -146,11 +146,24 @@ func (as *antigravitySession) startRun(prompt, messageID string, images []core.I
 		run.mu.Lock()
 		run.reviewTask = task
 		run.mu.Unlock()
+		if task.revision != "" {
+			if err := as.syncReview(run.ctx, task, as.CurrentSessionID(), "refresh", ""); err != nil {
+				return nil, err
+			}
+		}
 		fullPrompt = appendReviewInstructions(fullPrompt, task.instructions)
 	}
+	if err := as.startProcess(run, fullPrompt, tempFiles); err != nil {
+		return nil, err
+	}
+	started = true
+	return run, nil
+}
+
+func (as *antigravitySession) startProcess(run *agyRun, fullPrompt string, tempFiles []string) error {
 	chatID := as.CurrentSessionID()
 	args := as.buildAntigravityArgs(chatID, chatID != "", as.mode, as.invocationBridge.configDir, fullPrompt)
-	cmd := exec.CommandContext(ctx, as.cmd, args...)
+	cmd := exec.CommandContext(run.ctx, as.cmd, args...)
 	cmd.WaitDelay = time.Second
 	cmd.Dir = as.workDir
 	cmd.Env = core.MergeEnv(os.Environ(), as.extraEnv)
@@ -164,22 +177,76 @@ func (as *antigravitySession) startRun(prompt, messageID string, images []core.I
 	// -p consumes stdin to EOF. Never leave an open input pipe on this path.
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("antigravity: stdout pipe: %w", err)
+		return fmt.Errorf("antigravity: stdout pipe: %w", err)
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := as.invocationBridge.setRun(run); err != nil {
 		_ = stdout.Close()
-		return nil, err
+		return err
 	}
 	if err := cmd.Start(); err != nil {
 		_ = stdout.Close()
 		run.end(false)
-		return nil, fmt.Errorf("antigravity: start: %w", err)
+		return fmt.Errorf("antigravity: start: %w", err)
 	}
-	started = true
 	go as.readLoop(run, cmd, stdout, &stderr, tempFiles)
-	return run, nil
+	return nil
+}
+
+const maxAgyReviewRepairs = 2
+
+// Continue only a known author/material repair, on the same task and native
+// conversation. This is not a retry of an ambiguous external submission.
+func (as *antigravitySession) continueReviewRun(previous *agyRun, task *agyReviewTask, pending *agyReviewPending) (bool, error) {
+	if !pending.repair || previous.reviewRepairs >= maxAgyReviewRepairs || previous.ctx.Err() != nil {
+		return false, nil
+	}
+	ctx, cancel := context.WithCancel(as.ctx)
+	if deadline, ok := previous.ctx.Deadline(); ok {
+		cancel()
+		ctx, cancel = context.WithDeadline(as.ctx, deadline)
+	}
+	run, err := newAgyRun(ctx, cancel, as.CurrentSessionID())
+	if err != nil {
+		cancel()
+		return false, err
+	}
+	run.reviewTask, run.reviewRepairs = task, previous.reviewRepairs+1
+	prompt := "Continue the original task in " + filepath.Join(task.taskDir, "request.txt") +
+		". The host review check returned " + pending.code + ". Repair the missing task materials or author response now. " +
+		"Read the actual saved review before responding. Keep the same task and conversation. Do not ask the user to write internal review files. " +
+		"If the candidate must change, update the manifest and output the corrected candidate. If no change is needed, write the required response with preserve_candidate=true."
+	instructions := task.instructions
+	if pending.instructions != "" {
+		instructions = pending.instructions
+	}
+	fullPrompt := appendReviewInstructions(prompt, instructions)
+	if len(fullPrompt) > 63<<10 {
+		cancel()
+		return false, fmt.Errorf("antigravity: review repair instructions exceed supported size")
+	}
+	as.startMu.Lock()
+	if !as.alive.Load() || as.ctx.Err() != nil || as.activeRun != previous {
+		as.startMu.Unlock()
+		cancel()
+		return false, fmt.Errorf("antigravity: review repair interrupted")
+	}
+	as.activeRun = run
+	as.wg.Add(1)
+	as.startMu.Unlock()
+	if err := as.startProcess(run, fullPrompt, nil); err != nil {
+		cancel()
+		run.end(false)
+		as.startMu.Lock()
+		if as.activeRun == run {
+			as.activeRun = nil
+		}
+		as.startMu.Unlock()
+		as.wg.Done()
+		return false, err
+	}
+	return true, nil
 }
 
 func (as *antigravitySession) preparePrompt(prompt, messageID string, images []core.ImageAttachment, files []core.FileAttachment) (string, []string) {
@@ -288,7 +355,23 @@ func (as *antigravitySession) QueueInput(expectedSessionID, eventID, prompt stri
 			// deterministic event ID lets core retry it at idle without new tasks.
 			return core.ErrNoActiveInput
 		}
+		if callback.revision != "" {
+			// QueueInput must stay prompt. Native review verification may take
+			// much longer than the IPC request budget; defer an uncollected
+			// callback to the idle start path, where refresh can safely run.
+			report := filepath.Join(callback.taskDir, "revisions", callback.revision, "hermes-response.txt")
+			if info, err := os.Lstat(report); err != nil || !info.Mode().IsRegular() {
+				return core.ErrNoActiveInput
+			}
+		}
 		content = appendReviewInstructions(prompt, callback.instructions)
+		if err := run.queuePrepared(expectedSessionID, eventID, prompt, content, report); err != nil {
+			return err
+		}
+		run.mu.Lock()
+		run.reviewTask = callback
+		run.mu.Unlock()
+		return nil
 	}
 	return run.queuePrepared(expectedSessionID, eventID, prompt, content, report)
 }

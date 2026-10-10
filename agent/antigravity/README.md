@@ -34,24 +34,50 @@ The review process inherits those host variables. Each CLI run also receives
 `CC_REVIEW_TASK_ID`, `CC_REVIEW_TASK_DIR`, and `CC_REVIEW_MANIFEST_PATH` from its
 validated `begin` response. Instructions are appended to the CLI prompt only.
 
-The `cc-connect-review-gate-v1` contract has two operations:
+The `cc-connect-review-gate-v1` contract has five operations:
 
 - `begin` pins the request, origin, and review task before starting the CLI.
   A normal request must keep the host-proposed task ID. A registered IPC event
   may resolve to its existing task. Unknown events get a deterministic proposed
   UUID and the gate's durable registry decides their final task identity.
+  Explicit continue/retry messages can resume the pending task in the same
+  conversation; independent requests retain their own task identities.
+- `bind` persists the origin and native conversation immediately after CLI
+  initialization, even when a candidate or manifest has not been produced yet.
+- `refresh` collects the actual review receipt before resuming a callback and
+  provides the author with the frozen report and recovery instructions. Receipt
+  collection is kept out of the latency-sensitive live-input queue path.
 - `check` receives the exact UTF-8 candidate and its SHA-256. Publishing requires
   a successful process, matching protocol/task/candidate/manifest hashes,
   `status=verified`, and `allow_publish=true`. The manifest is read before the
   call and checked again afterward. Candidate deltas remain buffered throughout
-  a gated run. Pending, blocked, and invalid results produce `EventError` while
-  retaining the session for a later callback; they never publish the candidate.
+  a gated run. A valid waiting or changes-required response produces
+  `EventPending`, retains the session, and releases the foreground turn. Invalid
+  protocol responses remain errors. Neither path publishes the candidate.
+- `finalize` authorizes the fixed candidate after the author responds to the
+  review. The adapter verifies the task, revision, manifest, candidate hash and
+  file path, then reads those frozen bytes directly. The callback does not need
+  to reproduce the answer in a new `agent_response`. A successful result carries
+  separate `verified_review` metadata for the host's review receipt.
 
 The gated candidate is the final `agent_response` step, assembled from that
 step's exact `text_delta` bytes through `DONE`. Earlier progress messages and
 the CLI's cumulative `result.response` are excluded. A missing step identity,
 unfinished final response, or a later tool/input step without a final response
-fails closed before review; it does not fall back to an earlier message.
+fails closed before a new candidate is reviewed; it does not fall back to an
+earlier message. Known missing-material or author-response conditions allow at
+most two internal repairs, keeping the same task, conversation and deadline.
+An ambiguous external submission is never automatically submitted again.
+
+## Conversation storage
+
+CLI 1.3.3 stores its conversation index in
+`~/.gemini/antigravity-cli/conversation_summaries.db`. Session listing reads that
+SQLite database in read-only mode and matches its workspace file URIs exactly.
+Legacy JSONL sessions remain supported. An unreadable or unknown index cannot
+silently convert a requested resume into a new conversation. Native SQLite
+deletion remains unavailable until the CLI provides a supported operation;
+the adapter does not remove shared database records itself.
 
 ## Live input
 

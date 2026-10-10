@@ -85,6 +85,13 @@ func New(opts map[string]any) (core.Agent, error) {
 	if _, err := exec.LookPath(cmd); err != nil {
 		return nil, fmt.Errorf("antigravity: %q CLI not found in PATH, install from: https://antigravity.google/docs/cli-overview", cmd)
 	}
+	if len(reviewCommand) > 0 {
+		resolved, err := exec.LookPath(reviewCommand[0])
+		if err != nil {
+			return nil, fmt.Errorf("antigravity: review_command executable is unavailable")
+		}
+		reviewCommand[0] = resolved
+	}
 
 	return &Agent{
 		workDir:       workDir,

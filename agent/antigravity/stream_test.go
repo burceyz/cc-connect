@@ -205,7 +205,7 @@ func terminalEvent(t *testing.T, session *antigravitySession) (core.Event, strin
 			switch event.Type {
 			case core.EventText:
 				text.WriteString(event.Content)
-			case core.EventResult, core.EventError:
+			case core.EventResult, core.EventError, core.EventPending:
 				return event, text.String()
 			}
 		case <-timer.C:
@@ -376,9 +376,13 @@ func TestAgyStreamReportsToolProgressWithoutCandidateLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := &antigravitySession{ctx: ctx, events: make(chan core.Event, 16), reviewCommand: []string{"configured-gate"}}
+	// This parser unit starts after the separately tested init/bind handshake.
+	if err := run.bind("main"); err != nil {
+		t.Fatal(err)
+	}
+	session.chatID.Store("main")
 	stream := &agyStream{session: session, run: run}
 	for _, line := range []string{
-		`{"event":"init","init":{"conversation_id":"main"}}`,
 		`{"event":"step_update","step_update":{"conversation_id":"main","step_index":0,"step_type":"user_input","state":"DONE"}}`,
 		`{"event":"step_update","step_update":{"conversation_id":"main","step_index":1,"step_type":"agent_response","state":"ACTIVE","text_delta":"unreviewed candidate"}}`,
 		`{"event":"step_update","step_update":{"conversation_id":"main","step_index":2,"step_type":"tool","state":"ACTIVE","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo test"}}}}`,
