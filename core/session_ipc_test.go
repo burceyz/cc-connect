@@ -135,13 +135,14 @@ func TestIPC_ActiveSteerAndDuplicateAreOneInput(t *testing.T) {
 
 func TestIPC_IdleResumesPinnedSessionAndAcknowledges(t *testing.T) {
 	api, e, as, input := ipcFixture(t, false)
+	e.SetInjectSender(true)
 	delete(e.interactiveStates, input.Target.SessionKey) // also covers process restart
 	if w := ipcPost(t, api.handleIPCEvent, input); w.Code != 200 {
 		t.Fatal(w.Body.String())
 	}
 	select {
 	case got := <-as.input:
-		if !strings.Contains(got, input.Prompt) {
+		if got != input.Prompt {
 			t.Fatal(got)
 		}
 	case <-time.After(2 * time.Second):

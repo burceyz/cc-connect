@@ -295,8 +295,12 @@ func TestIPCQueue_StopBeforeNoActiveReplyCannotBecomeSafeRetry(t *testing.T) {
 
 func TestIPCQueue_NaturalFinishCanResumeOnlyThePinnedIdleSession(t *testing.T) {
 	api, e, q, input := ipcQueueFixture(t)
+	e.SetInjectSender(true)
 	ipcPost(t, api.handleIPCEvent, input)
 	call := ipcQueued(t, q)
+	if call.prompt != input.Prompt {
+		t.Fatal("busy IPC changed the fixed prompt")
+	}
 	if err := call.report(LiveInputProgress{Phase: LiveInputPhaseReleased, Code: "turn_finished"}); err != nil {
 		t.Fatal(err)
 	}
@@ -305,6 +309,14 @@ func TestIPCQueue_NaturalFinishCanResumeOnlyThePinnedIdleSession(t *testing.T) {
 	ipcPost(t, api.handleIPCEvent, input)
 	if receipt := ipcWaitStatus(t, api, input.EventID, "delivered"); receipt.Method != "start" {
 		t.Fatalf("safe release did not resume the pinned idle session: %+v", receipt)
+	}
+	select {
+	case prompt := <-q.idle.input:
+		if prompt != call.prompt {
+			t.Fatalf("idle IPC changed the previously queued prompt: %q", prompt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle IPC did not reach the pinned session")
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for session.Busy() && time.Now().Before(deadline) {

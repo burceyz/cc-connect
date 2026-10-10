@@ -573,6 +573,7 @@ func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput, att
 		SessionKey: input.Target.SessionKey, Platform: platform.Name(),
 		MessageID: "ipc-" + input.EventID, UserID: "ipc", UserName: "ipc",
 		Content: input.Prompt, ReplyCtx: replyCtx,
+		ipcEventID:             input.EventID,
 		ExpectedAgentSessionID: input.Target.AgentSessionID,
 		ipcQueueState:          pinnedQueueState,
 		OnAgentInput: func(err error) {

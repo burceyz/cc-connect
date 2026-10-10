@@ -4065,7 +4065,12 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		drainEvents(state.agentSession.Events())
 	}
 
-	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+	// Internal IPC prompts are already bound to their event and exact payload.
+	// Busy delivery uses those bytes directly; idle retry must do the same.
+	promptContent := msg.Content
+	if msg.ipcEventID == "" {
+		promptContent = e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+	}
 
 	sendStart := time.Now()
 	state.mu.Lock()
