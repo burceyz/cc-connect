@@ -181,8 +181,11 @@ func TestAgyReviewPendingKeepsCandidatePrivateAndAllowsCallback(t *testing.T) {
 	}
 }
 
-func TestAgyReviewAcceptsOfficialTrailingCheckpoint(t *testing.T) {
-	for _, scenario := range []string{"checkpoint", "checkpoint-active-done", "checkpoint-multi-response"} {
+func TestAgyReviewAcceptsOfficialAuxiliarySteps(t *testing.T) {
+	for _, scenario := range []string{
+		"checkpoint", "checkpoint-active-done", "checkpoint-multi-response",
+		"system-message-before-response", "system-message-after-response", "finish", "subagent-before-response",
+	} {
 		t.Run(scenario, func(t *testing.T) {
 			session, dir := testCLI(t, scenario)
 			enableTestReview(t, session, dir, "verified")
@@ -191,7 +194,7 @@ func TestAgyReviewAcceptsOfficialTrailingCheckpoint(t *testing.T) {
 			}
 			event, streamed := terminalEvent(t, session)
 			if event.Type != core.EventResult || event.Content != testAgyCandidate || streamed != "" {
-				t.Fatalf("official response/checkpoint sequence did not publish the reviewed candidate: %+v, %q", event, streamed)
+				t.Fatalf("official response/auxiliary sequence did not publish the reviewed candidate: %+v, %q", event, streamed)
 			}
 		})
 	}
@@ -203,6 +206,7 @@ func TestAgyReviewRejectsMissingOrIncompleteFinalResponse(t *testing.T) {
 		"checkpoint-incomplete", "checkpoint-incomplete-response", "checkpoint-around-tool", "checkpoint-around-user-input",
 		"checkpoint-before-unknown", "checkpoint-text", "checkpoint-tool-name", "checkpoint-tool-info",
 		"checkpoint-empty-tool-info", "checkpoint-subagent-info", "checkpoint-unknown-state",
+		"system-message-without-response",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			session, dir := testCLI(t, scenario)

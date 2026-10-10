@@ -67,8 +67,13 @@ type agyStream struct {
 	lastStepIndex int
 	lastStepType  string
 	candidate     *agyResponseStep
-	checkpoints   map[int]bool
+	auxiliary     map[int]agyAuxiliaryStep
 	tools         map[int]bool
+}
+
+type agyAuxiliaryStep struct {
+	kind string
+	done bool
 }
 
 type agyResponseStep struct {
@@ -141,12 +146,11 @@ func (s *agyStream) handleStep(step agyStreamStep) error {
 			return fmt.Errorf("antigravity: review stream step index is missing or invalid")
 		}
 		switch step.StepType {
-		case "checkpoint":
-			// The official CLI may append bookkeeping after its final reply.
-			// Keep its completion state without replacing the last content step.
-			return s.handleCheckpointStep(step)
-		case "user_input", "agent_response", "tool":
-			if _, checkpoint := s.checkpoints[*step.StepIndex]; checkpoint {
+		case "checkpoint", "system_message", "finish":
+			// CLI bookkeeping can precede or follow the final reply.
+			return s.handleAuxiliaryStep(step)
+		case "user_input", "agent_response", "tool", "subagent":
+			if _, auxiliary := s.auxiliary[*step.StepIndex]; auxiliary {
 				return fmt.Errorf("antigravity: review step index changed type")
 			}
 		default:
@@ -196,24 +200,25 @@ func (s *agyStream) handleCandidateStep(step agyStreamStep) error {
 	return nil
 }
 
-func (s *agyStream) handleCheckpointStep(step agyStreamStep) error {
-	if step.TextDelta != "" || step.ToolName != "" || step.ToolInfo != nil || step.SubagentInfo != nil {
-		return fmt.Errorf("antigravity: review checkpoint contains response or tool payload; candidate withheld")
+func (s *agyStream) handleAuxiliaryStep(step agyStreamStep) error {
+	if (step.StepType != "system_message" && step.TextDelta != "") ||
+		step.ToolName != "" || step.ToolInfo != nil || step.SubagentInfo != nil {
+		return fmt.Errorf("antigravity: review auxiliary step contains response or tool payload; candidate withheld")
 	}
 	if step.State != "ACTIVE" && step.State != "DONE" {
-		return fmt.Errorf("antigravity: review checkpoint has an unsupported state")
+		return fmt.Errorf("antigravity: review auxiliary step has an unsupported state")
 	}
 	index := *step.StepIndex
-	if index == s.lastStepIndex && s.lastStepType != "" {
+	if index <= s.lastStepIndex && s.lastStepType != "" {
 		return fmt.Errorf("antigravity: review step index changed type")
 	}
-	if s.checkpoints == nil {
-		s.checkpoints = make(map[int]bool)
+	if s.auxiliary == nil {
+		s.auxiliary = make(map[int]agyAuxiliaryStep)
 	}
-	if s.checkpoints[index] {
-		return fmt.Errorf("antigravity: review checkpoint is already complete")
+	if previous, exists := s.auxiliary[index]; exists && (previous.kind != step.StepType || previous.done) {
+		return fmt.Errorf("antigravity: review auxiliary step changed type or is already complete")
 	}
-	s.checkpoints[index] = step.State == "DONE"
+	s.auxiliary[index] = agyAuxiliaryStep{kind: step.StepType, done: step.State == "DONE"}
 	return nil
 }
 
@@ -224,9 +229,9 @@ func (s *agyStream) reviewCandidate() (string, error) {
 		s.candidate.index != s.lastStepIndex || s.lastStepType != "agent_response" {
 		return "", fmt.Errorf("antigravity: final review response step is missing or incomplete; candidate withheld")
 	}
-	for _, done := range s.checkpoints {
-		if !done {
-			return "", fmt.Errorf("antigravity: review checkpoint is incomplete; candidate withheld")
+	for _, step := range s.auxiliary {
+		if !step.done {
+			return "", fmt.Errorf("antigravity: review auxiliary step is incomplete; candidate withheld")
 		}
 	}
 	return s.candidate.text.String(), nil

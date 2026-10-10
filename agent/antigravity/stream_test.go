@@ -65,7 +65,7 @@ func TestAgyCLIHelper(t *testing.T) {
 	}
 	response, responseIndex := testAgyCandidate, 1
 	checkpoint := strings.HasPrefix(scenario, "checkpoint")
-	if checkpoint {
+	if checkpoint || strings.HasPrefix(scenario, "system-message") || scenario == "finish" || scenario == "subagent-before-response" {
 		responseIndex = 3
 	}
 	if scenario == "multi-response" || scenario == "incomplete-response" || scenario == "no-final-response" || scenario == "checkpoint-multi-response" {
@@ -77,6 +77,15 @@ func TestAgyCLIHelper(t *testing.T) {
 		}})
 		response, responseIndex = testAgyProgress+testAgyCandidate, 3
 	}
+	if strings.HasPrefix(scenario, "system-message") || scenario == "subagent-before-response" {
+		kind := "system_message"
+		if scenario == "subagent-before-response" {
+			kind = "subagent"
+		}
+		emit(map[string]any{"event": "step_update", "step_update": map[string]any{
+			"conversation_id": "stream-session", "step_index": 2, "state": "DONE", "step_type": kind,
+		}})
+	}
 	if checkpoint {
 		// The official headless example ends with response 3, checkpoint 4.
 		state := "DONE"
@@ -86,7 +95,7 @@ func TestAgyCLIHelper(t *testing.T) {
 		emitText(responseIndex, state, testAgyCandidate)
 	} else if scenario == "empty-response" {
 		emitText(responseIndex, "DONE", "")
-	} else if scenario != "result-only" && scenario != "no-final-response" {
+	} else if scenario != "result-only" && scenario != "no-final-response" && scenario != "system-message-without-response" {
 		for i, text := range []string{"候选结果  \n", "exact trailing newline\n"} {
 			state := "ACTIVE"
 			if i == 1 && scenario != "incomplete-response" {
@@ -95,9 +104,15 @@ func TestAgyCLIHelper(t *testing.T) {
 			emitText(responseIndex, state, text)
 		}
 	}
-	if checkpoint {
+	if checkpoint || scenario == "system-message-after-response" || scenario == "finish" {
+		kind := "checkpoint"
+		if scenario == "system-message-after-response" {
+			kind = "system_message"
+		} else if scenario == "finish" {
+			kind = "finish"
+		}
 		step := map[string]any{
-			"conversation_id": "stream-session", "step_index": 4, "state": "DONE", "step_type": "checkpoint",
+			"conversation_id": "stream-session", "step_index": 4, "state": "DONE", "step_type": kind,
 		}
 		if scenario == "checkpoint-active-done" || scenario == "checkpoint-incomplete" ||
 			scenario == "checkpoint-around-tool" || scenario == "checkpoint-around-user-input" {
