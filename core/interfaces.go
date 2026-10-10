@@ -93,6 +93,55 @@ type SessionEnvInjector interface {
 	SetSessionEnv(env []string)
 }
 
+// LiveInputQueuer is an optional alternative to LiveInputSteerer for backends
+// that consume external input at a later invocation boundary. QueueInput must
+// return promptly: nil means ownership of the pending input, not delivery.
+// ErrNoActiveInput guarantees that nothing was queued or sent; other errors
+// are ambiguous and must not be retried automatically.
+//
+// The backend must report claimed and wait for its durable success BEFORE
+// exposing input to the CLI. It may report injected only after observing that
+// the same invocation consumed the input. Merely returning a hook response is
+// not that evidence. Released is valid only after atomically removing an input
+// that was never claimed; use LiveInputCodeStopped for an explicit stop.
+//
+// Reports may occur before QueueInput returns. Call report without holding a
+// backend lock needed by Alive, CurrentSessionID, or session teardown. A failed
+// report must never be followed by an injection side effect. Each event must
+// have at most one claimant, and no further side effects after release.
+type LiveInputQueuer interface {
+	QueueInput(expectedSessionID, eventID, prompt string, report func(LiveInputProgress) error) error
+}
+
+// LiveInputProgress records backend evidence without extending the IPC v1
+// receipt status vocabulary. TurnID identifies the observed invocation when
+// available; Code is a fixed diagnostic code, never model output or secrets.
+type LiveInputProgress struct {
+	Phase  string
+	TurnID string
+	Code   string
+}
+
+const (
+	LiveInputPhaseQueued   = "queued"
+	LiveInputPhaseClaimed  = "claimed"
+	LiveInputPhaseInjected = "injected"
+	LiveInputPhaseReleased = "released"
+	LiveInputPhaseUnknown  = "unknown"
+
+	LiveInputCodeStopped = "session_stopped"
+)
+
+func (p LiveInputProgress) validate() error {
+	switch p.Phase {
+	case LiveInputPhaseQueued, LiveInputPhaseClaimed, LiveInputPhaseInjected,
+		LiveInputPhaseReleased, LiveInputPhaseUnknown:
+		return nil
+	default:
+		return errors.New("ipc_live_input_phase_invalid")
+	}
+}
+
 // FormattingInstructionProvider is an optional interface for platforms that
 // provide platform-specific formatting instructions for the agent system prompt
 // (e.g., Slack mrkdwn vs standard Markdown).

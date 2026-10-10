@@ -5,6 +5,19 @@ import (
 	"testing"
 )
 
+func TestLiveInputProgress_RejectsReceiptStatusesAsBackendEvidence(t *testing.T) {
+	for _, phase := range []string{"queued", "claimed", "injected", "released", "unknown"} {
+		if err := (LiveInputProgress{Phase: phase}).validate(); err != nil {
+			t.Errorf("phase %q: %v", phase, err)
+		}
+	}
+	for _, phase := range []string{"", "waiting", "dispatching", "delivered", "blocked", "accepted"} {
+		if err := (LiveInputProgress{Phase: phase}).validate(); err == nil {
+			t.Errorf("phase %q bypassed the backend evidence contract", phase)
+		}
+	}
+}
+
 // TestAgentSystemPrompt_EnglishDefault covers the back-compat behaviour:
 // AgentSystemPrompt() must return the same bytes as the English variant and
 // must contain the silent-reply marker so existing English-only callers keep
