@@ -156,6 +156,40 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(status, 'completed')
         self.assertEqual((dest / 'response.md').read_text(), 'node started')
 
+    def test_resolved_npm_entry_uses_its_installation_node(self):
+        prefix = self.root / '.nvm/versions/node/v22.20.0'
+        bin_dir = prefix / 'bin'
+        bin_dir.mkdir(parents=True)
+        entry = prefix / 'lib/node_modules/@deepseek-ai/dsh/lib/bin.js'
+        entry.parent.mkdir(parents=True)
+        entry.write_text('#!/usr/bin/env node\n')
+        entry.chmod(0o700)
+        launcher = bin_dir / 'dsh'
+        launcher.symlink_to(entry)
+        node = bin_dir / 'node'
+        node.write_text('#!' + sys.executable + '\nimport sys,json\n'
+                        'sys.stdin.read()\n'
+                        'print(json.dumps({"type":"session","sessionId":"session-test"}))\n'
+                        'print(json.dumps({"type":"final","text":"paired node started"}))\n')
+        node.chmod(0o700)
+        # jobs.submit persists a canonical path, so the worker receives the
+        # npm entry point rather than the original bin/dsh symlink.
+        accepted_executable = str(launcher.resolve())
+        with patch.dict(os.environ, {'PATH': '/missing-service-path'}, clear=True), \
+                redirect_stdout(io.StringIO()):
+            dest, status = bridge.run(self.task, None, 5, self.runtime, accepted_executable)
+        self.assertEqual(status, 'completed')
+        self.assertEqual((dest / 'response.md').read_text(), 'paired node started')
+
+    def test_npm_entry_without_paired_node_keeps_existing_path(self):
+        entry = self.root / 'prefix/lib/node_modules/dsh/bin.js'
+        entry.parent.mkdir(parents=True)
+        entry.write_text('#!/usr/bin/env node\n')
+        entry.chmod(0o700)
+        with patch.dict(os.environ, {'PATH': '/existing/bin'}, clear=True):
+            env = bridge.execution_env(str(entry))
+        self.assertEqual(env['PATH'].split(os.pathsep), [str(entry.parent), '/existing/bin'])
+
     def make_export(self):
         dest = self.runtime / 'runs/test'
         dest.mkdir(parents=True)

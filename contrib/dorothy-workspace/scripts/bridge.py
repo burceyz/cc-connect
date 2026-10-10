@@ -114,12 +114,23 @@ def execution_env(executable):
     """Keep the selected installation's interpreter available to its launcher and children."""
     env = os.environ.copy()
     # npm launchers use /usr/bin/env node. Finding an absolute dsh path is not
-    # sufficient when launchd omitted its nvm bin directory from PATH. Keep
-    # the launcher path (not its resolved node_modules symlink target).
+    # sufficient when launchd omitted its nvm bin directory from PATH. Async
+    # receipts canonicalize the launcher to lib/node_modules/.../bin.js, so
+    # recover that installation's own bin directory as well.
     selected = shutil.which(str(executable)) or str(executable)
-    bin_dir = str(Path(selected).absolute().parent)
+    launcher = Path(selected).absolute()
+    bin_dirs = [str(launcher.parent)]
+    for ancestor in launcher.resolve().parents:
+        if ancestor.name != 'node_modules' or ancestor.parent.name != 'lib':
+            continue
+        paired_bin = ancestor.parent.parent / 'bin'
+        node = paired_bin / 'node'
+        if node.is_file() and os.access(node, os.X_OK):
+            if str(paired_bin) not in bin_dirs:
+                bin_dirs.insert(0, str(paired_bin))
+            break
     paths = env.get('PATH', os.defpath).split(os.pathsep)
-    env['PATH'] = os.pathsep.join([bin_dir] + [path for path in paths if path != bin_dir])
+    env['PATH'] = os.pathsep.join(bin_dirs + [path for path in paths if path not in bin_dirs])
     return env
 
 
