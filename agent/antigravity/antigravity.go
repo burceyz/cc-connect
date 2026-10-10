@@ -256,6 +256,16 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	a.mu.Unlock()
 
+	if sessionID != "" && sessionID != core.ContinueSession {
+		valid, err := validateAntigravitySessionID(ctx, workDir, sessionID)
+		if err != nil {
+			return nil, &core.ResumeUnavailableError{Err: fmt.Errorf("antigravity: cannot verify the saved conversation workspace; retry when its index is available: %w", err)}
+		}
+		if !valid {
+			return nil, fmt.Errorf("antigravity: saved conversation does not belong to this workspace")
+		}
+	}
+
 	session, err := newAntigravitySession(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv, timeout)
 	if err != nil {
 		return nil, err
@@ -265,48 +275,24 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	return session, nil
 }
 
-func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
-	return listAntigravitySessions(a.workDir)
+func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {
+	return listAntigravitySessions(ctx, a.GetWorkDir())
 }
 
-func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("antigravity: cannot determine home dir: %w", err)
-	}
-	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", antigravityProjectSlug(a.workDir), "chats")
-	entries, err := os.ReadDir(chatsDir)
-	if err != nil {
-		return fmt.Errorf("session file not found: %s", sessionID)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-			continue
-		}
-		fpath := filepath.Join(chatsDir, entry.Name())
-		file, err := os.Open(fpath)
-		if err != nil {
-			continue
-		}
+func (a *Agent) DeleteSession(ctx context.Context, sessionID string) error {
+	return deleteAntigravitySession(ctx, a.GetWorkDir(), sessionID)
+}
 
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		if scanner.Scan() {
-			var sf struct {
-				SessionID string `json:"sessionId"`
-			}
-			if json.Unmarshal([]byte(scanner.Text()), &sf) == nil && sf.SessionID == sessionID {
-				_ = file.Close()
-				return os.Remove(fpath)
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			_ = file.Close()
-			continue
-		}
-		_ = file.Close()
+// ValidateSessionID rejects a known workspace mismatch without discarding the
+// stored ID when the CLI's index is temporarily unavailable. The core interface
+// has no "unknown" result and treats false as permission to clear the history.
+func (a *Agent) ValidateSessionID(ctx context.Context, sessionID string) bool {
+	valid, err := validateAntigravitySessionID(ctx, a.GetWorkDir(), sessionID)
+	if err != nil {
+		slog.Warn("antigravity: session validation unavailable; preserving stored ID", "error", err)
+		return true
 	}
-	return fmt.Errorf("session file not found: %s", sessionID)
+	return valid
 }
 
 func (a *Agent) Stop() error { return nil }
@@ -327,15 +313,17 @@ func (a *Agent) GetMode() string {
 func (a *Agent) PermissionModes() []core.PermissionModeInfo {
 	return []core.PermissionModeInfo{
 		{Key: "default", Name: "Default", NameZh: "默认", Desc: "Ask for approval through cc-connect on each tool use", DescZh: "每次工具调用都通过 cc-connect 请求确认"},
+		{Key: "acceptEdits", Name: "Accept Edits", NameZh: "自动编辑", Desc: "Auto-approve workspace edits; ask for other tool calls", DescZh: "自动批准工作区编辑，其他工具调用仍请求确认"},
 		{Key: "yolo", Name: "YOLO", NameZh: "全自动", Desc: "Auto-approve all tool calls", DescZh: "自动批准所有工具调用"},
 		{Key: "plan", Name: "Plan", NameZh: "规划模式", Desc: "Read-only plan mode in sandbox", DescZh: "只读沙箱规划模式"},
 	}
 }
 
 func (a *Agent) CommandDirs() []string {
-	absDir, err := filepath.Abs(a.workDir)
+	workDir := a.GetWorkDir()
+	absDir, err := filepath.Abs(workDir)
 	if err != nil {
-		absDir = a.workDir
+		absDir = workDir
 	}
 	dirs := []string{filepath.Join(absDir, ".gemini", "commands")}
 	if home, err := os.UserHomeDir(); err == nil {
@@ -345,9 +333,10 @@ func (a *Agent) CommandDirs() []string {
 }
 
 func (a *Agent) SkillDirs() []string {
-	absDir, err := filepath.Abs(a.workDir)
+	workDir := a.GetWorkDir()
+	absDir, err := filepath.Abs(workDir)
 	if err != nil {
-		absDir = a.workDir
+		absDir = workDir
 	}
 	dirs := []string{filepath.Join(absDir, ".gemini", "skills")}
 	if home, err := os.UserHomeDir(); err == nil {
@@ -359,9 +348,10 @@ func (a *Agent) SkillDirs() []string {
 func (a *Agent) CompressCommand() string { return "" }
 
 func (a *Agent) ProjectMemoryFile() string {
-	absDir, err := filepath.Abs(a.workDir)
+	workDir := a.GetWorkDir()
+	absDir, err := filepath.Abs(workDir)
 	if err != nil {
-		absDir = a.workDir
+		absDir = workDir
 	}
 	return filepath.Join(absDir, "GEMINI.md")
 }
@@ -499,7 +489,7 @@ type sessionLine struct {
 	} `json:"$set"`
 }
 
-func listAntigravitySessions(workDir string) ([]core.AgentSessionInfo, error) {
+func listLegacyAntigravitySessions(workDir string) ([]core.AgentSessionInfo, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("antigravity: cannot determine home dir: %w", err)
@@ -518,7 +508,7 @@ func listAntigravitySessions(workDir string) ([]core.AgentSessionInfo, error) {
 
 	var sessions []core.AgentSessionInfo
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+		if !entry.Type().IsRegular() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 
