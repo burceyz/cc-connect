@@ -216,6 +216,16 @@ const (
 	MsgToolAllowFailed           MsgKey = "tool_allow_failed"
 	MsgToolAllowedNew            MsgKey = "tool_allowed_new"
 	MsgError                     MsgKey = "error"
+	MsgPendingTitle              MsgKey = "pending_title"
+	MsgPendingFooter             MsgKey = "pending_footer"
+	MsgPendingGeneric            MsgKey = "pending_generic"
+	MsgPendingReviewWaiting      MsgKey = "pending_review_waiting"
+	MsgPendingReviewWaitingNamed MsgKey = "pending_review_waiting_named"
+	MsgPendingPreparation        MsgKey = "pending_preparation"
+	MsgPendingChangesRequired    MsgKey = "pending_changes_required"
+	MsgPendingTask               MsgKey = "pending_task"
+	MsgPendingCode               MsgKey = "pending_code"
+	MsgVerifiedReviewReceipt     MsgKey = "verified_review_receipt"
 	MsgSessionNotFound           MsgKey = "session_not_found"
 	MsgFailedToStartAgentSession MsgKey = "failed_to_start_agent_session"
 	MsgFailedToDeleteSession     MsgKey = "failed_to_delete_session"
@@ -859,6 +869,76 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 錯誤: %v",
 		LangJapanese:           "❌ エラー: %v",
 		LangSpanish:            "❌ Error: %v",
+	},
+	MsgPendingTitle: {
+		LangEnglish:            "Pending",
+		LangChinese:            "待处理",
+		LangTraditionalChinese: "待處理",
+		LangJapanese:           "保留中",
+		LangSpanish:            "Pendiente",
+	},
+	MsgPendingFooter: {
+		LangEnglish:            "This turn has ended; the task is still pending. See the status message for details.",
+		LangChinese:            "当前执行轮已结束，任务仍待处理。详情见状态消息。",
+		LangTraditionalChinese: "目前執行回合已結束，任務仍待處理。詳情見狀態訊息。",
+		LangJapanese:           "今回の実行は終了しました。タスクは保留中です。状態メッセージをご確認ください。",
+		LangSpanish:            "Este turno ha terminado; la tarea sigue pendiente. Consulta el mensaje de estado.",
+	},
+	MsgPendingGeneric: {
+		LangEnglish:            "⏸ The task is pending and its result has not been released. The conversation is saved for continuation.",
+		LangChinese:            "⏸ 任务待继续，当前结果尚未发布。已保留会话，可继续处理。",
+		LangTraditionalChinese: "⏸ 任務待繼續，目前結果尚未發布。已保留會話，可繼續處理。",
+		LangJapanese:           "⏸ タスクは保留中で、結果は未公開です。続行できるよう会話を保存しました。",
+		LangSpanish:            "⏸ La tarea está pendiente y su resultado no se ha publicado. La conversación se ha guardado para continuar.",
+	},
+	MsgPendingReviewWaiting: {
+		LangEnglish:            "⏸ Awaiting review; the result has not been released. The conversation is saved while the review is pending.",
+		LangChinese:            "⏸ 正在等待复核，当前结果尚未发布。已保留会话，等待复核结果。",
+		LangTraditionalChinese: "⏸ 正在等待複核，目前結果尚未發布。已保留會話，等待複核結果。",
+		LangJapanese:           "⏸ レビュー待ちのため、結果は未公開です。レビュー中も会話は保存されています。",
+		LangSpanish:            "⏸ Pendiente de revisión; el resultado no se ha publicado. La conversación se ha guardado durante la revisión.",
+	},
+	MsgPendingReviewWaitingNamed: {
+		LangEnglish:            "⏸ Awaiting review by %s; the result has not been released. The conversation is saved while the review is pending.",
+		LangChinese:            "⏸ 正在等待 %s 复核，当前结果尚未发布。已保留会话，等待复核结果。",
+		LangTraditionalChinese: "⏸ 正在等待 %s 複核，目前結果尚未發布。已保留會話，等待複核結果。",
+		LangJapanese:           "⏸ %s のレビュー待ちのため、結果は未公開です。レビュー中も会話は保存されています。",
+		LangSpanish:            "⏸ Pendiente de revisión por %s; el resultado no se ha publicado. La conversación se ha guardado durante la revisión.",
+	},
+	MsgPendingPreparation: {
+		LangEnglish:            "⏸ Delivery materials still need preparation; the result has not been released. The conversation is saved for continuation.",
+		LangChinese:            "⏸ 交付材料待补齐，当前结果尚未发布。已保留会话，可继续处理。",
+		LangTraditionalChinese: "⏸ 交付材料待補齊，目前結果尚未發布。已保留會話，可繼續處理。",
+		LangJapanese:           "⏸ 提出資料の準備が必要なため、結果は未公開です。続行できるよう会話を保存しました。",
+		LangSpanish:            "⏸ Falta preparar material de entrega; el resultado no se ha publicado. La conversación se ha guardado para continuar.",
+	},
+	MsgPendingChangesRequired: {
+		LangEnglish:            "⏸ Review requires changes; the result has not been released. The conversation is saved for continuation.",
+		LangChinese:            "⏸ 复核要求修正，当前结果尚未发布。已保留会话，可继续处理。",
+		LangTraditionalChinese: "⏸ 複核要求修正，目前結果尚未發布。已保留會話，可繼續處理。",
+		LangJapanese:           "⏸ レビューで修正が必要と判断されたため、結果は未公開です。続行できるよう会話を保存しました。",
+		LangSpanish:            "⏸ La revisión requiere cambios; el resultado no se ha publicado. La conversación se ha guardado para continuar.",
+	},
+	MsgPendingTask: {
+		LangEnglish:            "Task: %s",
+		LangChinese:            "任务：%s",
+		LangTraditionalChinese: "任務：%s",
+		LangJapanese:           "タスク：%s",
+		LangSpanish:            "Tarea: %s",
+	},
+	MsgPendingCode: {
+		LangEnglish:            "Status code: %s",
+		LangChinese:            "状态码：%s",
+		LangTraditionalChinese: "狀態碼：%s",
+		LangJapanese:           "状態コード：%s",
+		LangSpanish:            "Código de estado: %s",
+	},
+	MsgVerifiedReviewReceipt: {
+		LangEnglish:            "Independent review completed: %s · Task %s · Revision %s",
+		LangChinese:            "独立复核已完成：%s · 任务 %s · 修订 %s",
+		LangTraditionalChinese: "獨立複核已完成：%s · 任務 %s · 修訂 %s",
+		LangJapanese:           "独立レビュー完了：%s · タスク %s · リビジョン %s",
+		LangSpanish:            "Revisión independiente completada: %s · Tarea %s · Revisión %s",
 	},
 	MsgBackgroundAutoDenied: {
 		LangEnglish:            "⚠️ Background task requested permission for `%s` but was auto-denied (no active user turn). Send a message or use `/yolo` to approve future requests.",

@@ -33,6 +33,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +71,31 @@ func TestCUJ_A8_ImmediateReceiptsDuringStartupAndQueue(t *testing.T) {
 	env.startup.session.events <- Event{Type: EventResult, Content: "second answer", Done: true}
 	env.awaitVisible("second answer")
 	env.assertReceipts("first", "second")
+}
+
+// A clean pending turn must release a queued follow-up, without marking the
+// original task completed or changing either message's receipt.
+func TestCUJ_A8_PendingReviewReleasesQueuedFollowup(t *testing.T) {
+	env := newReceiptAckEnv(t, nil)
+	// User action 1: submit a task that will need external review.
+	env.send("pending-first", "prepare work for review", 1000)
+	env.awaitStartup()
+	close(env.startup.release)
+	env.awaitSendCount(1)
+	// User action 2: queue a follow-up while the first turn is still running.
+	env.send("pending-second", "continue the work", 2000)
+	env.awaitVisible(env.engine.i18n.T(MsgMessageQueued))
+	// User action 3: local status remains usable during the pending work.
+	env.send("pending-status", "/status", 3000)
+	env.startup.session.events <- reviewPendingFixture()
+	env.awaitVisible("Awaiting review by Reviewer One")
+	env.awaitSendCount(2)
+	env.startup.session.events <- Event{Type: EventResult, Content: "queued-followup-delivered", Done: true}
+	env.awaitVisible("queued-followup-delivered")
+	env.assertReceipts("pending-first", "pending-second")
+	if env.sentContains("unpublished-candidate") || env.sentContains("❌") {
+		t.Fatalf("pending queue journey exposed a candidate or failure: %v", env.plat.getSent())
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2123,6 +2149,83 @@ func TestCUJ_G5_ReviewPendingIPCResumesOriginalConversation(t *testing.T) {
 	}
 	if len(backend.getSentPrompts()) != 3 {
 		t.Fatal("three turns did not reach the same backend conversation")
+	}
+}
+
+// Pending review is a clean turn boundary. A user can explicitly continue and
+// inspect status before the pinned IPC callback publishes the reviewed result.
+func TestCUJ_G5_PendingReviewContinueAndPublish(t *testing.T) {
+	env := newCUJEnv(t)
+	t.Cleanup(func() { _ = env.engine.Stop() })
+	dir, err := filepath.EvalSymlinks(env.tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.engine.agent = &cujIPCAgent{cujAgent: env.agent, dir: dir}
+	env.engine.platforms = []Platform{&cujReplyCtxPlatform{env.plat}}
+	api := &APIServer{engines: map[string]*Engine{"test": env.engine}}
+	if err := api.initSessionIPC(filepath.Join(t.TempDir(), "receipts")); err != nil {
+		t.Fatal(err)
+	}
+	env.agent.setNextSessionEvents([]Event{reviewPendingFixture()}, 0)
+	// User action 1: request work; only a neutral pending status is delivered.
+	key := env.userSends("clean-review", "prepare original work alpha")
+	env.waitFor("review pending", 2*time.Second, func() bool { return env.sentContains("Awaiting review by Reviewer One") })
+	session := env.activeSession(key)
+	env.waitFor("pending turn released", 2*time.Second, func() bool { return !session.Busy() })
+	env.agent.mu.Lock()
+	backend := env.agent.sessions[0]
+	env.agent.mu.Unlock()
+	if env.sentContains("unpublished-candidate") || env.sentContains("❌") {
+		t.Fatalf("pending work appeared as delivery or failure: %v", env.plat.getSent())
+	}
+	// User action 2: continue the same task while its review is still pending.
+	pending := reviewPendingFixture()
+	backend.mu.Lock()
+	backend.nextEventOverride = &pending
+	backend.mu.Unlock()
+	env.plat.clearSent()
+	env.userSends("clean-review", "continue")
+	env.waitFor("continued review still pending", 2*time.Second, func() bool { return env.sentContains("task-42") })
+	env.waitFor("continued turn released", 2*time.Second, func() bool { return !session.Busy() })
+	// User action 3: check status before the external review returns.
+	env.plat.clearSent()
+	env.userSends("clean-review", "/status")
+	env.waitFor("status visible", 2*time.Second, func() bool { return len(env.plat.getSent()) > 0 })
+	const candidate = "reviewed-original-body"
+	approved := Event{Type: EventResult, Content: candidate, Done: true,
+		Metadata: map[string]any{"verified_review": map[string]any{"reviewer": "Reviewer One", "task_id": "task-42", "revision": "rev-3"}}}
+	backend.mu.Lock()
+	backend.nextEventOverride = &approved
+	backend.mu.Unlock()
+	env.plat.clearSent()
+	input := IPCInput{EventID: strings.Repeat("d", 64),
+		Target: IPCTarget{Project: "test", SessionKey: key, SessionID: session.ID, AgentSessionID: session.GetAgentSessionID(), CWD: dir},
+		Prompt: "review receipt ready for original work alpha"}
+	if response := ipcPost(t, api.handleIPCEvent, input); response.Code != http.StatusOK {
+		t.Fatal(response.Body.String())
+	}
+	env.waitFor("reviewed result and separate receipt visible", 2*time.Second, func() bool {
+		return env.sentContains(candidate) && env.sentContains("Independent review completed:")
+	})
+	env.waitFor("review callback released", 2*time.Second, func() bool { return !session.Busy() })
+	sent := env.plat.getSent()
+	if len(sent) != 2 || sent[0] != candidate || !strings.Contains(sent[1], "rev-3") {
+		t.Fatalf("review receipt changed or duplicated the candidate: %v", sent)
+	}
+	if receipt := ipcWaitStatus(t, api, input.EventID, "delivered"); receipt.Method != "start" {
+		t.Fatalf("callback did not resume the pinned idle conversation: %+v", receipt)
+	}
+	// User action 4: history contains published work, never the pending draft.
+	env.plat.clearSent()
+	env.userSends("clean-review", "/history")
+	for _, text := range []string{"original work alpha", "continue", candidate} {
+		if !env.sentContains(text) {
+			t.Fatalf("history lost %q: %v", text, env.plat.getSent())
+		}
+	}
+	if env.sentContains("unpublished-candidate") || len(backend.getSentPrompts()) != 3 {
+		t.Fatal("pending continuation lost the original backend or published its draft")
 	}
 }
 

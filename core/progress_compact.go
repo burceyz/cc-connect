@@ -31,6 +31,7 @@ type ProgressCardState string
 const (
 	ProgressCardStateRunning   ProgressCardState = "running"
 	ProgressCardStateCompleted ProgressCardState = "completed"
+	ProgressCardStatePending   ProgressCardState = "pending"
 	ProgressCardStateFailed    ProgressCardState = "failed"
 )
 
@@ -494,7 +495,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 	return true
 }
 
-// Finalize updates card progress state (running/completed/failed) without
+// Finalize updates card progress state (running/completed/pending/failed) without
 // appending a new progress entry.
 func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
 	if !w.enabled || w.failed || w.style != progressStyleCard || !w.usePayload || w.handle == nil {

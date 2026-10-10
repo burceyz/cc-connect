@@ -458,6 +458,7 @@ const (
 	EventToolUse           EventType = "tool_use"           // tool invocation info
 	EventToolResult        EventType = "tool_result"        // tool execution result
 	EventResult            EventType = "result"             // final aggregated result
+	EventPending           EventType = "pending"            // turn ended cleanly; task is not ready for delivery
 	EventError             EventType = "error"              // error occurred
 	EventPermissionRequest EventType = "permission_request" // agent requests permission via stdio protocol
 	EventThinking          EventType = "thinking"           // thinking/processing status
@@ -493,7 +494,8 @@ type Event struct {
 	Questions                []UserQuestion // populated when ToolName == "AskUserQuestion"
 	Done                     bool
 	Error                    error
-	InputTokens              int // token usage from agent result events
+	Pending                  *PendingInfo // populated for EventPending; Content is never a deliverable on this event
+	InputTokens              int          // token usage from agent result events
 	OutputTokens             int
 	CacheCreationInputTokens int            // cache-write tokens (new content written to cache)
 	CacheReadInputTokens     int            // cache-read tokens (prior context retrieved from cache)

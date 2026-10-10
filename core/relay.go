@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -198,7 +199,9 @@ type RelayRequest struct {
 
 // RelayResponse is the result of a relay send.
 type RelayResponse struct {
-	Response string `json:"response"`
+	Response string       `json:"response"`
+	Status   string       `json:"status,omitempty"`
+	Pending  *PendingInfo `json:"pending,omitempty"`
 }
 
 // Send delivers a message from one bot to another and returns the response.
@@ -256,6 +259,17 @@ func (rm *RelayManager) Send(ctx context.Context, req RelayRequest) (*RelayRespo
 
 	response, err := targetEngine.HandleRelay(relayCtx, req.From, req.SessionKey, req.Message)
 	if err != nil {
+		var pending *pendingTurnError
+		if errors.As(err, &pending) {
+			if visibility != RelayVisibilityNone {
+				label := fmt.Sprintf("[%s] %s", toName, targetEngine.i18n.T(MsgPendingTitle))
+				if visibility == RelayVisibilityFull {
+					label = fmt.Sprintf("[%s]\n%s", toName, pending.message)
+				}
+				rm.sendToGroup(ctx, targetEngine, platform, groupSessionKey, label)
+			}
+			return &RelayResponse{Response: pending.message, Status: "pending", Pending: &pending.info}, nil
+		}
 		return nil, fmt.Errorf("relay: %w", err)
 	}
 

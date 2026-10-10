@@ -795,6 +795,10 @@ func (s *APIServer) handleRelaySend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if resp.Pending != nil {
+		apiJSON(w, http.StatusAccepted, resp)
+		return
+	}
 
 	apiJSON(w, http.StatusOK, resp)
 }

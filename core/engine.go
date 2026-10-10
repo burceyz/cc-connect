@@ -2687,7 +2687,8 @@ func (e *Engine) isQueuedUserMessageStaleForDrainLocked(state *interactiveState,
 }
 
 // noteUserTurnCompleted advances lastCompletedUserMessageTimeMs after an
-// agent turn ends with EventResult.
+// agent turn ends cleanly with EventResult or EventPending. This is a message
+// deduplication watermark, not a record of successful task delivery.
 func (e *Engine) noteUserTurnCompleted(state *interactiveState) {
 	state.mu.Lock()
 	t := state.currentTurnUserMessageTimeMs
@@ -4421,8 +4422,10 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	agentSession, err := agent.StartSession(e.ctx, startSessionID)
 	startElapsed := time.Since(startAt)
 	if err != nil {
-		// If resume/continue failed, try a fresh session as fallback.
-		if startSessionID != "" {
+		// A temporarily unreadable backend history is not evidence that its
+		// conversation is invalid. Preserve the binding for a later retry.
+		var unavailable *ResumeUnavailableError
+		if startSessionID != "" && !errors.As(err, &unavailable) {
 			slog.Error("session resume failed, falling back to fresh session",
 				"session_key", sessionKey, "failed_session_id", startSessionID,
 				"error", err, "elapsed", startElapsed)
@@ -5136,6 +5139,29 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					"session", sessionKey,
 					"status", event.ToolStatus)
 
+			case EventPending:
+				state.mu.Lock()
+				pendingAgent := state.agent
+				if pendingAgent == nil {
+					pendingAgent = e.agent
+				}
+				state.eventsNeedResync = false
+				state.sideText = ""
+				state.mu.Unlock()
+				persistPendingSessionID(session, sessions, agentSession, pendingAgent.Name(), event.SessionID)
+				e.send(p, replyCtx, pendingStatusText(e.i18n, event.Pending))
+				// A pending turn has no publishable response. Drop its buffer so
+				// a later callback cannot accidentally aggregate candidate text.
+				textParts = nil
+				toolsUsed = nil
+				turnActive = false
+				if workspaceDir != "" && e.workspacePool != nil {
+					if ws := e.workspacePool.Get(workspaceDir); ws != nil {
+						ws.EndTurn()
+					}
+				}
+				e.scheduleAgentSessionIdleClose(sessionKey, state)
+
 			case EventResult:
 				fullResponse := event.Content
 				if fullResponse == "" && len(textParts) > 0 {
@@ -5145,6 +5171,9 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				if fullResponse != "" {
 					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
 						e.send(p, replyCtx, chunk)
+					}
+					if receipt := verifiedReviewReceipt(e.i18n, event); receipt != "" {
+						e.send(p, replyCtx, receipt)
 					}
 				}
 
@@ -6011,6 +6040,61 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				idleTimer.Reset(e.eventIdleTimeout)
 			}
 
+		case EventPending:
+			cp.Finalize(ProgressCardStatePending)
+			// Pending is a clean turn boundary, not a failure and not a
+			// delivered assistant answer. The caller drains queued messages
+			// and restarts the idle reader after we release this turn.
+			state.mu.Lock()
+			backend := state.agentSession
+			state.eventsNeedResync = false
+			state.sideText = ""
+			state.mu.Unlock()
+			persistPendingSessionID(session, sessions, backend, replyAgent.Name(), event.SessionID)
+			e.noteUserTurnCompleted(state)
+			textParts = nil
+			partialText = ""
+			cardAnswerText.Reset()
+			doneReaction = nil
+			notice := pendingStatusText(e.i18n, event.Pending)
+			delivered := false
+			if streamCard != nil && !streamCard.Failed() {
+				sp.discard()
+				if err := streamCard.Finalize(e.ctx, notice); err != nil {
+					slog.Warn("streaming card pending update failed", "error", err)
+				} else {
+					delivered = true
+				}
+			} else if hasRichCard {
+				sp.discard()
+				card := buildResolvedRichCard(CardStatusPending, e.i18n.T(MsgPendingTitle), toolSteps, notice, false, "")
+				if cardMessageID != nil {
+					if updater, ok := p.(MessageUpdater); ok {
+						if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err == nil {
+							delivered = true
+						} else {
+							slog.Warn("rich card pending update failed", "error", err)
+						}
+					}
+				} else if starter, ok := p.(PreviewStarter); ok {
+					if handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card); err == nil && handle != nil {
+						delivered = true
+					} else {
+						slog.Warn("rich card pending send failed", "error", err, "handle_nil", handle == nil)
+					}
+				}
+			} else {
+				sp.setStatus(CardStatusPending)
+				delivered = sp.finish(notice, "")
+			}
+			if !delivered {
+				sendWorkspace(p, replyCtx, notice)
+			}
+			pending := normalizedPendingInfo(event.Pending)
+			slog.Info("turn pending", "session", session.ID, "task", pending.TaskID,
+				"stage", pending.Stage, "code", pending.Code)
+			return
+
 		case EventResult:
 			// Non-terminal result events (e.g. mid-turn compaction: Claude
 			// Code's auto-context-compact emits type:"result" with
@@ -6407,6 +6491,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			if elapsed := time.Since(replyStart); elapsed >= slowPlatformSend {
 				slog.Warn("slow final reply send", "platform", p.Name(), "elapsed", elapsed, "response_len", len(fullResponse))
+			}
+
+			if !isSilent && !suppressDuplicate {
+				if receipt := verifiedReviewReceipt(e.i18n, event); receipt != "" {
+					sendWorkspace(p, replyCtx, receipt)
+				}
 			}
 
 			// TTS: async voice reply if enabled (skipped for silent replies)
@@ -10995,6 +11085,21 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 				}
 				textParts = append(textParts, fmt.Sprintf(e.i18n.T(MsgToolResult), tn, out)+"\n")
 			}
+		case EventPending:
+			state.mu.Lock()
+			backend := state.agentSession
+			pendingAgent := state.agent
+			if pendingAgent == nil {
+				pendingAgent = e.agent
+			}
+			state.eventsNeedResync = false
+			state.mu.Unlock()
+			persistPendingSessionID(session, sessions, backend, pendingAgent.Name(), event.SessionID)
+			if !auto {
+				e.send(p, replyCtx, pendingStatusText(e.i18n, event.Pending))
+			}
+			e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked, lockGen)
+			return
 		case EventResult:
 			result := event.Content
 			if result == "" && len(textParts) > 0 {
@@ -16421,7 +16526,8 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	if err != nil {
 		// Resume failed — fall back to a fresh session so the relay is not
 		// permanently broken by a corrupted/stale session ID.
-		if session.GetAgentSessionID() != "" {
+		var unavailable *ResumeUnavailableError
+		if session.GetAgentSessionID() != "" && !errors.As(err, &unavailable) {
 			slog.Warn("relay: session resume failed, trying fresh session",
 				"relay_key", relaySessionKey, "error", err)
 			session.SetAgentSessionID("", agent.Name())
@@ -16483,6 +16589,11 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 				}
 				textParts = append(textParts, fmt.Sprintf(e.i18n.T(MsgToolResult), tn, out)+"\n\n")
 			}
+		case EventPending:
+			persistPendingSessionID(session, sessions, agentSession, agent.Name(), event.SessionID)
+			pending := normalizedPendingInfo(event.Pending)
+			agentSession.Close()
+			return "", &pendingTurnError{info: pending, message: pendingStatusText(e.i18n, &pending)}
 		case EventResult:
 			// Use agentSession.CurrentSessionID() for the same reason as above.
 			if currentID := agentSession.CurrentSessionID(); currentID != "" {
@@ -16569,6 +16680,11 @@ func (e *Engine) drainRelaySession(agentSession AgentSession, session *Session, 
 				sessions.Save()
 			}
 			switch ev.Type {
+			case EventPending:
+				persistPendingSessionID(session, sessions, agentSession, agentName, ev.SessionID)
+				slog.Info("relay: background drain ended with pending task", "relay_key", relaySessionKey)
+				agentSession.Close()
+				return
 			case EventResult:
 				slog.Info("relay: background drain completed (agent finished turn)",
 					"relay_key", relaySessionKey)

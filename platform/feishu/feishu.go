@@ -4699,6 +4699,9 @@ func progressAgentLabel(agent string) string {
 func progressStateMeta(state core.ProgressCardState, lang string, agent string) (title string, template string, footer string) {
 	zh := isZhLikeProgressLang(lang)
 	switch state {
+	case core.ProgressCardStatePending:
+		i18n := core.NewI18n(core.NormalizeLanguageString(lang))
+		return fmt.Sprintf("%s · %s", agent, i18n.T(core.MsgPendingTitle)), "grey", i18n.T(core.MsgPendingFooter)
 	case core.ProgressCardStateCompleted:
 		if zh {
 			return fmt.Sprintf("%s · 已完成", agent), "green", "本过程卡片已停止更新，完整答复见下一条消息。"
@@ -7203,8 +7206,8 @@ const maxRichCardJSONBytes = 28000
 // buildRichCard renders a Card 2.0 "single-card" turn with collapsible
 // reasoning/tool panels, streaming markdown body, status-colored header, and a
 // pre-composed multi-line statusFooter (engine-owned, includes elapsed).
-func buildRichCard(status core.CardStatus, _ string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) string {
-	b, err := buildRichCardJSONBytes(status, steps, markdown, streaming, statusFooter)
+func buildRichCard(status core.CardStatus, title string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) string {
+	b, err := buildRichCardJSONBytes(status, title, steps, markdown, streaming, statusFooter)
 	if err != nil {
 		slog.Debug("feishu: build rich card marshal failed, fallback to basic card", "error", err)
 		return buildCardJSONWithStatus(markdown, status)
@@ -7226,7 +7229,7 @@ func buildRichCard(status core.CardStatus, _ string, steps []core.ToolStep, mark
 		{perLane: 3, textLen: 80},
 	} {
 		compactSteps := compactRichStepsForCardSize(steps, limit.perLane, limit.textLen)
-		compact, err := buildRichCardJSONBytes(status, compactSteps, markdown, streaming, statusFooter)
+		compact, err := buildRichCardJSONBytes(status, title, compactSteps, markdown, streaming, statusFooter)
 		if err == nil && len(compact) <= maxRichCardJSONBytes {
 			slog.Debug("feishu: rich card exceeded size limit, compacted panels",
 				"original_size", len(b),
@@ -7246,7 +7249,7 @@ func buildRichCard(status core.CardStatus, _ string, steps []core.ToolStep, mark
 	return buildCardJSONWithStatus(fallbackMarkdown, status)
 }
 
-func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) ([]byte, error) {
+func buildRichCardJSONBytes(status core.CardStatus, title string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) ([]byte, error) {
 	reasoningSteps, toolSteps := splitRichStepsByLane(steps)
 	panelMaps := make([]map[string]any, 0, 2)
 	if len(reasoningSteps) > 0 {
@@ -7309,6 +7312,12 @@ func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markd
 	headerTemplate := "blue"
 	headerTitle := pickThinkingVerb()
 	switch status {
+	case core.CardStatusPending:
+		headerTemplate = "grey"
+		headerTitle = strings.TrimSpace(title)
+		if headerTitle == "" {
+			headerTitle = core.NewI18n(core.DetectLanguage(markdown)).T(core.MsgPendingTitle)
+		}
 	case core.CardStatusDone:
 		headerTemplate = "green"
 		headerTitle = "Done"

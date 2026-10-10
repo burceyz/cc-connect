@@ -163,6 +163,9 @@ func buildDiscordToolResultSummary(item core.ProgressCardEntry, lang string) str
 
 func discordProgressStateMeta(state core.ProgressCardState, lang string, agent string) (title string, color int, footer string) {
 	switch state {
+	case core.ProgressCardStatePending:
+		i18n := core.NewI18n(core.NormalizeLanguageString(lang))
+		return fmt.Sprintf("%s · %s", agent, i18n.T(core.MsgPendingTitle)), 0x95A5A6, i18n.T(core.MsgPendingFooter)
 	case core.ProgressCardStateCompleted:
 		return fmt.Sprintf("%s · %s", agent, discordProgressCompletedText(lang)), 0x57F287, discordProgressCompletedFooter(lang)
 	case core.ProgressCardStateFailed:

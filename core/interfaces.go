@@ -709,7 +709,8 @@ type StreamingCard interface {
 	// Update replaces the card content with the given markdown.
 	// Implementations should throttle calls internally.
 	Update(ctx context.Context, content string) error
-	// Finalize sends the final content and marks the card as complete.
+	// Finalize ends streaming and replaces the card content. The content
+	// describes the task outcome; ending a stream does not imply success.
 	Finalize(ctx context.Context, content string) error
 	// Failed returns true if the card has entered a failed state.
 	Failed() bool
@@ -731,6 +732,7 @@ const (
 	CardStatusThinking CardStatus = "thinking" // grey
 	CardStatusWorking  CardStatus = "working"  // blue
 	CardStatusDone     CardStatus = "done"     // green
+	CardStatusPending  CardStatus = "pending"  // grey; stream ended, task remains pending
 	CardStatusError    CardStatus = "error"    // red
 )
 
