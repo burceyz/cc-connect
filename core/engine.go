@@ -557,6 +557,7 @@ type interactiveState struct {
 	// the active CC session or backend instance changes.
 	ipcOrigin          string
 	ipcOriginSessionID string
+	ipcQueueInstanceID string // non-secret, assigned once under mu for queue retry fences
 	// busySession is the core.Session whose busy lock guards the in-flight
 	// turn. Set by getOrCreateInteractiveStateWith so /stop can release the
 	// lock after tearing the turn down (#1830).
@@ -3953,6 +3954,14 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		return
 	}
 
+	state := msg.ipcQueueState
+	if state != nil && e.currentIPCQueueBackend(interactiveKey, state) == nil {
+		if msg.OnAgentInput != nil {
+			msg.OnAgentInput(errIPCQueueInstanceChanged)
+		}
+		return
+	}
+
 	turnStart := time.Now()
 
 	e.i18n.DetectAndSet(msg.Content)
@@ -3967,7 +3976,13 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if agent != e.agent {
 		agentOverride = agent
 	}
-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
+	if state == nil {
+		state = e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
+	} else {
+		state.mu.Lock()
+		state.busySession = session
+		state.mu.Unlock()
+	}
 
 	// Set workspaceDir on the state for idle reaper identification
 	if workspaceDir != "" {
@@ -4070,6 +4085,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 				msg.OnAgentInput(err)
 			}
 			sendDone <- err
+		}
+		if msg.ipcQueueState != nil && (as == nil || e.currentIPCQueueBackend(interactiveKey, msg.ipcQueueState) != as) {
+			finishInput(errIPCQueueInstanceChanged)
+			return
 		}
 		if as == nil {
 			finishInput(fmt.Errorf("agent session became nil"))

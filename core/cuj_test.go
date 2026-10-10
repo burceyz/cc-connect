@@ -2031,6 +2031,101 @@ func TestCUJ_G5_ToolFailureSurfacesToUser(t *testing.T) {
 	}
 }
 
+type cujIPCAgent struct {
+	*cujAgent
+	dir string
+}
+
+func (a *cujIPCAgent) GetWorkDir() string      { return a.dir }
+func (a *cujIPCAgent) SupportsLiveInput() bool { return true }
+
+// A deferred external review ends this turn with EventError while the backend
+// remains alive. Its completion must resume the original conversation, and the
+// next user turn must still work without losing a fresh result during resync.
+func TestCUJ_G5_ReviewPendingIPCResumesOriginalConversation(t *testing.T) {
+	env := newCUJEnv(t)
+	dir, err := filepath.EvalSymlinks(env.tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.engine.agent = &cujIPCAgent{cujAgent: env.agent, dir: dir}
+	env.engine.platforms = []Platform{&cujReplyCtxPlatform{env.plat}}
+	api := &APIServer{engines: map[string]*Engine{"test": env.engine}}
+	if err := api.initSessionIPC(filepath.Join(t.TempDir(), "receipts")); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = env.engine.Stop() })
+	env.agent.setNextSessionEvents([]Event{
+		{Type: EventError, Error: errors.New("review_pending_fixture"), Done: true},
+		{Type: EventText, Content: "stale_tail_from_pending_turn"},
+	}, 0)
+
+	// User action 1: the requested work reaches a pending review, not success.
+	key := env.userSends("review-ipc", "prepare the original change alpha")
+	env.waitFor("pending review visible", 2*time.Second, func() bool {
+		return env.sentContains("review_pending_fixture")
+	})
+	session := env.activeSession(key)
+	env.waitFor("pending turn released", 2*time.Second, func() bool { return !session.Busy() })
+	target := IPCTarget{Project: "test", SessionKey: key, SessionID: session.ID,
+		AgentSessionID: session.GetAgentSessionID(), CWD: dir}
+
+	// User action 2: status is still available while the review is elsewhere.
+	env.plat.clearSent()
+	env.userSends("review-ipc", "/status")
+	env.waitFor("status reply", 2*time.Second, func() bool { return len(env.plat.getSent()) > 0 })
+	env.agent.mu.Lock()
+	backend := env.agent.sessions[0]
+	env.agent.mu.Unlock()
+	backend.mu.Lock()
+	backend.reply = "review_confirmed_fixture"
+	backend.mu.Unlock()
+
+	// External completion uses the real IPC receiver and its pinned idle path.
+	env.plat.clearSent()
+	input := IPCInput{EventID: strings.Repeat("b", 64), Target: target,
+		Prompt: "external review is ready for the original change alpha"}
+	if response := ipcPost(t, api.handleIPCEvent, input); response.Code != 200 {
+		t.Fatal(response.Body.String())
+	}
+	env.waitFor("original conversation resumed after review", 2*time.Second, func() bool {
+		return env.sentContains("review_confirmed_fixture")
+	})
+	if env.sentContains("stale_tail_from_pending_turn") {
+		t.Fatal("stale failed-turn output escaped during IPC resumption")
+	}
+	if strings.Count(strings.Join(env.plat.getSent(), "\n"), "review_confirmed_fixture") != 1 {
+		t.Fatal("review callback produced duplicate or missing user-visible results")
+	}
+	if receipt := ipcWaitStatus(t, api, input.EventID, "delivered"); receipt.Method != "start" {
+		t.Fatal("review callback did not use the idle session path")
+	}
+	env.waitFor("callback turn released", 2*time.Second, func() bool { return !session.Busy() })
+
+	// User action 3: a subsequent ordinary message continues that conversation.
+	backend.mu.Lock()
+	backend.reply = "followup_confirmed_fixture"
+	backend.mu.Unlock()
+	env.plat.clearSent()
+	env.userSends("review-ipc", "continue after the review result")
+	env.waitFor("follow-up reply", 2*time.Second, func() bool {
+		return env.sentContains("followup_confirmed_fixture")
+	})
+	env.waitFor("follow-up released", 2*time.Second, func() bool { return !session.Busy() })
+
+	// User action 4: history includes the original work, callback and follow-up.
+	env.plat.clearSent()
+	env.userSends("review-ipc", "/history")
+	for _, text := range []string{"original change alpha", "review_confirmed_fixture", "followup_confirmed_fixture"} {
+		if !env.sentContains(text) {
+			t.Fatalf("user history lost %q: %v", text, env.plat.getSent())
+		}
+	}
+	if len(backend.getSentPrompts()) != 3 {
+		t.Fatal("three turns did not reach the same backend conversation")
+	}
+}
+
 // CUJ-G6 · Network flap: undelivered outbound messages eventually arrive
 // once the transport recovers. Platform-specific retry logic; covered by
 // platform/feishu/token_retry_test.go and transient_retry_test.go.

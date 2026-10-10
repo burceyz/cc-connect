@@ -32,11 +32,32 @@ const sessionIPCProtocol = "cc-connect-session-ipc-v1"
 // Origins are deliberately process-local. A persisted conversation is not
 // evidence that a tool inherited its environment from this live instance.
 func newIPCOrigin() (string, error) {
+	id, err := newIPCIdentity()
+	if err != nil {
+		return "", err
+	}
+	return "cc-origin-v1-" + id, nil
+}
+
+func newIPCIdentity() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("ipc origin identity: %w", err)
+		return "", fmt.Errorf("ipc identity: %w", err)
 	}
-	return "cc-origin-v1-" + hex.EncodeToString(b), nil
+	return hex.EncodeToString(b), nil
+}
+
+func (state *interactiveState) ipcQueueIdentity() (string, error) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.ipcQueueInstanceID == "" {
+		id, err := newIPCIdentity()
+		if err != nil {
+			return "", err
+		}
+		state.ipcQueueInstanceID = id
+	}
+	return state.ipcQueueInstanceID, nil
 }
 
 // IPCTarget pins the existing conversation, never a newest-session alias.
@@ -62,6 +83,12 @@ type IPCReceipt struct {
 	Method         string   `json:"method,omitempty"`
 	TurnID         string   `json:"turn_id,omitempty"`
 	Boot           string   `json:"boot"`
+	AttemptID      string   `json:"attempt_id,omitempty"`
+	InstanceID     string   `json:"instance_id,omitempty"`
+	Phase          string   `json:"phase,omitempty"`
+	QueuedAt       string   `json:"queued_at,omitempty"`
+	ClaimedAt      string   `json:"claimed_at,omitempty"`
+	InjectedAt     string   `json:"injected_at,omitempty"`
 	UpdatedAt      string   `json:"updated_at"`
 	AcknowledgedAt string   `json:"acknowledged_at,omitempty"`
 }
@@ -348,7 +375,49 @@ func (s *APIServer) handleIPCEvent(w http.ResponseWriter, r *http.Request) {
 		apiJSON(w, http.StatusConflict, map[string]string{"code": "ipc_receipt_unreadable"})
 		return
 	}
-	receipt := &IPCReceipt{Input: input, SHA256: digest, Status: "dispatching", Boot: s.ipcBoot}
+	if prior != nil && (prior.Method == "queue" || prior.InstanceID != "") {
+		previousAttempt, previousBoot := prior.AttemptID, prior.Boot
+		// Never take interactiveMu while holding ipcMu: a backend Close may
+		// report progress while its engine holds interactiveMu. Re-read after
+		// taking the snapshot so another sender cannot race this safe retry.
+		s.ipcMu.Unlock()
+		retryEngine, retryState := s.ipcQueueRetryState(input.Target)
+		s.ipcMu.Lock()
+		prior, err = s.ipcRead(input.EventID)
+		if err != nil || prior.SHA256 != digest {
+			s.ipcMu.Unlock()
+			apiJSON(w, http.StatusConflict, map[string]string{"code": "ipc_receipt_changed"})
+			return
+		}
+		if prior.Status != "waiting" || prior.AttemptID != previousAttempt || prior.Boot != previousBoot {
+			s.ipcMu.Unlock()
+			apiJSON(w, http.StatusOK, prior)
+			return
+		}
+		if !ipcQueueRetryValid(prior, s.ipcBoot, retryEngine, retryState) {
+			prior.Status, prior.Code = "blocked", "ipc_queue_instance_changed"
+			if err := s.ipcSave(prior); err != nil {
+				s.ipcMu.Unlock()
+				apiJSON(w, http.StatusInternalServerError, map[string]string{"code": "ipc_receipt_write_failed"})
+				return
+			}
+			s.ipcMu.Unlock()
+			apiJSON(w, http.StatusOK, prior)
+			return
+		}
+	}
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		s.ipcMu.Unlock()
+		apiJSON(w, http.StatusInternalServerError, map[string]string{"code": "ipc_attempt_identity_failed"})
+		return
+	}
+	receipt := &IPCReceipt{Input: input, SHA256: digest, Status: "dispatching", Boot: s.ipcBoot,
+		AttemptID: hex.EncodeToString(nonce)}
+	if prior != nil && (prior.Method == "queue" || prior.InstanceID != "") {
+		receipt.InstanceID = prior.InstanceID
+	}
+	attempt := ipcAttempt{eventID: input.EventID, id: receipt.AttemptID, boot: receipt.Boot, instanceID: receipt.InstanceID}
 	e, session, err := s.resolveIPCTarget(&input.Target, false)
 	if err != nil {
 		receipt.Status, receipt.Code = "blocked", err.Error()
@@ -360,7 +429,7 @@ func (s *APIServer) handleIPCEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	s.ipcMu.Unlock()
 	if receipt.Status == "dispatching" {
-		s.dispatchIPC(e, session, input)
+		s.dispatchIPC(e, session, input, attempt)
 	}
 	s.ipcMu.Lock()
 	result, err := s.ipcRead(input.EventID)
@@ -372,34 +441,113 @@ func (s *APIServer) handleIPCEvent(w http.ResponseWriter, r *http.Request) {
 	apiJSON(w, http.StatusOK, result)
 }
 
-func (s *APIServer) finishIPC(id, status, method, turn, code string) {
+// A retry from waiting is a distinct attempt, even within the same receiver
+// boot. Late backend callbacks must never modify its replacement's receipt.
+type ipcAttempt struct {
+	eventID    string
+	id         string
+	boot       string
+	instanceID string
+}
+
+var errIPCQueueInstanceChanged = errors.New("ipc_queue_instance_changed")
+
+func (s *APIServer) ipcQueueRetryState(target IPCTarget) (*Engine, *interactiveState) {
+	s.mu.RLock()
+	e := s.engines[target.Project]
+	s.mu.RUnlock()
+	if e == nil {
+		return nil, nil
+	}
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[target.SessionKey]
+	e.interactiveMu.Unlock()
+	return e, state
+}
+
+func ipcQueueRetryValid(receipt *IPCReceipt, boot string, e *Engine, state *interactiveState) bool {
+	if receipt.Boot != boot || receipt.InstanceID == "" || e == nil || state == nil || e.ctx.Err() != nil {
+		return false
+	}
+	state.mu.Lock()
+	as := state.agentSession
+	matching := !state.stopped && state.ipcQueueInstanceID == receipt.InstanceID
+	state.mu.Unlock()
+	return matching && as != nil && as.Alive()
+}
+
+// Queue retries that have become idle must never enter the normal restore
+// path. Recheck the exact instance when the asynchronous engine turn starts
+// and immediately before Send, including a stop after the HTTP idle lease.
+func (e *Engine) currentIPCQueueBackend(key string, expected *interactiveState) AgentSession {
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+	if expected == nil || e.interactiveStates[key] != expected || e.ctx.Err() != nil {
+		return nil
+	}
+	expected.mu.Lock()
+	as, stopped := expected.agentSession, expected.stopped
+	expected.mu.Unlock()
+	if stopped || as == nil || !as.Alive() {
+		return nil
+	}
+	return as
+}
+
+// Caller holds ipcMu.
+func (s *APIServer) readIPCAttempt(attempt ipcAttempt) (*IPCReceipt, error) {
+	receipt, err := s.ipcRead(attempt.eventID)
+	if err != nil {
+		return nil, err
+	}
+	if attempt.boot != s.ipcBoot || receipt.Boot != attempt.boot || receipt.AttemptID != attempt.id {
+		return nil, errors.New("ipc_attempt_changed")
+	}
+	return receipt, nil
+}
+
+func (s *APIServer) finishIPC(attempt ipcAttempt, status, method, turn, code string) {
 	s.ipcMu.Lock()
 	defer s.ipcMu.Unlock()
-	receipt, err := s.ipcRead(id)
+	receipt, err := s.readIPCAttempt(attempt)
 	if err != nil {
-		slog.Error("ipc receipt read failed", "event_id", id)
+		slog.Debug("ipc attempt update skipped", "event_id", attempt.eventID)
 		return
 	}
-	// An explicit agent acknowledgement is stronger evidence than a lost RPC reply.
-	if receipt.AcknowledgedAt != "" {
-		status, code = "delivered", ""
+	// Positive delivery evidence is immutable, including an acknowledgement
+	// racing the backend's final failure or teardown report.
+	if receipt.AcknowledgedAt != "" || receipt.Status != "dispatching" {
+		return
 	}
 	receipt.Status, receipt.Method, receipt.TurnID, receipt.Code = status, method, turn, code
 	if err := s.ipcSave(receipt); err != nil {
-		slog.Error("ipc receipt update failed", "event_id", id)
+		slog.Error("ipc receipt update failed", "event_id", attempt.eventID)
 	}
 }
 
-func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput) {
+func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput, attempt ipcAttempt) {
 	lockGen, locked := session.TryLock()
 	if !locked {
-		s.steerIPC(e, input)
+		s.steerIPC(e, input, attempt)
 		return
+	}
+	var pinnedQueueState *interactiveState
+	if attempt.instanceID != "" {
+		retryEngine, retryState := s.ipcQueueRetryState(input.Target)
+		s.ipcMu.Lock()
+		boot := s.ipcBoot
+		s.ipcMu.Unlock()
+		if retryEngine != e || !ipcQueueRetryValid(&IPCReceipt{Boot: attempt.boot, InstanceID: attempt.instanceID}, boot, retryEngine, retryState) {
+			session.UnlockWithoutUpdate(lockGen)
+			s.finishIPC(attempt, "blocked", "queue", "", "ipc_queue_instance_changed")
+			return
+		}
+		pinnedQueueState = retryState
 	}
 	// Revalidate after obtaining the idle-session lease; no implicit /switch.
 	if _, current, err := s.resolveIPCTarget(&input.Target, false); err != nil || current != session {
 		session.UnlockWithoutUpdate(lockGen)
-		s.finishIPC(input.EventID, "blocked", "", "", "ipc_target_changed")
+		s.finishIPC(attempt, "blocked", "", "", "ipc_target_changed")
 		return
 	}
 	var platform Platform
@@ -412,13 +560,13 @@ func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput) {
 	rc, ok := platform.(ReplyContextReconstructor)
 	if !ok {
 		session.UnlockWithoutUpdate(lockGen)
-		s.finishIPC(input.EventID, "blocked", "", "", "ipc_reply_target_unavailable")
+		s.finishIPC(attempt, "blocked", "", "", "ipc_reply_target_unavailable")
 		return
 	}
 	replyCtx, err := rc.ReconstructReplyCtx(input.Target.SessionKey)
 	if err != nil {
 		session.UnlockWithoutUpdate(lockGen)
-		s.finishIPC(input.EventID, "blocked", "", "", "ipc_reply_target_unavailable")
+		s.finishIPC(attempt, "blocked", "", "", "ipc_reply_target_unavailable")
 		return
 	}
 	msg := &Message{
@@ -426,19 +574,24 @@ func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput) {
 		MessageID: "ipc-" + input.EventID, UserID: "ipc", UserName: "ipc",
 		Content: input.Prompt, ReplyCtx: replyCtx,
 		ExpectedAgentSessionID: input.Target.AgentSessionID,
+		ipcQueueState:          pinnedQueueState,
 		OnAgentInput: func(err error) {
-			status, code := "delivered", ""
-			if err != nil {
+			status, method, code := "delivered", "start", ""
+			if errors.Is(err, errIPCQueueInstanceChanged) {
+				status, method, code = "blocked", "queue", errIPCQueueInstanceChanged.Error()
+			} else if err != nil {
 				status, code = "unknown", "agent_input_failed_or_unconfirmed"
 			}
-			s.finishIPC(input.EventID, status, "start", "", code)
+			s.finishIPC(attempt, status, method, "", code)
 		},
 	}
-	e.ensureInteractiveStateForQueueing(input.Target.SessionKey, platform, replyCtx)
+	if pinnedQueueState == nil {
+		e.ensureInteractiveStateForQueueing(input.Target.SessionKey, platform, replyCtx)
+	}
 	go e.processInteractiveMessage(platform, msg, session, lockGen)
 }
 
-func (s *APIServer) steerIPC(e *Engine, input IPCInput) {
+func (s *APIServer) steerIPC(e *Engine, input IPCInput, attempt ipcAttempt) {
 	e.interactiveMu.Lock()
 	state := e.interactiveStates[input.Target.SessionKey]
 	var as AgentSession
@@ -448,19 +601,184 @@ func (s *APIServer) steerIPC(e *Engine, input IPCInput) {
 		state.mu.Unlock()
 	}
 	e.interactiveMu.Unlock()
+	if attempt.instanceID != "" {
+		s.ipcMu.Lock()
+		boot := s.ipcBoot
+		s.ipcMu.Unlock()
+		if !ipcQueueRetryValid(&IPCReceipt{Boot: attempt.boot, InstanceID: attempt.instanceID}, boot, e, state) ||
+			e.currentIPCQueueBackend(input.Target.SessionKey, state) != as {
+			s.finishIPC(attempt, "blocked", "queue", "", errIPCQueueInstanceChanged.Error())
+			return
+		}
+	}
+	if as == nil || !as.Alive() {
+		s.finishIPC(attempt, "waiting", "", "", "session_busy_without_live_input")
+		return
+	}
 	steerer, ok := as.(LiveInputSteerer)
-	if !ok || !as.Alive() {
-		s.finishIPC(input.EventID, "waiting", "", "", "session_busy_without_live_input")
+	if !ok {
+		if queuer, ok := as.(LiveInputQueuer); ok {
+			// The durable dispatching receipt already exists. Neither a long
+			// invocation nor an unexpectedly slow backend may hold this HTTP
+			// response open until the sender times out and freezes delivery.
+			go s.queueIPC(e, state, as, queuer, input, attempt)
+			return
+		}
+		s.finishIPC(attempt, "waiting", "", "", "session_busy_without_live_input")
 		return
 	}
 	turn, err := steerer.SteerInput(input.Target.AgentSessionID, input.Prompt)
 	if errors.Is(err, ErrNoActiveInput) {
-		s.finishIPC(input.EventID, "waiting", "", "", "turn_not_ready")
+		s.finishIPC(attempt, "waiting", "", "", "turn_not_ready")
 	} else if err != nil {
-		s.finishIPC(input.EventID, "unknown", "steer", "", "steer_unconfirmed")
+		s.finishIPC(attempt, "unknown", "steer", "", "steer_unconfirmed")
 	} else {
-		s.finishIPC(input.EventID, "delivered", "steer", turn, "")
+		s.finishIPC(attempt, "delivered", "steer", turn, "")
 	}
+}
+
+func (s *APIServer) queueIPC(e *Engine, state *interactiveState, as AgentSession, queuer LiveInputQueuer, input IPCInput, attempt ipcAttempt) {
+	instanceID, err := state.ipcQueueIdentity()
+	if err != nil {
+		s.finishIPC(attempt, "blocked", "queue", "", "ipc_queue_identity_unavailable")
+		return
+	}
+	report := func(progress LiveInputProgress) error {
+		return s.reportQueuedIPC(e, state, as, input, attempt, instanceID, progress)
+	}
+	// No API, interactive-state, or session-map lock is held across backend
+	// code. Some backends report synchronously from QueueInput or Close.
+	err = queuer.QueueInput(input.Target.AgentSessionID, input.EventID, input.Prompt, report)
+	if errors.Is(err, ErrNoActiveInput) {
+		if report(LiveInputProgress{Phase: LiveInputPhaseReleased, Code: "turn_not_ready"}) != nil {
+			_ = report(LiveInputProgress{Phase: LiveInputPhaseUnknown, Code: "queue_release_unconfirmed"})
+		}
+	} else if err != nil {
+		_ = report(LiveInputProgress{Phase: LiveInputPhaseUnknown, Code: "queue_unconfirmed"})
+	}
+}
+
+// This check never acquires interactiveMu: a backend may call report during
+// Close while the engine holds that lock to replace an instance.
+func (s *APIServer) checkIPCQueueTarget(e *Engine, state *interactiveState, as AgentSession, input IPCInput) error {
+	state.mu.Lock()
+	current := !state.stopped && state.agentSession == as
+	state.mu.Unlock()
+	if !current || e.ctx.Err() != nil || !as.Alive() {
+		return errors.New(LiveInputCodeStopped)
+	}
+	if _, _, err := s.resolveIPCTarget(&input.Target, false); err != nil {
+		return err
+	}
+	if as.CurrentSessionID() != input.Target.AgentSessionID {
+		return errors.New("ipc_target_changed")
+	}
+	return nil
+}
+
+func (s *APIServer) reportQueuedIPC(e *Engine, state *interactiveState, as AgentSession, input IPCInput, attempt ipcAttempt, instanceID string, progress LiveInputProgress) error {
+	if err := progress.validate(); err != nil {
+		return err
+	}
+	s.ipcMu.Lock()
+	defer s.ipcMu.Unlock()
+	receipt, err := s.readIPCAttempt(attempt)
+	if err != nil {
+		return err
+	}
+	if receipt.AcknowledgedAt != "" || receipt.Status != "dispatching" {
+		// Ignore terminal evidence arriving late, but refuse a new queue or
+		// claim so a late callback cannot authorize another input side effect.
+		if progress.Phase == LiveInputPhaseUnknown || progress.Phase == LiveInputPhaseReleased ||
+			(progress.Phase == LiveInputPhaseInjected && receipt.Status == "delivered") {
+			return nil
+		}
+		return errors.New("ipc_attempt_finished")
+	}
+	if receipt.InstanceID != "" && receipt.InstanceID != instanceID {
+		return s.rejectIPCQueue(receipt, "ipc_queue_instance_changed")
+	}
+	receipt.InstanceID = instanceID
+	if progress.Phase == LiveInputPhaseReleased {
+		state.mu.Lock()
+		stopped := state.stopped || state.agentSession != as
+		state.mu.Unlock()
+		if stopped || e.ctx.Err() != nil {
+			// ErrNoActiveInput can race an explicit stop before the backend
+			// reports queued. Turning it into waiting would restart that task.
+			progress.Code = LiveInputCodeStopped
+		}
+	}
+	if progress.Phase == LiveInputPhaseQueued || progress.Phase == LiveInputPhaseClaimed {
+		if err := s.checkIPCQueueTarget(e, state, as, input); err != nil {
+			return s.rejectIPCQueue(receipt, err.Error())
+		}
+	}
+	changed, transitionErr := applyIPCLiveProgress(receipt, progress)
+	if changed {
+		if err := s.ipcSave(receipt); err != nil {
+			return err
+		}
+	}
+	return transitionErr
+}
+
+// Caller holds ipcMu. Never describe a possibly exposed claim as unsent.
+func (s *APIServer) rejectIPCQueue(receipt *IPCReceipt, code string) error {
+	receipt.Status, receipt.Phase, receipt.Code, receipt.Method = "blocked", LiveInputPhaseReleased, code, "queue"
+	if receipt.ClaimedAt != "" {
+		receipt.Status, receipt.Phase = "unknown", LiveInputPhaseUnknown
+	}
+	if err := s.ipcSave(receipt); err != nil {
+		return err
+	}
+	return errors.New(code)
+}
+
+// Returns changed even when freezing a backend protocol violation. In that
+// case the caller must durably save the uncertainty before returning the error.
+func applyIPCLiveProgress(receipt *IPCReceipt, progress LiveInputProgress) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	receipt.Method = "queue"
+	if progress.TurnID != "" {
+		receipt.TurnID = progress.TurnID
+	}
+	switch progress.Phase {
+	case LiveInputPhaseQueued:
+		if receipt.Phase != "" && receipt.Phase != LiveInputPhaseQueued {
+			return false, errors.New("ipc_queue_progress_out_of_order")
+		}
+		if receipt.QueuedAt == "" {
+			receipt.QueuedAt = now
+		}
+	case LiveInputPhaseClaimed:
+		if receipt.Phase != LiveInputPhaseQueued {
+			return false, errors.New("ipc_claim_not_available")
+		}
+		receipt.ClaimedAt = now
+	case LiveInputPhaseInjected:
+		if receipt.Phase != LiveInputPhaseClaimed {
+			receipt.Status, receipt.Phase, receipt.Code = "unknown", LiveInputPhaseUnknown, "ipc_injection_without_claim"
+			return true, errors.New("ipc_injection_without_claim")
+		}
+		receipt.Status, receipt.InjectedAt = "delivered", now
+	case LiveInputPhaseReleased:
+		if receipt.ClaimedAt != "" {
+			receipt.Status, receipt.Phase, receipt.Code = "unknown", LiveInputPhaseUnknown, "ipc_release_after_claim"
+			return true, errors.New("ipc_release_after_claim")
+		}
+		receipt.Status = "waiting"
+		if progress.Code == LiveInputCodeStopped {
+			receipt.Status = "blocked"
+		}
+	case LiveInputPhaseUnknown:
+		receipt.Status = "unknown"
+	}
+	receipt.Phase, receipt.Code = progress.Phase, progress.Code
+	if receipt.Status == "delivered" {
+		receipt.Code = ""
+	}
+	return true, nil
 }
 
 func (s *APIServer) handleIPCAck(w http.ResponseWriter, r *http.Request) {
