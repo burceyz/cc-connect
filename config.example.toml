@@ -2325,7 +2325,15 @@ app_secret = "your-feishu-app-secret"
 # - "plan":      Read-only plan mode with terminal sandbox constraints (--sandbox) / 只读沙箱规划模式
 #
 # Optional: specify a model / 可选：指定模型
-# model = "gemini-3.1-pro-preview"
+# model = "gemini-3.8-flash-high"
+# effort = "high"  # Optional: low | medium | high, passed explicitly to agy / 显式传给 agy
+#
+# Optional fixed completion reviewer / 可选：固定的完成复核程序
+# Direct argv array; receives cc-connect-review-gate-v1 JSON on stdin and replies
+# with JSON on stdout. Only verified results are published; pending candidates
+# stay buffered. See agent/antigravity/README.md for the exact contract.
+# 使用参数数组，不经 shell；仅核验通过后发布候选，接口详见适配器 README。
+# review_command = ["python3", "/absolute/path/to/dorothy_review.py"]
 #
 # # Provider with API key / 使用 API Key 的 Provider
 # [[projects.agent.providers]]
