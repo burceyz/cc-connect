@@ -237,6 +237,14 @@ func main() {
 		runAntigravityPermissionHook()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "_agy-invocation-hook" {
+		phase := ""
+		if len(os.Args) == 3 {
+			phase = os.Args[2]
+		}
+		runAntigravityInvocationHook(phase)
+		return
+	}
 
 	checkUpdateAsync()
 	// When started as a daemon (CC_LOG_FILE set), redirect logs to a rotating file.

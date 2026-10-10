@@ -30,17 +30,19 @@ func init() {
 //   - "yolo":      auto-approve all tools (--dangerously-skip-permissions)
 //   - "plan":      read-only plan mode with terminal sandbox constraints (--sandbox)
 type Agent struct {
-	workDir      string
-	model        string
-	mode         string
-	cmd          string   // CLI binary name, default "agy"
-	cliExtraArgs []string // extra args from cmd after the binary name
-	configEnv    []string // env vars from [projects.agent.options.env]
-	timeout      time.Duration
-	providers    []core.ProviderConfig
-	activeIdx    int
-	sessionEnv   []string
-	mu           sync.RWMutex
+	workDir       string
+	model         string
+	effort        string
+	reviewCommand []string
+	mode          string
+	cmd           string   // CLI binary name, default "agy"
+	cliExtraArgs  []string // extra args from cmd after the binary name
+	configEnv     []string // env vars from [projects.agent.options.env]
+	timeout       time.Duration
+	providers     []core.ProviderConfig
+	activeIdx     int
+	sessionEnv    []string
+	mu            sync.RWMutex
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -49,6 +51,14 @@ func New(opts map[string]any) (core.Agent, error) {
 		workDir = "."
 	}
 	model, _ := opts["model"].(string)
+	effort, err := parseAgyEffort(opts["effort"])
+	if err != nil {
+		return nil, err
+	}
+	reviewCommand, err := parseReviewCommand(opts["review_command"])
+	if err != nil {
+		return nil, err
+	}
 	mode, _ := opts["mode"].(string)
 	mode = normalizeMode(mode)
 	cmd, extraArgs := core.ParseCmdOpts(opts, "agy")
@@ -76,14 +86,16 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 
 	return &Agent{
-		workDir:      workDir,
-		model:        model,
-		mode:         mode,
-		cmd:          cmd,
-		cliExtraArgs: extraArgs,
-		configEnv:    core.ParseConfigEnv(opts),
-		timeout:      timeout,
-		activeIdx:    -1,
+		workDir:       workDir,
+		model:         model,
+		effort:        effort,
+		reviewCommand: reviewCommand,
+		mode:          mode,
+		cmd:           cmd,
+		cliExtraArgs:  extraArgs,
+		configEnv:     core.ParseConfigEnv(opts),
+		timeout:       timeout,
+		activeIdx:     -1,
 	}, nil
 }
 
@@ -98,7 +110,26 @@ func normalizeMode(raw string) string {
 	}
 }
 
+func parseAgyEffort(value any) (string, error) {
+	if value == nil {
+		return "", nil
+	}
+	effort, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("antigravity: effort must be low, medium, or high")
+	}
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	switch effort {
+	case "", "low", "medium", "high":
+		return effort, nil
+	default:
+		return "", fmt.Errorf("antigravity: effort must be low, medium, or high")
+	}
+}
+
 func (a *Agent) Name() string { return "antigravity" }
+
+func (a *Agent) SupportsLiveInput() bool { return true }
 
 func (a *Agent) SetWorkDir(dir string) {
 	a.mu.Lock()
@@ -205,6 +236,8 @@ func (a *Agent) SetSessionEnv(env []string) {
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
 	a.mu.Lock()
 	model := a.model
+	effort := a.effort
+	reviewCommand := append([]string(nil), a.reviewCommand...)
 	mode := a.mode
 	cmd := a.cmd
 	extraArgs := append([]string{}, a.cliExtraArgs...)
@@ -220,7 +253,13 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	a.mu.Unlock()
 
-	return newAntigravitySession(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv, timeout)
+	session, err := newAntigravitySession(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv, timeout)
+	if err != nil {
+		return nil, err
+	}
+	session.effort = effort
+	session.reviewCommand = reviewCommand
+	return session, nil
 }
 
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {

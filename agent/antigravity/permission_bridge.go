@@ -95,6 +95,10 @@ func newAgyPermissionBridge(ctx context.Context, events chan<- core.Event) (*agy
 }
 
 func createAgyConfigOverlay(rootDir string) (string, error) {
+	return createAgyConfigOverlayForHooks(rootDir, true, false)
+}
+
+func createAgyConfigOverlayForHooks(rootDir string, permission, invocation bool) (string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory for Agy permission bridge: %w", err)
@@ -150,7 +154,29 @@ func createAgyConfigOverlay(rootDir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal Agy permission hook: %w", err)
 	}
-	hooks[agyPermissionHookName] = bridgeHook
+	if permission {
+		if _, exists := hooks[agyPermissionHookName]; exists {
+			return "", fmt.Errorf("existing Agy hook uses reserved name %s", agyPermissionHookName)
+		}
+		hooks[agyPermissionHookName] = bridgeHook
+	}
+	if invocation {
+		if _, exists := hooks[agyInvocationHookName]; exists {
+			return "", fmt.Errorf("existing Agy hook uses reserved name %s", agyInvocationHookName)
+		}
+		invocationHook, err := json.Marshal(map[string]any{
+			"PreInvocation": []any{map[string]any{
+				"type": "command", "command": shellQuote(executable) + " _agy-invocation-hook pre", "timeout": 15,
+			}},
+			"PostInvocation": []any{map[string]any{
+				"type": "command", "command": shellQuote(executable) + " _agy-invocation-hook post", "timeout": 15,
+			}},
+		})
+		if err != nil {
+			return "", fmt.Errorf("marshal Agy invocation hook: %w", err)
+		}
+		hooks[agyInvocationHookName] = invocationHook
+	}
 
 	data, err := json.MarshalIndent(hooks, "", "  ")
 	if err != nil {

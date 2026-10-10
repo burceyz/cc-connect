@@ -25,3 +25,16 @@ func runAntigravityPermissionHook() {
 		Reason:   "cc-connect permission bridge is unavailable",
 	})
 }
+
+func runAntigravityInvocationHook(phase string) {
+	err := antigravityhook.RelayInvocation(
+		os.Stdin, os.Stdout,
+		os.Getenv(antigravityhook.EnvInvocationAddress),
+		os.Getenv(antigravityhook.EnvInvocationToken),
+		os.Getenv(antigravityhook.EnvInvocationGeneration), phase,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cc-connect Agy invocation hook: %v\n", err)
+		_ = json.NewEncoder(os.Stdout).Encode(antigravityhook.InvocationOutput{})
+	}
+}

@@ -73,7 +73,12 @@ func TestSession_ContinueSessionTreatedAsFresh(t *testing.T) {
 }
 
 func TestBuildAntigravityArgs_PromptAtEnd(t *testing.T) {
-	s, _ := newAntigravitySession(context.Background(), "echo", []string{"--verbose"}, "/tmp", "", "default", "", nil, 0)
+	t.Setenv("HOME", t.TempDir())
+	s, err := newAntigravitySession(context.Background(), "echo", []string{"--verbose"}, "/tmp", "", "default", "", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
 	args := s.buildAntigravityArgs("sid-1", true, "plan", "/tmp/agy-config", "What is 1+1?")
 	if len(args) < 2 {
 		t.Fatalf("args too short: %v", args)
@@ -93,6 +98,9 @@ func TestBuildAntigravityArgs_PromptAtEnd(t *testing.T) {
 	if contains(args, "-m") || contains(args, "--model") {
 		t.Fatalf("did not expect model flags in args, got: %v", args)
 	}
+	if contains(args, "--effort") || !contains(args, "stream-json") {
+		t.Fatalf("expected structured output with no invented effort default, got: %v", args)
+	}
 }
 
 func TestAntigravitySession_ResumePassesConversationID(t *testing.T) {
@@ -104,9 +112,12 @@ func TestAntigravitySession_ResumePassesConversationID(t *testing.T) {
 		if err := os.WriteFile(argsPath, []byte(strings.Join(os.Args, "\x00")), 0o600); err != nil {
 			os.Exit(2)
 		}
-		_, _ = io.WriteString(os.Stdout, "ok\n")
+		_, _ = io.WriteString(os.Stdout, "{\"event\":\"init\",\"conversation_id\":\"conversation-1\",\"init\":{}}\n")
+		_, _ = io.WriteString(os.Stdout, "{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"conversation-1\",\"step_type\":\"user_input\",\"state\":\"DONE\"}}\n")
+		_, _ = io.WriteString(os.Stdout, "{\"event\":\"result\",\"result\":{\"conversation_id\":\"conversation-1\",\"status\":\"SUCCESS\",\"response\":\"ok\"}}\n")
 		os.Exit(0)
 	}
+	t.Setenv("HOME", t.TempDir())
 
 	argsPath := t.TempDir() + string(os.PathSeparator) + "args"
 	workDir := t.TempDir()
@@ -199,6 +210,7 @@ func TestNonDefaultModesDoNotCreatePermissionBridge(t *testing.T) {
 }
 
 func TestRespondPermissionRequiresDefaultMode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	s, err := newAntigravitySession(context.Background(), "echo", nil, "/tmp", "", "plan", "", nil, 0)
 	if err != nil {
 		t.Fatalf("newAntigravitySession: %v", err)
@@ -217,7 +229,10 @@ func TestSendDoesNotHoldStdinOpen(t *testing.T) {
 
 	workDir := t.TempDir()
 	cmdPath := filepath.Join(t.TempDir(), "fake-agy.sh")
-	script := "#!/bin/sh\ncat >/dev/null\nprintf 'done\\n'\n"
+	script := "#!/bin/sh\ncat >/dev/null\ncat <<'AGY_STREAM'\n" +
+		"{\"event\":\"init\",\"conversation_id\":\"eof-session\",\"init\":{}}\n" +
+		"{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"eof-session\",\"step_type\":\"user_input\",\"state\":\"DONE\"}}\n" +
+		"{\"event\":\"result\",\"result\":{\"conversation_id\":\"eof-session\",\"status\":\"SUCCESS\",\"response\":\"done\"}}\nAGY_STREAM\n"
 	if err := os.WriteFile(cmdPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile fake agy: %v", err)
 	}
@@ -243,6 +258,7 @@ func TestSendDoesNotHoldStdinOpen(t *testing.T) {
 			case core.EventText:
 				text.WriteString(ev.Content)
 			case core.EventResult:
+				text.WriteString(ev.Content)
 				if !strings.Contains(text.String(), "done") {
 					t.Fatalf("text = %q, want done", text.String())
 				}

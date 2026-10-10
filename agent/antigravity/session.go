@@ -1,17 +1,14 @@
 package antigravity
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,12 +17,14 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 )
 
-// antigravitySession manages multi-turn conversations with the Antigravity CLI (agy).
+// antigravitySession resumes a fixed conversation with one -p process per Send.
 type antigravitySession struct {
 	cmd              string
-	extraArgs        []string // extra args from cmd, prepended before agy args
+	extraArgs        []string
 	workDir          string
 	model            string
+	effort           string
+	reviewCommand    []string
 	mode             string
 	timeout          time.Duration
 	extraEnv         []string
@@ -36,26 +35,18 @@ type antigravitySession struct {
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
 	alive            atomic.Bool
+	startMu          sync.Mutex // prevents Send/Close WaitGroup races
+	activeRun        *agyRun
 	permissionBridge *agyPermissionBridge
+	invocationBridge *agyInvocationBridge
 }
 
 func newAntigravitySession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, resumeID string, extraEnv []string, timeout time.Duration) (*antigravitySession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
-
 	as := &antigravitySession{
-		cmd:       cmd,
-		extraArgs: extraArgs,
-		workDir:   workDir,
-		model:     model,
-		mode:      mode,
-		timeout:   timeout,
-		extraEnv:  extraEnv,
-		events:    make(chan core.Event, 64),
-		ctx:       sessionCtx,
-		cancel:    cancel,
+		cmd: cmd, extraArgs: extraArgs, workDir: workDir, model: model, mode: mode,
+		timeout: timeout, extraEnv: extraEnv, events: make(chan core.Event, 64), ctx: sessionCtx, cancel: cancel,
 	}
-	as.alive.Store(true)
-
 	if mode == "default" {
 		bridge, err := newAgyPermissionBridge(sessionCtx, as.events)
 		if err != nil {
@@ -64,42 +55,140 @@ func newAntigravitySession(ctx context.Context, cmd string, extraArgs []string, 
 		}
 		as.permissionBridge = bridge
 	}
-
+	bridge, err := newAgyInvocationBridge(sessionCtx, as.permissionBridge != nil)
+	if err != nil {
+		cancel()
+		if as.permissionBridge != nil {
+			as.permissionBridge.Close()
+		}
+		return nil, fmt.Errorf("antigravity: initialize invocation bridge: %w", err)
+	}
+	as.invocationBridge = bridge
 	if resumeID != "" && resumeID != core.ContinueSession {
 		as.chatID.Store(resumeID)
 	}
-
+	as.alive.Store(true)
 	return as, nil
 }
 
 func (as *antigravitySession) Send(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
-	if !as.alive.Load() {
-		return fmt.Errorf("session is closed")
+	run, err := as.startRun(prompt, messageID, images, files)
+	if err != nil {
+		return err
 	}
+	// Process creation is not an input acknowledgement. The first user_input
+	// event confirms acceptance of this process's sole -p argument. Subsequent
+	// body-less user_input events do not identify an external IPC message.
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-run.accepted:
+		return err
+	case <-run.ctx.Done():
+		select {
+		case err := <-run.accepted:
+			return err
+		default:
+			return fmt.Errorf("antigravity: input acceptance interrupted: %w", run.ctx.Err())
+		}
+	case <-timer.C:
+		run.cancel()
+		return fmt.Errorf("antigravity: input acceptance timed out")
+	}
+}
 
-	// Capture existing chat logs so we can identify a new session on first turn
-	preEntries := make(map[string]bool)
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		slug := antigravityProjectSlug(as.workDir)
-		chatsDir := filepath.Join(homeDir, ".gemini", "tmp", slug, "chats")
-		if entries, err := os.ReadDir(chatsDir); err == nil {
-			for _, entry := range entries {
-				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jsonl") {
-					preEntries[entry.Name()] = true
-				}
+func (as *antigravitySession) startRun(prompt, messageID string, images []core.ImageAttachment, files []core.FileAttachment) (*agyRun, error) {
+	as.startMu.Lock()
+	if !as.alive.Load() || as.ctx.Err() != nil {
+		as.startMu.Unlock()
+		return nil, fmt.Errorf("antigravity: session is closed")
+	}
+	if as.activeRun != nil {
+		as.startMu.Unlock()
+		return nil, fmt.Errorf("antigravity: a run is already active")
+	}
+	ctx, cancel := context.WithCancel(as.ctx)
+	if as.timeout > 0 {
+		cancel()
+		ctx, cancel = context.WithTimeout(as.ctx, as.timeout)
+	}
+	run, err := newAgyRun(ctx, cancel, as.CurrentSessionID())
+	if err != nil {
+		cancel()
+		as.startMu.Unlock()
+		return nil, err
+	}
+	as.activeRun = run
+	as.wg.Add(1)
+	as.startMu.Unlock()
+	fullPrompt, tempFiles := as.preparePrompt(prompt, messageID, images, files)
+	started := false
+	defer func() {
+		if !started {
+			cancel()
+			run.end(false)
+			as.startMu.Lock()
+			if as.activeRun == run {
+				as.activeRun = nil
+			}
+			as.startMu.Unlock()
+			as.wg.Done()
+			for _, path := range tempFiles {
+				_ = os.Remove(path)
 			}
 		}
+	}()
+	if len(as.reviewCommand) > 0 {
+		task, err := as.beginReview(run.ctx, fullPrompt, ipcEventID(messageID), as.CurrentSessionID())
+		if err != nil {
+			return nil, err
+		}
+		run.mu.Lock()
+		run.reviewTask = task
+		run.mu.Unlock()
+		fullPrompt = appendReviewInstructions(fullPrompt, task.instructions)
 	}
+	chatID := as.CurrentSessionID()
+	args := as.buildAntigravityArgs(chatID, chatID != "", as.mode, as.invocationBridge.configDir, fullPrompt)
+	cmd := exec.CommandContext(ctx, as.cmd, args...)
+	cmd.WaitDelay = time.Second
+	cmd.Dir = as.workDir
+	cmd.Env = core.MergeEnv(os.Environ(), as.extraEnv)
+	if as.permissionBridge != nil {
+		cmd.Env = core.MergeEnv(cmd.Env, as.permissionBridge.Env())
+	}
+	cmd.Env = core.MergeEnv(cmd.Env, as.invocationBridge.Env(run))
+	if run.reviewTask != nil {
+		cmd.Env = core.MergeEnv(cmd.Env, run.reviewTask.Env())
+	}
+	// -p consumes stdin to EOF. Never leave an open input pipe on this path.
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("antigravity: stdout pipe: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := as.invocationBridge.setRun(run); err != nil {
+		_ = stdout.Close()
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdout.Close()
+		run.end(false)
+		return nil, fmt.Errorf("antigravity: start: %w", err)
+	}
+	started = true
+	go as.readLoop(run, cmd, stdout, &stderr, tempFiles)
+	return run, nil
+}
 
-	// Save images and files into the workspace
+func (as *antigravitySession) preparePrompt(prompt, messageID string, images []core.ImageAttachment, files []core.FileAttachment) (string, []string) {
 	attachDir := filepath.Join(as.workDir, ".cc-connect", "attachments")
-	if (len(images) > 0 || len(files) > 0) && os.MkdirAll(attachDir, 0o755) != nil {
+	if len(images) > 0 && os.MkdirAll(attachDir, 0o700) != nil {
 		attachDir = os.TempDir()
 	}
-
 	var imageRefs []string
-	for i, img := range images {
+	for _, img := range images {
 		ext := ".png"
 		switch img.MimeType {
 		case "image/jpeg":
@@ -109,113 +198,49 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 		case "image/webp":
 			ext = ".webp"
 		}
-		fname := fmt.Sprintf("img_%d_%d%s", time.Now().UnixMilli(), i, ext)
-		fpath := filepath.Join(attachDir, fname)
-		if err := os.WriteFile(fpath, img.Data, 0o600); err == nil {
-			imageRefs = append(imageRefs, fpath)
+		file, err := os.CreateTemp(attachDir, "img-*"+ext)
+		if err != nil {
+			slog.Warn("antigravity: cannot save image attachment")
+			continue
 		}
+		_, err = file.Write(img.Data)
+		closeErr := file.Close()
+		if err != nil || closeErr != nil {
+			_ = os.Remove(file.Name())
+			continue
+		}
+		imageRefs = append(imageRefs, file.Name())
 	}
-
-	var fileRefs []string
-	for i, f := range files {
-		fname := filepath.Base(f.FileName)
-		if fname == "" || fname == "." || fname == ".." {
-			fname = fmt.Sprintf("file_%d_%d", time.Now().UnixMilli(), i)
-		}
-		fpath := filepath.Join(attachDir, fname)
-		if err := os.WriteFile(fpath, f.Data, 0o600); err == nil {
-			fileRefs = append(fileRefs, fpath)
-		}
-	}
-
-	chatID := as.CurrentSessionID()
-	isResume := chatID != ""
-
-	// Attach image and file references to prompt
-	fullPrompt := prompt
+	fileRefs := core.SaveFilesToDisk(as.workDir, messageID, files)
 	if len(imageRefs) > 0 {
-		if fullPrompt == "" {
-			fullPrompt = "Please analyze the attached image(s)."
+		if prompt == "" {
+			prompt = "Please analyze the attached image(s)."
 		}
-		fullPrompt += "\n\n[Attached images saved at: " + strings.Join(imageRefs, ", ") + "]"
+		prompt += "\n\n[Attached images saved at: " + strings.Join(imageRefs, ", ") + "]"
 	}
 	if len(fileRefs) > 0 {
-		if fullPrompt == "" {
-			fullPrompt = "Please analyze the attached file(s)."
+		if prompt == "" {
+			prompt = "Please analyze the attached file(s)."
 		}
-		fullPrompt += "\n\n[Attached files saved at: " + strings.Join(fileRefs, ", ") + "]"
+		prompt += "\n\n[Attached files saved at: " + strings.Join(fileRefs, ", ") + "]"
 	}
-	agyConfigDir := ""
-	if as.permissionBridge != nil {
-		agyConfigDir = as.permissionBridge.AgyConfigDir()
-	}
-	args := as.buildAntigravityArgs(chatID, isResume, as.mode, agyConfigDir, fullPrompt)
-	if strings.TrimSpace(as.model) != "" {
-		slog.Warn("antigravitySession: model is configured but ignored because agy does not support --model yet", "model", as.model)
-	}
-
-	var ctx context.Context
-	var cancel context.CancelFunc
-	if as.timeout > 0 {
-		ctx, cancel = context.WithTimeout(as.ctx, as.timeout)
-	} else {
-		ctx, cancel = context.WithCancel(as.ctx)
-	}
-
-	started := false
-	defer func() {
-		if !started {
-			cancel()
-		}
-	}()
-
-	slog.Debug("antigravitySession: launching", "resume", isResume, "args", core.RedactArgs(args))
-	cmd := exec.CommandContext(ctx, as.cmd, args...)
-	cmd.WaitDelay = 1 * time.Second
-	cmd.Dir = as.workDir
-	env := os.Environ()
-	if len(as.extraEnv) > 0 {
-		env = core.MergeEnv(env, as.extraEnv)
-	}
-	if as.permissionBridge != nil {
-		env = core.MergeEnv(env, as.permissionBridge.Env())
-	}
-	cmd.Env = env
-
-	// Keep stdin disconnected: agy --print consumes piped stdin to EOF before
-	// processing the prompt, so an open pipe would deadlock the turn.
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("antigravitySession: stdout pipe: %w", err)
-	}
-
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("antigravitySession: start: %w", err)
-	}
-
-	started = true
-	as.wg.Add(1)
-	go func() {
-		defer cancel()
-		as.readLoop(ctx, cmd, stdout, &stderrBuf, append(imageRefs, fileRefs...), preEntries, time.Now())
-	}()
-
-	return nil
+	return prompt, append(imageRefs, fileRefs...)
 }
 
 func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool, mode, agyConfigDir, fullPrompt string) []string {
-	// Prepend extra args from cmd so wrappers like "timeout 3600 agy" work.
-	// Keep "-p <prompt>" at the very end because agy consumes the immediate next arg.
 	args := append([]string{}, as.extraArgs...)
 	if agyConfigDir != "" {
-		// Antigravity currently names this compatibility flag --gemini_dir.
-		args = append(args, "--gemini_dir="+agyConfigDir, "--print-timeout=24h")
+		args = append(args, "--gemini_dir="+agyConfigDir)
 	}
+	args = append(args, "--output-format", "stream-json", "--print-timeout=24h")
 	if isResume {
 		args = append(args, "--conversation", chatID)
+	}
+	if model := strings.TrimSpace(as.model); model != "" {
+		args = append(args, "--model", model)
+	}
+	if as.effort != "" {
+		args = append(args, "--effort", as.effort)
 	}
 	switch mode {
 	case "yolo":
@@ -223,166 +248,47 @@ func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool,
 	case "plan":
 		args = append(args, "--sandbox")
 	}
-	args = append(args, "-p", fullPrompt)
-	return args
+	return append(args, "-p", fullPrompt)
 }
 
-func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer, tempFiles []string, preEntries map[string]bool, sendStartedAt time.Time) {
-	defer as.wg.Done()
-	defer func() {
-		for _, f := range tempFiles {
-			_ = os.Remove(f)
+func (as *antigravitySession) QueueInput(expectedSessionID, eventID, prompt string, report func(core.LiveInputProgress) error) error {
+	if !agyEventIDPattern.MatchString(eventID) || strings.TrimSpace(prompt) == "" || len(prompt) > 8192 || report == nil {
+		return fmt.Errorf("invalid Agy queued input")
+	}
+	as.startMu.Lock()
+	run := as.activeRun
+	alive := as.alive.Load()
+	as.startMu.Unlock()
+	if !alive || run == nil {
+		return core.ErrNoActiveInput
+	}
+	content := prompt
+	if len(as.reviewCommand) > 0 {
+		run.mu.Lock()
+		task, ready := run.reviewTask, run.inputAccepted && !run.ended
+		matches := run.sessionID == expectedSessionID && expectedSessionID != ""
+		run.mu.Unlock()
+		if !ready || task == nil {
+			return core.ErrNoActiveInput
 		}
-
-		err := cmd.Wait()
-
-		// Detect conversation ID if this was the first turn of a fresh session.
-		// agy may flush the chat file only while the process is exiting, so wait
-		// for process reaping before scanning the chat directory.
-		if as.CurrentSessionID() == "" {
-			var sid string
-			for attempt := 0; attempt < 15; attempt++ {
-				sid = as.detectNewSessionID(preEntries, sendStartedAt)
-				if sid != "" {
-					break
-				}
-				time.Sleep(20 * time.Millisecond)
-			}
-			if sid != "" {
-				as.chatID.Store(sid)
-				slog.Debug("antigravitySession: detected session ID", "session_id", sid)
-				// Emit an EventText carrying the session ID back to core.
-				select {
-				case as.events <- core.Event{Type: core.EventText, SessionID: sid}:
-				case <-as.ctx.Done():
-				}
-			}
+		if !matches {
+			return fmt.Errorf("Agy queued input conversation mismatch")
 		}
-
-		sid := as.CurrentSessionID()
+		callback, err := as.beginReview(run.ctx, prompt, eventID, expectedSessionID)
 		if err != nil {
-			stderrMsg := strings.TrimSpace(stderrBuf.String())
-			if stderrMsg != "" {
-				slog.Error("antigravitySession: process failed", "error", err, "stderr", stderrMsg)
-				select {
-				case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}:
-				case <-as.ctx.Done():
-				}
+			if errors.Is(err, errAgyReviewGateBusy) {
+				return core.ErrNoActiveInput
 			}
+			return err
 		}
-
-		// Finalize turn.
-		select {
-		case as.events <- core.Event{Type: core.EventResult, SessionID: sid, Done: true}:
-		case <-as.ctx.Done():
+		if callback.taskID != task.taskID {
+			// A distinct task needs its own candidate and review manifest. The
+			// deterministic event ID lets core retry it at idle without new tasks.
+			return core.ErrNoActiveInput
 		}
-	}()
-
-	go func() {
-		<-ctx.Done()
-		_ = stdout.Close()
-	}()
-
-	reader := bufio.NewReader(stdout)
-	buf := make([]byte, 1024)
-
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			text := string(buf[:n])
-			select {
-			case as.events <- core.Event{Type: core.EventText, Content: text}:
-			case <-as.ctx.Done():
-				return
-			}
-		}
-		if err != nil {
-			if err != io.EOF && !strings.Contains(err.Error(), "file already closed") {
-				slog.Error("antigravitySession: read error", "error", err)
-				select {
-				case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}:
-				case <-as.ctx.Done():
-				}
-			}
-			return
-		}
+		content = appendReviewInstructions(prompt, callback.instructions)
 	}
-}
-
-func (as *antigravitySession) detectNewSessionID(preEntries map[string]bool, sendStartedAt time.Time) string {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	slug := antigravityProjectSlug(as.workDir)
-	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", slug, "chats")
-
-	entries, err := os.ReadDir(chatsDir)
-	if err != nil {
-		return ""
-	}
-
-	type candidate struct {
-		sessionID string
-		modTime   time.Time
-		diff      time.Duration
-	}
-	var candidates []candidate
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-			continue
-		}
-		if preEntries[entry.Name()] {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		mod := info.ModTime()
-		if !sendStartedAt.IsZero() && mod.Before(sendStartedAt.Add(-2*time.Second)) {
-			continue
-		}
-
-		fpath := filepath.Join(chatsDir, entry.Name())
-		file, err := os.Open(fpath)
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		if scanner.Scan() {
-			var sf struct {
-				SessionID string `json:"sessionId"`
-			}
-			if json.Unmarshal([]byte(scanner.Text()), &sf) == nil && sf.SessionID != "" {
-				diff := time.Duration(0)
-				if !sendStartedAt.IsZero() {
-					if mod.After(sendStartedAt) {
-						diff = mod.Sub(sendStartedAt)
-					} else {
-						diff = sendStartedAt.Sub(mod)
-					}
-				}
-				candidates = append(candidates, candidate{
-					sessionID: sf.SessionID,
-					modTime:   mod,
-					diff:      diff,
-				})
-			}
-		}
-		_ = file.Close()
-	}
-	if len(candidates) == 0 {
-		return ""
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].diff == candidates[j].diff {
-			return candidates[i].modTime.After(candidates[j].modTime)
-		}
-		return candidates[i].diff < candidates[j].diff
-	})
-	return candidates[0].sessionID
+	return run.queuePrepared(expectedSessionID, eventID, prompt, content, report)
 }
 
 func (as *antigravitySession) RespondPermission(requestID string, result core.PermissionResult) error {
@@ -395,37 +301,45 @@ func (as *antigravitySession) RespondPermission(requestID string, result core.Pe
 	return as.permissionBridge.RespondPermission(requestID, result)
 }
 
-func (as *antigravitySession) Events() <-chan core.Event {
-	return as.events
+func (as *antigravitySession) emit(event core.Event) {
+	select {
+	case as.events <- event:
+	case <-as.ctx.Done():
+	}
 }
+
+func (as *antigravitySession) Events() <-chan core.Event { return as.events }
 
 func (as *antigravitySession) CurrentSessionID() string {
 	v, _ := as.chatID.Load().(string)
 	return v
 }
 
-func (as *antigravitySession) Alive() bool {
-	return as.alive.Load()
-}
+func (as *antigravitySession) Alive() bool { return as.alive.Load() }
 
 func (as *antigravitySession) Close() error {
+	as.startMu.Lock()
 	as.alive.Store(false)
+	run := as.activeRun
+	as.startMu.Unlock()
+	if run != nil {
+		run.end(true)
+	}
 	as.cancel()
+	as.invocationBridge.Close()
 	if as.permissionBridge != nil {
 		as.permissionBridge.Close()
 	}
 	done := make(chan struct{})
 	go func() {
 		as.wg.Wait()
-		as.closeOnce.Do(func() {
-			close(as.events)
-		})
+		as.closeOnce.Do(func() { close(as.events) })
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(8 * time.Second):
-		slog.Warn("antigravitySession: close timed out")
+		slog.Warn("antigravity: close timed out")
 	}
 	return nil
 }
