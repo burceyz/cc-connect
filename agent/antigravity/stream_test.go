@@ -64,7 +64,11 @@ func TestAgyCLIHelper(t *testing.T) {
 		emit(map[string]any{"event": "step_update", "step_update": step})
 	}
 	response, responseIndex := testAgyCandidate, 1
-	if scenario == "multi-response" || scenario == "incomplete-response" || scenario == "no-final-response" {
+	checkpoint := strings.HasPrefix(scenario, "checkpoint")
+	if checkpoint {
+		responseIndex = 3
+	}
+	if scenario == "multi-response" || scenario == "incomplete-response" || scenario == "no-final-response" || scenario == "checkpoint-multi-response" {
 		emitText(1, "ACTIVE", "Checking ")
 		emitText(1, "DONE", "the completed review.\n")
 		emit(map[string]any{"event": "step_update", "step_update": map[string]any{
@@ -73,7 +77,14 @@ func TestAgyCLIHelper(t *testing.T) {
 		}})
 		response, responseIndex = testAgyProgress+testAgyCandidate, 3
 	}
-	if scenario == "empty-response" {
+	if checkpoint {
+		// The official headless example ends with response 3, checkpoint 4.
+		state := "DONE"
+		if scenario == "checkpoint-incomplete-response" {
+			state = "ACTIVE"
+		}
+		emitText(responseIndex, state, testAgyCandidate)
+	} else if scenario == "empty-response" {
 		emitText(responseIndex, "DONE", "")
 	} else if scenario != "result-only" && scenario != "no-final-response" {
 		for i, text := range []string{"候选结果  \n", "exact trailing newline\n"} {
@@ -82,6 +93,47 @@ func TestAgyCLIHelper(t *testing.T) {
 				state = "DONE"
 			}
 			emitText(responseIndex, state, text)
+		}
+	}
+	if checkpoint {
+		step := map[string]any{
+			"conversation_id": "stream-session", "step_index": 4, "state": "DONE", "step_type": "checkpoint",
+		}
+		if scenario == "checkpoint-active-done" || scenario == "checkpoint-incomplete" ||
+			scenario == "checkpoint-around-tool" || scenario == "checkpoint-around-user-input" {
+			step["state"] = "ACTIVE"
+			emit(map[string]any{"event": "step_update", "step_update": step})
+			step["state"] = "DONE"
+		}
+		switch scenario {
+		case "checkpoint-around-tool", "checkpoint-around-user-input":
+			kind := "tool"
+			if scenario == "checkpoint-around-user-input" {
+				kind = "user_input"
+			}
+			emit(map[string]any{"event": "step_update", "step_update": map[string]any{
+				"conversation_id": "stream-session", "step_index": 5, "state": "DONE", "step_type": kind,
+			}})
+		case "checkpoint-text":
+			step["text_delta"] = "unreviewed checkpoint payload"
+		case "checkpoint-tool-name":
+			step["tool_name"] = "view_file"
+		case "checkpoint-tool-info":
+			step["tool_info"] = map[string]any{"name": "view_file"}
+		case "checkpoint-empty-tool-info":
+			step["tool_info"] = map[string]any{}
+		case "checkpoint-subagent-info":
+			step["subagent_info"] = map[string]any{"subagents": []any{}}
+		case "checkpoint-unknown-state":
+			step["state"] = "UNKNOWN"
+		}
+		if scenario != "checkpoint-incomplete" {
+			emit(map[string]any{"event": "step_update", "step_update": step})
+		}
+		if scenario == "checkpoint-before-unknown" {
+			emit(map[string]any{"event": "step_update", "step_update": map[string]any{
+				"conversation_id": "stream-session", "step_index": 5, "state": "DONE", "step_type": "unknown",
+			}})
 		}
 	}
 	status, errorText := "SUCCESS", ""

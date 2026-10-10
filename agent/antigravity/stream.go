@@ -28,20 +28,23 @@ type agyResult struct {
 }
 
 type agyStreamStep struct {
-	ConversationID string `json:"conversation_id"`
-	StepIndex      *int   `json:"step_index"`
-	State          string `json:"state"`
-	StepType       string `json:"step_type"`
-	TextDelta      string `json:"text_delta"`
-	ToolName       string `json:"tool_name"`
-	ToolInfo       struct {
-		Name       string         `json:"name"`
-		Parameters map[string]any `json:"parameters"`
-		Output     string         `json:"output"`
-		Error      *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	} `json:"tool_info"`
+	ConversationID string           `json:"conversation_id"`
+	StepIndex      *int             `json:"step_index"`
+	State          string           `json:"state"`
+	StepType       string           `json:"step_type"`
+	TextDelta      string           `json:"text_delta"`
+	ToolName       string           `json:"tool_name"`
+	ToolInfo       *agyToolInfo     `json:"tool_info"`
+	SubagentInfo   *json.RawMessage `json:"subagent_info"`
+}
+
+type agyToolInfo struct {
+	Name       string         `json:"name"`
+	Parameters map[string]any `json:"parameters"`
+	Output     string         `json:"output"`
+	Error      *struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 type agyStreamEvent struct {
@@ -64,6 +67,7 @@ type agyStream struct {
 	lastStepIndex int
 	lastStepType  string
 	candidate     *agyResponseStep
+	checkpoints   map[int]bool
 	tools         map[int]bool
 }
 
@@ -136,6 +140,18 @@ func (s *agyStream) handleStep(step agyStreamStep) error {
 		if step.StepIndex == nil || *step.StepIndex < 0 {
 			return fmt.Errorf("antigravity: review stream step index is missing or invalid")
 		}
+		switch step.StepType {
+		case "checkpoint":
+			// The official CLI may append bookkeeping after its final reply.
+			// Keep its completion state without replacing the last content step.
+			return s.handleCheckpointStep(step)
+		case "user_input", "agent_response", "tool":
+			if _, checkpoint := s.checkpoints[*step.StepIndex]; checkpoint {
+				return fmt.Errorf("antigravity: review step index changed type")
+			}
+		default:
+			return fmt.Errorf("antigravity: unsupported review stream step type; candidate withheld")
+		}
 		if *step.StepIndex >= s.lastStepIndex {
 			s.lastStepIndex, s.lastStepType = *step.StepIndex, step.StepType
 		}
@@ -180,12 +196,38 @@ func (s *agyStream) handleCandidateStep(step agyStreamStep) error {
 	return nil
 }
 
+func (s *agyStream) handleCheckpointStep(step agyStreamStep) error {
+	if step.TextDelta != "" || step.ToolName != "" || step.ToolInfo != nil || step.SubagentInfo != nil {
+		return fmt.Errorf("antigravity: review checkpoint contains response or tool payload; candidate withheld")
+	}
+	if step.State != "ACTIVE" && step.State != "DONE" {
+		return fmt.Errorf("antigravity: review checkpoint has an unsupported state")
+	}
+	index := *step.StepIndex
+	if index == s.lastStepIndex && s.lastStepType != "" {
+		return fmt.Errorf("antigravity: review step index changed type")
+	}
+	if s.checkpoints == nil {
+		s.checkpoints = make(map[int]bool)
+	}
+	if s.checkpoints[index] {
+		return fmt.Errorf("antigravity: review checkpoint is already complete")
+	}
+	s.checkpoints[index] = step.State == "DONE"
+	return nil
+}
+
 func (s *agyStream) reviewCandidate() (string, error) {
 	// result.response can concatenate progress and several assistant messages.
 	// Only the final complete response step identifies the bytes to review.
 	if s.candidate == nil || !s.candidate.done || s.candidate.text.Len() == 0 ||
 		s.candidate.index != s.lastStepIndex || s.lastStepType != "agent_response" {
 		return "", fmt.Errorf("antigravity: final review response step is missing or incomplete; candidate withheld")
+	}
+	for _, done := range s.checkpoints {
+		if !done {
+			return "", fmt.Errorf("antigravity: review checkpoint is incomplete; candidate withheld")
+		}
 	}
 	return s.candidate.text.String(), nil
 }
@@ -194,9 +236,13 @@ func (s *agyStream) handleTool(step agyStreamStep) {
 	if s.tools == nil {
 		s.tools = make(map[int]bool)
 	}
+	info := step.ToolInfo
+	if info == nil {
+		info = &agyToolInfo{}
+	}
 	name := step.ToolName
 	if name == "" {
-		name = step.ToolInfo.Name
+		name = info.Name
 	}
 	index := 0
 	if step.StepIndex != nil {
@@ -205,14 +251,14 @@ func (s *agyStream) handleTool(step agyStreamStep) {
 	if !s.tools[index] {
 		s.tools[index] = true
 		s.session.emit(core.Event{Type: core.EventToolUse, ToolName: name,
-			ToolInput: formatAgyToolInput(step.ToolInfo.Parameters), ToolInputRaw: step.ToolInfo.Parameters})
+			ToolInput: formatAgyToolInput(info.Parameters), ToolInputRaw: info.Parameters})
 	}
 	if step.State == "DONE" {
-		output := step.ToolInfo.Output
+		output := info.Output
 		status := "completed"
-		if step.ToolInfo.Error != nil {
+		if info.Error != nil {
 			status = "failed"
-			output = step.ToolInfo.Error.Message
+			output = info.Error.Message
 		}
 		s.session.emit(core.Event{Type: core.EventToolResult, ToolName: name, ToolResult: output, Content: output, ToolStatus: status})
 	}
