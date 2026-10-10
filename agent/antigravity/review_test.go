@@ -102,6 +102,9 @@ func TestAgyReviewHelper(t *testing.T) {
 		switch mode {
 		case "pending":
 			response["status"], response["allow_publish"] = "pending_review", false
+		case "manifest-missing":
+			response["status"], response["allow_publish"] = "pending_review", false
+			response["reasons"] = []string{"manifest_missing"}
 		case "blocked":
 			response["status"], response["allow_publish"] = "blocked", false
 		case "wrong-hash":
@@ -178,6 +181,21 @@ func TestAgyReviewPendingKeepsCandidatePrivateAndAllowsCallback(t *testing.T) {
 	hash := sha256.Sum256([]byte(testAgyCandidate))
 	if checked.CandidateText != testAgyCandidate || checked.CandidateSHA256 != hex.EncodeToString(hash[:]) || checked.ConversationID != "stream-session" {
 		t.Fatalf("candidate bytes or identity changed: %+v", checked)
+	}
+}
+
+func TestAgyReviewMissingManifestDoesNotClaimHermesWasDispatched(t *testing.T) {
+	session, dir := testCLI(t, "multi-response")
+	enableTestReview(t, session, dir, "manifest-missing")
+	if err := session.Send("original task", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	event, streamed := terminalEvent(t, session)
+	if event.Type != core.EventError || event.Error == nil ||
+		!strings.Contains(event.Error.Error(), "manifest.json 尚未写入") ||
+		!strings.Contains(event.Error.Error(), "Hermes 尚未派发") ||
+		event.Content != "" || streamed != "" {
+		t.Fatalf("missing manifest was reported as dispatched review or leaked candidate: %+v, %q", event, streamed)
 	}
 }
 

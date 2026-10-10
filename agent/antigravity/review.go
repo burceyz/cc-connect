@@ -209,12 +209,13 @@ func (as *antigravitySession) checkReview(ctx context.Context, task *agyReviewTa
 		ManifestPath    string          `json:"manifest_path"`
 	}{agyReviewProtocol, "check", task.taskID, task.origin, conversationID, candidate, textSHA256(candidate), task.manifestPath}
 	var response struct {
-		Protocol        string `json:"protocol"`
-		TaskID          string `json:"task_id"`
-		CandidateSHA256 string `json:"candidate_sha256"`
-		ManifestSHA256  string `json:"manifest_sha256"`
-		Status          string `json:"status"`
-		AllowPublish    bool   `json:"allow_publish"`
+		Protocol        string   `json:"protocol"`
+		TaskID          string   `json:"task_id"`
+		CandidateSHA256 string   `json:"candidate_sha256"`
+		ManifestSHA256  string   `json:"manifest_sha256"`
+		Status          string   `json:"status"`
+		AllowPublish    bool     `json:"allow_publish"`
+		Reasons         []string `json:"reasons"`
 	}
 	if err := as.callReview(ctx, request, &response, 60*time.Second); err != nil {
 		return fmt.Errorf("antigravity: 复核关口执行失败，候选结果未发布（任务 %s）", task.taskID)
@@ -230,6 +231,9 @@ func (as *antigravitySession) checkReview(ctx context.Context, task *agyReviewTa
 			return nil
 		}
 	case "pending_review":
+		if len(response.Reasons) == 1 && response.Reasons[0] == "manifest_missing" {
+			return fmt.Errorf("antigravity: 结果已保存，但复核清单 manifest.json 尚未写入，Hermes 尚未派发（任务 %s）", task.taskID)
+		}
 		return fmt.Errorf("antigravity: 结果已保存，等待 Hermes 复核（任务 %s）", task.taskID)
 	case "blocked":
 		return fmt.Errorf("antigravity: 结果已保存，复核尚未通过（任务 %s）", task.taskID)

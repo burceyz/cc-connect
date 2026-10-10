@@ -79,7 +79,7 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 	// Process creation is not an input acknowledgement. The first user_input
 	// event confirms acceptance of this process's sole -p argument. Subsequent
 	// body-less user_input events do not identify an external IPC message.
-	timer := time.NewTimer(30 * time.Second)
+	timer := time.NewTimer(120 * time.Second)
 	defer timer.Stop()
 	select {
 	case err := <-run.accepted:
