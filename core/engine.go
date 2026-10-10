@@ -553,6 +553,10 @@ type queuedMessage struct {
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
 	agentSession AgentSession
+	// Immutable origin ownership; never retarget an inherited environment when
+	// the active CC session or backend instance changes.
+	ipcOrigin          string
+	ipcOriginSessionID string
 	// busySession is the core.Session whose busy lock guards the in-flight
 	// turn. Set by getOrCreateInteractiveStateWith so /stop can release the
 	// lock after tearing the turn down (#1830).
@@ -4283,6 +4287,9 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		// If wantID is empty (/new, cleared session) but the process already has
 		// a concrete ID, reusing would keep --resume context — recycle (#238).
 		needRecycle := currentID != "" && (wantID == "" || wantID != currentID)
+		if state.ipcOrigin != "" && state.ipcOriginSessionID != session.ID {
+			needRecycle = true
+		}
 		if !needRecycle {
 			state.mu.Lock()
 			state.busySession = session
@@ -4315,24 +4322,13 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		ccKey = ccSessionKey
 	}
 
-	// Inject per-session env vars so the agent subprocess can call `cc-connect cron add` etc.
-	if inj, ok := agent.(SessionEnvInjector); ok {
-		envVars := []string{
-			"CC_PROJECT=" + e.name,
-			"CC_SESSION_KEY=" + ccKey,
-		}
-		if e.dataDir != "" {
-			envVars = append(envVars, "CC_DATA_DIR="+e.dataDir)
-		}
-		if exePath, err := os.Executable(); err == nil {
-			binDir := filepath.Dir(exePath)
-			if curPath := os.Getenv("PATH"); curPath != "" {
-				envVars = append(envVars, "PATH="+binDir+string(filepath.ListSeparator)+curPath)
-			} else {
-				envVars = append(envVars, "PATH="+binDir)
-			}
-		}
-		inj.SetSessionEnv(envVars)
+	originID, err := e.injectInteractiveSessionEnv(agent, ccKey)
+	if err != nil {
+		slog.Error("failed to initialize session origin", "error", err)
+		newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true, busySession: session}
+		adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
+		e.interactiveStates[sessionKey] = newState
+		return newState
 	}
 
 	// Inject platform-specific formatting instructions into the agent's system prompt.
@@ -4407,7 +4403,12 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 				"session_key", sessionKey, "failed_session_id", startSessionID,
 				"error", err, "elapsed", startElapsed)
 			startAt = time.Now()
-			agentSession, err = agent.StartSession(e.ctx, "")
+			// A failed start may have exposed its environment. Never reuse its
+			// origin handle for the replacement backend instance.
+			originID, err = e.injectInteractiveSessionEnv(agent, ccKey)
+			if err == nil {
+				agentSession, err = agent.StartSession(e.ctx, "")
+			}
 			startElapsed = time.Since(startAt)
 			if err == nil {
 				// Replace the binding only after a fresh session exists. An
@@ -4464,12 +4465,14 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 
 	newState := &interactiveState{
-		agentSession:     agentSession,
-		busySession:      session,
-		platform:         p,
-		replyCtx:         replyCtx,
-		agent:            agent,
-		eventsNeedResync: true,
+		agentSession:       agentSession,
+		ipcOrigin:          originID,
+		ipcOriginSessionID: session.ID,
+		busySession:        session,
+		platform:           p,
+		replyCtx:           replyCtx,
+		agent:              agent,
+		eventsNeedResync:   true,
 	}
 	adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
 	state = newState
@@ -4488,6 +4491,37 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	})
 
 	return state
+}
+
+// Each StartSession attempt gets its own origin before the child environment
+// is copied. Setting the parent's environment after init would be too late.
+func (e *Engine) injectInteractiveSessionEnv(agent Agent, sessionKey string) (string, error) {
+	inj, ok := agent.(SessionEnvInjector)
+	if !ok {
+		return "", nil
+	}
+	origin, err := newIPCOrigin()
+	if err != nil {
+		return "", err
+	}
+	env := []string{
+		"CC_PROJECT=" + e.name,
+		"CC_SESSION_KEY=" + sessionKey,
+		"CC_IPC_ORIGIN=" + origin,
+	}
+	if e.dataDir != "" {
+		env = append(env, "CC_DATA_DIR="+e.dataDir)
+	}
+	if exePath, err := os.Executable(); err == nil {
+		binDir := filepath.Dir(exePath)
+		if curPath := os.Getenv("PATH"); curPath != "" {
+			env = append(env, "PATH="+binDir+string(filepath.ListSeparator)+curPath)
+		} else {
+			env = append(env, "PATH="+binDir)
+		}
+	}
+	inj.SetSessionEnv(env)
+	return origin, nil
 }
 
 // cleanupInteractiveState removes the interactive state for the given session key

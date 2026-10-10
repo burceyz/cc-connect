@@ -384,6 +384,16 @@ func TestIPC_PrivateUnixSocketRoundTrip(t *testing.T) {
 	if request("POST", "/ipc/target", input.Target)["supports_live_input"] != true {
 		t.Fatal("capability route missing")
 	}
+	origin, err := newIPCOrigin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := engine.interactiveStates[input.Target.SessionKey]
+	state.ipcOrigin, state.ipcOriginSessionID = origin, input.Target.SessionID
+	if request("POST", "/ipc/origin", ipcOriginRequest{OriginID: origin,
+		Project: input.Target.Project, SessionKey: input.Target.SessionKey, CWD: input.Target.CWD})["protocol"] != sessionIPCProtocol {
+		t.Fatal("origin route missing")
+	}
 	if request("POST", "/ipc/event", input)["status"] != "delivered" {
 		t.Fatal("event not delivered")
 	}

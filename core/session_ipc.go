@@ -25,8 +25,19 @@ type LiveInputSteerer interface {
 
 var ErrNoActiveInput = errors.New("no active input turn")
 var ipcEventIDPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+var ipcOriginPattern = regexp.MustCompile(`^cc-origin-v1-[a-f0-9]{64}$`)
 
 const sessionIPCProtocol = "cc-connect-session-ipc-v1"
+
+// Origins are deliberately process-local. A persisted conversation is not
+// evidence that a tool inherited its environment from this live instance.
+func newIPCOrigin() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("ipc origin identity: %w", err)
+	}
+	return "cc-origin-v1-" + hex.EncodeToString(b), nil
+}
 
 // IPCTarget pins the existing conversation, never a newest-session alias.
 type IPCTarget struct {
@@ -107,6 +118,10 @@ func (s *APIServer) handleIPCTarget(w http.ResponseWriter, r *http.Request) {
 		apiJSON(w, http.StatusConflict, map[string]string{"code": err.Error()})
 		return
 	}
+	s.writeIPCTarget(w, e, session, target)
+}
+
+func (s *APIServer) writeIPCTarget(w http.ResponseWriter, e *Engine, session *Session, target IPCTarget) {
 	canSteer := false
 	if capable, ok := e.agent.(interface{ SupportsLiveInput() bool }); ok {
 		canSteer = capable.SupportsLiveInput()
@@ -117,23 +132,31 @@ func (s *APIServer) handleIPCTarget(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *APIServer) resolveIPCProject(project, directory string) (*Engine, error) {
+	s.mu.RLock()
+	e := s.engines[project]
+	s.mu.RUnlock()
+	if e == nil || e.multiWorkspace {
+		return nil, errors.New("ipc_project_unsupported")
+	}
+	wd, ok := e.agent.(interface{ GetWorkDir() string })
+	if !ok {
+		return nil, errors.New("ipc_cwd_unavailable")
+	}
+	cwd, err := filepath.EvalSymlinks(wd.GetWorkDir())
+	if err != nil || cwd != directory {
+		return nil, errors.New("ipc_cwd_mismatch")
+	}
+	return e, nil
+}
+
 func (s *APIServer) resolveIPCTarget(target *IPCTarget, capture bool) (*Engine, *Session, error) {
 	if target.Project == "" || target.SessionKey == "" || target.AgentSessionID == "" || target.CWD == "" {
 		return nil, nil, errors.New("ipc_target_incomplete")
 	}
-	s.mu.RLock()
-	e := s.engines[target.Project]
-	s.mu.RUnlock()
-	if e == nil || e.multiWorkspace {
-		return nil, nil, errors.New("ipc_project_unsupported")
-	}
-	wd, ok := e.agent.(interface{ GetWorkDir() string })
-	if !ok {
-		return nil, nil, errors.New("ipc_cwd_unavailable")
-	}
-	cwd, err := filepath.EvalSymlinks(wd.GetWorkDir())
-	if err != nil || cwd != target.CWD {
-		return nil, nil, errors.New("ipc_cwd_mismatch")
+	e, err := s.resolveIPCProject(target.Project, target.CWD)
+	if err != nil {
+		return nil, nil, err
 	}
 	e.sessions.mu.RLock()
 	defer e.sessions.mu.RUnlock()
@@ -148,6 +171,86 @@ func (s *APIServer) resolveIPCTarget(target *IPCTarget, capture bool) (*Engine, 
 		return nil, nil, errors.New("ipc_target_changed")
 	}
 	return e, session, nil
+}
+
+type ipcOriginRequest struct {
+	OriginID   string `json:"origin_id"`
+	Project    string `json:"project"`
+	SessionKey string `json:"session_key"`
+	CWD        string `json:"cwd"`
+}
+
+// The caller supplies an instance handle, never an agent-side ID to adopt.
+// This endpoint is registered only on the private Unix API.
+func (s *APIServer) handleIPCOrigin(w http.ResponseWriter, r *http.Request) {
+	var origin ipcOriginRequest
+	if !ipcDecode(w, r, &origin) {
+		return
+	}
+	if origin.OriginID == "" || origin.Project == "" || origin.SessionKey == "" || origin.CWD == "" {
+		apiJSON(w, http.StatusBadRequest, map[string]string{"code": "ipc_origin_incomplete"})
+		return
+	}
+	if !ipcOriginPattern.MatchString(origin.OriginID) {
+		apiJSON(w, http.StatusBadRequest, map[string]string{"code": "ipc_origin_invalid"})
+		return
+	}
+	e, err := s.resolveIPCProject(origin.Project, origin.CWD)
+	if err != nil {
+		apiJSON(w, http.StatusConflict, map[string]string{"code": err.Error()})
+		return
+	}
+	session, target, bound, err := resolveIPCOrigin(e, origin)
+	if err != nil {
+		apiJSON(w, http.StatusConflict, map[string]string{"code": err.Error()})
+		return
+	}
+	if bound {
+		// Save only after releasing the interactive and session-map locks.
+		// Preserve first-assignment naming when this wins the init-event race.
+		if name := session.GetName(); name != "" && name != "session" && name != "default" {
+			e.sessions.SetSessionName(target.AgentSessionID, name)
+		}
+		e.sessions.Save()
+	}
+	s.writeIPCTarget(w, e, session, target)
+}
+
+func resolveIPCOrigin(e *Engine, origin ipcOriginRequest) (*Session, IPCTarget, bool, error) {
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+	state := e.interactiveStates[origin.SessionKey]
+	if state == nil {
+		return nil, IPCTarget{}, false, errors.New("ipc_origin_changed")
+	}
+	state.mu.Lock()
+	as, stopped := state.agentSession, state.stopped
+	matching := state.ipcOrigin == origin.OriginID
+	owner := state.ipcOriginSessionID
+	state.mu.Unlock()
+	if !matching || stopped || as == nil || !as.Alive() || e.ctx.Err() != nil {
+		return nil, IPCTarget{}, false, errors.New("ipc_origin_changed")
+	}
+	e.sessions.mu.RLock()
+	defer e.sessions.mu.RUnlock()
+	session := e.sessions.sessions[e.sessions.activeSession[origin.SessionKey]]
+	if session == nil || session.ID != owner {
+		return nil, IPCTarget{}, false, errors.New("ipc_origin_changed")
+	}
+	id := as.CurrentSessionID()
+	if id == "" || id == ContinueSession {
+		return nil, IPCTarget{}, false, errors.New("ipc_origin_not_ready")
+	}
+	bound := false
+	if session.GetAgentSessionID() == "" {
+		bound = session.CompareAndSetAgentSessionID(id, e.agent.Name())
+	}
+	if session.GetAgentSessionID() != id {
+		return nil, IPCTarget{}, false, errors.New("ipc_origin_changed")
+	}
+	target := IPCTarget{Project: origin.Project, SessionKey: origin.SessionKey,
+		SessionID: session.ID, AgentSessionID: id, CWD: origin.CWD}
+	return session, target, bound, nil
 }
 
 func (s *APIServer) ipcRead(id string) (*IPCReceipt, error) {

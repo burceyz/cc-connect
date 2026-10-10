@@ -115,6 +115,7 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	}
 	s.mux.HandleFunc("/ipc/health", s.handleIPCHealth)
 	s.mux.HandleFunc("/ipc/target", s.handleIPCTarget)
+	s.mux.HandleFunc("/ipc/origin", s.handleIPCOrigin)
 	s.mux.HandleFunc("/ipc/event", s.handleIPCEvent)
 	s.mux.HandleFunc("/ipc/ack", s.handleIPCAck)
 
