@@ -47,7 +47,7 @@ func newAntigravitySession(ctx context.Context, cmd string, extraArgs []string, 
 		cmd: cmd, extraArgs: extraArgs, workDir: workDir, model: model, mode: mode,
 		timeout: timeout, extraEnv: extraEnv, events: make(chan core.Event, 64), ctx: sessionCtx, cancel: cancel,
 	}
-	if mode == "default" {
+	if mode == "default" || mode == "acceptEdits" {
 		bridge, err := newAgyPermissionBridge(sessionCtx, as.events)
 		if err != nil {
 			cancel()
@@ -245,6 +245,8 @@ func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool,
 	switch mode {
 	case "yolo":
 		args = append(args, "--dangerously-skip-permissions")
+	case "acceptEdits":
+		args = append(args, "--mode", "accept-edits")
 	case "plan":
 		args = append(args, "--sandbox")
 	}

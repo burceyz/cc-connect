@@ -27,6 +27,7 @@ func init() {
 //
 // Modes (maps to agy approval and sandbox flags):
 //   - "default":   ask for each tool through the cc-connect permission bridge
+//   - "acceptEdits": auto-approve workspace edits; ask for other tools through the permission bridge
 //   - "yolo":      auto-approve all tools (--dangerously-skip-permissions)
 //   - "plan":      read-only plan mode with terminal sandbox constraints (--sandbox)
 type Agent struct {
@@ -103,6 +104,8 @@ func normalizeMode(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "yolo", "auto", "force", "bypasspermissions":
 		return "yolo"
+	case "acceptedits", "accept-edits", "edit":
+		return "acceptEdits"
 	case "plan", "sandbox":
 		return "plan"
 	default:

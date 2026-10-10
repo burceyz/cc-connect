@@ -44,6 +44,9 @@ func TestNormalizeMode(t *testing.T) {
 		{"yolo", "yolo"},
 		{"auto", "yolo"},
 		{"force", "yolo"},
+		{"acceptEdits", "acceptEdits"},
+		{"accept-edits", "acceptEdits"},
+		{"edit", "acceptEdits"},
 		{"plan", "plan"},
 		{"sandbox", "plan"},
 		{"invalid", "default"},
@@ -175,19 +178,27 @@ func TestAntigravitySession_ResumePassesConversationID(t *testing.T) {
 }
 
 func TestDefaultModeCreatesPermissionBridge(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-
-	s, err := newAntigravitySession(context.Background(), "echo", nil, "/tmp", "", "default", "", nil, 0)
-	if err != nil {
-		t.Fatalf("newAntigravitySession: %v", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	if s.permissionBridge == nil {
-		t.Fatal("permissionBridge = nil, want default-mode permission bridge")
-	}
-	if _, err := os.Stat(filepath.Join(s.permissionBridge.AgyConfigDir(), "config", "hooks.json")); err != nil {
-		t.Fatalf("stat Agy hook overlay: %v", err)
+	for _, mode := range []string{"default", "acceptEdits"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			s, err := newAntigravitySession(context.Background(), "echo", nil, "/tmp", "", mode, "", nil, 0)
+			if err != nil {
+				t.Fatalf("newAntigravitySession: %v", err)
+			}
+			defer func() { _ = s.Close() }()
+			if s.permissionBridge == nil {
+				t.Fatal("permissionBridge = nil, want permission bridge")
+			}
+			if _, err := os.Stat(filepath.Join(s.permissionBridge.AgyConfigDir(), "config", "hooks.json")); err != nil {
+				t.Fatalf("stat Agy hook overlay: %v", err)
+			}
+			if mode == "acceptEdits" {
+				args := s.buildAntigravityArgs("", false, mode, s.invocationBridge.configDir, "request")
+				if !contains(args, "accept-edits") || contains(args, "--dangerously-skip-permissions") {
+					t.Fatalf("acceptEdits must use scoped CLI mode: %v", args)
+				}
+			}
+		})
 	}
 }
 
