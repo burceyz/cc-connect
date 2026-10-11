@@ -218,9 +218,10 @@ Every page repeats ownership, original-record and integrity checks; consultation
 pages also require the accepted request, tool-policy proof and released
 processes. Cursors bind the complete result and event/job metadata and reject
 changed content or a different result. They are read positions, not file paths
-or capabilities. This keeps research results and long incoming material out of
-the native client's inaccessible `output.txt` spill files. No cache directory
-or additional file-read permission is granted.
+or capabilities. Research results and long incoming material stay inline in the
+native client. The client may still record `output.txt` internally, but the
+model does not need to read that file. No cache directory or additional
+file-read permission is granted.
 
 The host's operation scope and the arguments determine the stable operation
 key. Retries reuse the original event and pinned recipient. Unknown delivery
