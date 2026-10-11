@@ -310,17 +310,22 @@ def delivery_confirmed(state):
 
 
 def receipt_allows_retry(receipt):
-    """Accept only an identified receiver attempt that provably sent no input."""
+    """Accept only identified receiver evidence that no input was sent."""
     if (receipt.get('status') != 'waiting' or receipt.get('code') == 'session_stopped' or
             any(receipt.get(key) for key in ('claimed_at', 'injected_at', 'acknowledged_at'))):
         return False
-    if any(not isinstance(receipt.get(key), str) or
-           re.fullmatch(r'[0-9a-f]{32}', receipt[key]) is None for key in ('boot', 'attempt_id')):
+    boot, attempt = receipt.get('boot'), receipt.get('attempt_id')
+    if not isinstance(boot, str) or re.fullmatch(r'[0-9a-f]{32}', boot) is None:
+        return False
+    valid_attempt = isinstance(attempt, str) and re.fullmatch(r'[0-9a-f]{32}', attempt) is not None
+    if 'attempt_id' in receipt and not valid_attempt:
         return False
     if receipt.get('method') == 'queue':
         instance = receipt.get('instance_id')
-        return (receipt.get('phase') == 'released' and isinstance(instance, str) and
+        return (valid_attempt and receipt.get('phase') == 'released' and isinstance(instance, str) and
                 re.fullmatch(r'[0-9a-f]{64}', instance) is not None)
+    # The deployed synchronous ipc.3 receiver has no attempt_id. Its explicit
+    # ErrNoActiveInput codes guarantee no side effect and have no late queue callbacks.
     return (not receipt.get('method') and not receipt.get('phase') and not receipt.get('instance_id') and
             receipt.get('code') in {'turn_not_ready', 'session_busy_without_live_input'})
 
@@ -419,7 +424,7 @@ def step(dest, runtime):
                   acknowledged_at=result.get('acknowledged_at'),
                   delivery_confirmed=delivery_confirmed(state) or result['status'] == 'delivered',
                   receiver_attempt_id=result.get('attempt_id'), receiver_phase=result.get('phase'),
-                  query_only=querying and not receipt_allows_retry(result))
+                  query_only=not receipt_allows_retry(result))
 
 
 def watch(key, runtime, lease_fd=None):

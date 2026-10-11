@@ -53,7 +53,11 @@ class DeliveryTests(unittest.TestCase):
 
     def response(self, state='delivered', method='start'):
         payload = json.loads((self.dest / 'callback-input.json').read_text())
-        return {'status': state, 'input': payload, 'method': method}
+        receipt = {'status': state, 'input': payload, 'method': method}
+        if state == 'waiting' and method == 'start':
+            receipt.update(method='', boot='a' * 32, attempt_id='b' * 32,
+                           code='session_busy_without_live_input')
+        return receipt
 
     def queued_response(self, state='dispatching', phase='queued', **values):
         return self.response(state, 'queue') | {
@@ -111,6 +115,34 @@ class DeliveryTests(unittest.TestCase):
                     self.assertTrue(ipc.step(self.dest, self.runtime)['query_only'])
                     self.assertTrue(ipc.step(self.dest, self.runtime)['query_only'])
                 self.assertEqual([item.args[1] for item in call.call_args_list], ['GET', 'GET'])
+
+    def test_first_post_waiting_with_stop_or_claim_never_reposts(self):
+        for changed in ({'code': 'session_stopped'}, {'claimed_at': 'now'}, {'injected_at': 'now'},
+                        {'phase': 'claimed'}, {'attempt_id': ''}, {'instance_id': ''}):
+            with self.subTest(changed=changed):
+                ipc.prepare(self.dest, self.request)
+                receipt = None
+
+                def reply(*args):
+                    nonlocal receipt
+                    receipt = self.queued_response('waiting', 'released') | changed
+                    return receipt
+
+                with patch.object(ipc, 'call', side_effect=reply) as call:
+                    self.assertTrue(ipc.step(self.dest, self.runtime)['query_only'])
+                    self.assertTrue(ipc.step(self.dest, self.runtime)['query_only'])
+                self.assertEqual([item.args[1] for item in call.call_args_list], ['POST', 'GET'])
+
+    def test_legacy_steer_receiver_without_attempt_id_can_retry(self):
+        with patch.object(ipc, 'call', side_effect=ipc.DeliveryUnknown()):
+            ipc.step(self.dest, self.runtime)
+        # Deployed ipc.3 has boot + explicit no-input code, but no queue/attempt fields.
+        receipt = self.response('waiting')
+        receipt.pop('attempt_id')
+        with patch.object(ipc, 'call', side_effect=[receipt, self.response()]) as call:
+            self.assertFalse(ipc.step(self.dest, self.runtime)['query_only'])
+            self.assertEqual(ipc.step(self.dest, self.runtime)['status'], 'delivered')
+        self.assertEqual([item.args[1] for item in call.call_args_list], ['GET', 'POST'])
 
     def test_identified_no_active_steer_receipt_can_retry(self):
         with patch.object(ipc, 'call', side_effect=ipc.DeliveryUnknown()):
@@ -402,7 +434,8 @@ class DeliveryTests(unittest.TestCase):
     def test_unknown_reconciled_to_waiting_keeps_query_only_marker(self):
         with patch.object(ipc, 'call', side_effect=lambda *args: self.response('unknown')):
             self.assertEqual(ipc.step(self.dest, self.runtime)['status'], 'unknown')
-        with patch.object(ipc, 'call', side_effect=lambda *args: self.response('waiting')) as call:
+        with patch.object(ipc, 'call', side_effect=lambda *args: {
+                'status': 'waiting', 'input': self.response()['input']}) as call:
             self.assertTrue(ipc.reconcile('one', self.runtime)['query_only'])
             self.assertEqual(ipc.step(self.dest, self.runtime)['status'], 'waiting')
         self.assertEqual([item.args[1] for item in call.call_args_list], ['GET', 'GET'])
