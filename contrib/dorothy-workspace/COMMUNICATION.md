@@ -33,6 +33,7 @@ cannot choose it or override its fields. An example with consultation disabled:
   "source_cwd": "/Users/yz/WorkSpace/cc-connect-demo/workdir/dorothy",
   "source_prefix": "dorothy",
   "allowed_contacts": {"atlas": "atlas"},
+  "contact_labels": {"atlas": "本次接入维护与问题处理"},
   "enable_consultation": false,
   "consultation_timeout": 300,
   "materials": {}
@@ -44,6 +45,8 @@ native `source_cwd`. The host provides `CC_IPC_ORIGIN`, `CC_PROJECT`,
 `CC_SESSION_KEY`, `CC_DATA_DIR`, and `CC_IPC_CWD=source_cwd`. Every event/job
 operation obtains its identity from `ipc.capture()`. The request context is
 not an identity source. `tools/list` and `list_contacts` need no live origin.
+`list_contacts` performs only receiver identity checks, with at most four
+concurrent lookups and a two-second socket timeout per lookup.
 
 The IPC library accepts the existing workspace root and canonical, existing
 directories below it. The receiver still verifies the actual origin/target.
@@ -55,6 +58,22 @@ names. An equivalent list uses each name as its own alias. Sending registers
 only a deterministic source name derived from the actual binding, without
 `replace`. Existing canonical contacts remain unchanged. Replies retain the
 original sender's pinned binding and require its name to remain allowed.
+
+Optional `contact_labels` maps allowed aliases to host-verified, single-line task
+descriptions of at most 256 UTF-8 bytes. Unknown aliases, blank descriptions,
+surrounding whitespace and control characters are rejected. Missing labels are
+shown as `任务主题未核实`; no task is inferred from the contact name or a live session.
+Different Atlas sessions should have distinct aliases and verified descriptions.
+
+`list_contacts` returns `{"contacts":[{"alias":"atlas","purpose":"...","status":"available"}]}`.
+The fixed status values are `available` (the registered identity still matches
+and supports live input), `changed` (a different identity or workspace),
+`offline` (receiver connection unavailable), `unknown` (check inconclusive), and
+`unregistered` (no registered contact file). An optional `busy` boolean appears
+only when the matching receiver actually provides it; `available` alone does
+not mean idle. Results contain no socket, path or raw session identifiers.
+Checks neither scan the contacts directory nor register, rebind, send an event,
+or select a latest session. A changed binding needs an explicit host update.
 
 Optional material IDs map to objects containing `path` and `sha256`. Paths must
 point to controlled text copies under `work_dir/materials/`; the backend checks
@@ -130,5 +149,6 @@ python3 -B -m unittest test_communication test_ipc
 ```
 
 The communication tests use real temporary peer outboxes and mock transport,
-watchers and model-job submission. The IPC tests include local fixture sockets
+watchers and model-job submission, plus bounded concurrent identity checks.
+The IPC tests include local fixture sockets
 and fresh subprocess imports; they do not call the real host or a model.

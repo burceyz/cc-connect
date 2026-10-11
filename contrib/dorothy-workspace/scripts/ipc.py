@@ -65,7 +65,7 @@ def socket_path():
     return (data / 'run' / 'api.sock').resolve()
 
 
-def call(path, method, route, body=None, *, identity_lookup=False):
+def call(path, method, route, body=None, *, identity_lookup=False, timeout=12):
     """No TCP fallback, proxy, webhook token, shell, or latest-session lookup."""
     path = Path(path)
     try:
@@ -75,8 +75,8 @@ def call(path, method, route, body=None, *, identity_lookup=False):
     except FileNotFoundError:
         raise ReceiverOffline() from None
     transport = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    transport.settimeout(12)
-    conn = http.client.HTTPConnection('localhost', timeout=12)
+    transport.settimeout(timeout)
+    conn = http.client.HTTPConnection('localhost', timeout=timeout)
     try:
         try:
             transport.connect(str(path))
@@ -95,10 +95,11 @@ def call(path, method, route, body=None, *, identity_lookup=False):
                 raise DeliveryUnknown()
             if response.status != 200:
                 # Mutating calls retain their existing conservative unknown
-                # semantics. Only an origin lookup may expose safe error codes.
+                # semantics. Only identity lookups may expose safe error codes.
                 code = value.get('code', '')
-                if (identity_lookup and method == 'POST' and route == '/ipc/origin' and
-                        response.status in {400, 404, 409} and
+                identity_rejected = ((route == '/ipc/origin' and response.status in {400, 404, 409}) or
+                                     (route == '/ipc/target' and response.status == 409))
+                if (identity_lookup and method == 'POST' and identity_rejected and
                         isinstance(code, str) and re.fullmatch(r'ipc_[a-z_]{1,80}', code)):
                     raise ReceiverRejected(code)
                 raise DeliveryUnknown()

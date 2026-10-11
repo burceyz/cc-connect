@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -130,10 +131,108 @@ class CommunicationTests(unittest.TestCase):
         result = communication.execute(request, self.backend)
         self.assertEqual({item['name'] for item in result['tools']}, {
             'list_contacts', 'send_message', 'reply_message', 'read_message', 'message_status', 'ack_message'})
-        self.assertEqual(self.call('list_contacts'), {'contacts': ['atlas']})
+        ipc.call.assert_not_called()
+        self.assertEqual(self.call('list_contacts'), {'contacts': [
+            {'alias': 'atlas', 'purpose': '任务主题未核实', 'status': 'available'}]})
         ipc.capture.assert_not_called()
         self.jobs.submit.assert_not_called()
         peer_ipc.launch_watch.assert_not_called()
+
+    def test_contacts_show_two_verified_atlas_labels_and_only_actual_busy(self):
+        self.policy.update(allowed_contacts={'atlas-current': 'atlas', 'atlas-review': 'other'},
+                           contact_labels={'atlas-current': 'Dorothy接入迁移', 'atlas-review': '回调修复复核'})
+        before = {path.name: path.read_bytes() for path in (self.runtime / 'contacts').glob('*.json')}
+
+        def probe(socket, method, route, body, **kwargs):
+            self.assertEqual((method, route), ('POST', '/ipc/target'))
+            self.assertEqual(kwargs, {'identity_lookup': True, 'timeout': 2})
+            value = {'protocol': ipc.PROTOCOL, 'target': deepcopy(body), 'supports_live_input': True,
+                     'socket': '/private/never-returned', 'agent_session_id': 'never-returned'}
+            if body == self.atlas['target']:
+                value['busy'] = True
+            else:
+                value['busy'] = 'false'
+            return value
+
+        with patch.object(ipc, 'call', side_effect=probe), patch.object(peer_ipc, 'register') as register, \
+                patch.object(peer_ipc, 'send') as send:
+            result = self.call('list_contacts')
+        self.assertEqual(result, {'contacts': [
+            {'alias': 'atlas-current', 'purpose': 'Dorothy接入迁移', 'status': 'available', 'busy': True},
+            {'alias': 'atlas-review', 'purpose': '回调修复复核', 'status': 'available'}]})
+        register.assert_not_called()
+        send.assert_not_called()
+        ipc.capture.assert_not_called()
+        self.jobs.submit.assert_not_called()
+        peer_ipc.launch_watch.assert_not_called()
+        self.assertEqual(self.event_posts, [])
+        self.assertNotIn('never-returned', json.dumps(result))
+        self.assertEqual(before, {path.name: path.read_bytes() for path in (self.runtime / 'contacts').glob('*.json')})
+
+    def test_contact_checks_distinguish_changes_offline_and_unknown_without_rebinding(self):
+        contacts = ('changed', 'offline', 'uncertain', 'unsupported', 'wrong')
+        for contact in contacts:
+            fixed = deepcopy(self.atlas)
+            fixed['target']['project'] = contact
+            ipc.write_state(self.runtime / 'contacts' / (contact + '.json'),
+                            {'protocol': peer_ipc.VERSION, 'name': contact, 'binding': fixed})
+        # This import snapshot is not a registered contact and must not escape as metadata.
+        ipc.write_state(self.runtime / 'contacts' / 'invalid.json', self.atlas)
+        self.policy['allowed_contacts'] = {name: name for name in (*contacts, 'missing', 'invalid')}
+        before = {path.name: path.read_bytes() for path in (self.runtime / 'contacts').glob('*.json')}
+
+        def probe(socket, method, route, body, **kwargs):
+            self.assertEqual((method, route), ('POST', '/ipc/target'))
+            self.assertEqual(kwargs, {'identity_lookup': True, 'timeout': 2})
+            kind = body['project']
+            if kind == 'changed':
+                raise ipc.ReceiverRejected('ipc_target_changed')
+            if kind == 'offline':
+                raise ipc.ReceiverOffline()
+            if kind == 'uncertain':
+                raise ipc.DeliveryUnknown()
+            if kind == 'unsupported':
+                raise ipc.ReceiverRejected('ipc_project_unsupported')
+            return {'protocol': ipc.PROTOCOL, 'target': body | {'agent_session_id': 'replacement'},
+                    'supports_live_input': True, 'busy': False}
+
+        with patch.object(ipc, 'call', side_effect=probe) as call:
+            result = self.call('list_contacts')
+        self.assertEqual({item['alias']: item['status'] for item in result['contacts']}, {
+            'changed': 'changed', 'offline': 'offline', 'uncertain': 'unknown', 'unsupported': 'unknown',
+            'wrong': 'changed', 'missing': 'unregistered', 'invalid': 'unknown'})
+        self.assertEqual(call.call_count, 5)
+        self.assertTrue(all(set(item) == {'alias', 'purpose', 'status'} for item in result['contacts']))
+        self.assertNotIn(str(self.root), json.dumps(result))
+        self.assertNotIn('replacement', json.dumps(result))
+        self.assertEqual(before, {path.name: path.read_bytes() for path in (self.runtime / 'contacts').glob('*.json')})
+        self.assertEqual(self.event_posts, [])
+
+    def test_contact_checks_use_bounded_parallelism_and_keep_alias_order(self):
+        aliases = ['atlas-' + str(index) for index in range(8)]
+        self.policy['allowed_contacts'] = {alias: 'atlas' for alias in reversed(aliases)}
+        barrier, lock = threading.Barrier(4), threading.Lock()
+        active, peak = 0, 0
+
+        def probe(socket, method, route, body, **kwargs):
+            nonlocal active, peak
+            self.assertEqual(kwargs['timeout'], 2)
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait(timeout=3)
+                return {'protocol': ipc.PROTOCOL, 'target': body, 'supports_live_input': True, 'busy': False}
+            finally:
+                with lock:
+                    active -= 1
+
+        with patch.object(ipc, 'call', side_effect=probe) as call:
+            result = self.call('list_contacts')
+        self.assertEqual(peak, 4)
+        self.assertEqual(call.call_count, len(aliases))
+        self.assertEqual([item['alias'] for item in result['contacts']], aliases)
+        self.assertTrue(all(item['status'] == 'available' and item['busy'] is False for item in result['contacts']))
 
     def test_empty_allowlists_do_not_publish_invalid_empty_enums(self):
         self.policy.update(allowed_contacts={}, enable_consultation=True, materials={})
@@ -464,6 +563,7 @@ class PolicyTests(unittest.TestCase):
         loaded = communication.load_policy(self.policy_path)
         self.assertEqual(loaded['allowed_contacts'], {'atlas': 'atlas'})
         self.assertFalse(loaded['enable_consultation'])
+        self.assertEqual(loaded['contact_labels'], {})
         self.policy_path.chmod(0o644)
         with self.assertRaisesRegex(ValueError, 'record_not_private'):
             communication.load_policy(self.policy_path)
@@ -472,6 +572,18 @@ class PolicyTests(unittest.TestCase):
         self.write()
         with self.assertRaisesRegex(ValueError, 'invalid_fields'):
             communication.load_policy(self.policy_path)
+
+    def test_contact_labels_are_optional_bounded_and_scoped_to_allowed_aliases(self):
+        self.policy['contact_labels'] = {'atlas': '本次接入迁移'}
+        self.write()
+        self.assertEqual(communication.load_policy(self.policy_path)['contact_labels'], self.policy['contact_labels'])
+        for labels in ([], {'other': '未知成员'}, {'atlas': ''}, {'atlas': ' '}, {'atlas': ' 前导空格'},
+                       {'atlas': '第一行\n第二行'}, {'atlas': 'a\x7fb'}, {'atlas': '中' * 86}, {'atlas': 5}):
+            with self.subTest(labels=labels):
+                self.policy['contact_labels'] = labels
+                self.write()
+                with self.assertRaisesRegex(ValueError, 'policy_contact_labels_invalid'):
+                    communication.load_policy(self.policy_path)
 
     def test_policy_rejects_external_materials_and_symlinked_policy(self):
         self.policy['materials'] = {'secret': {'path': '/private/secret.txt', 'sha256': 'a' * 64}}

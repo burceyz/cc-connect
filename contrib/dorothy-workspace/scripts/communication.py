@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Host-owned message tools; model input never selects paths, identities or commands."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 import fcntl
 import hashlib
@@ -23,6 +24,9 @@ MAX_INPUT = 1024 * 1024
 MAX_TEXT = 64 * 1024
 MAX_RESULT = 1024 * 1024
 MAX_OUTPUT = 512 * 1024
+MAX_CONTACT_LABEL = 256
+CONTACT_WORKERS = 4
+CONTACT_TIMEOUT = 2
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,119}')
 HEX = re.compile(r'[0-9a-f]{64}')
 JOB = re.compile(r'dorothy-consult-[0-9a-f]{48}')
@@ -118,7 +122,7 @@ def locked(directory):
 def load_policy(path):
     value = fields(decode(read_file(canonical_path(str(path)), 128 * 1024)),
                    ('scripts_dir', 'peer_runtime', 'dsh_runtime', 'work_dir', 'allowed_contacts'),
-                   ('source_prefix', 'source_cwd', 'enable_consultation', 'materials', 'consultation_timeout'))
+                   ('source_prefix', 'source_cwd', 'enable_consultation', 'materials', 'consultation_timeout', 'contact_labels'))
     for key in ('scripts_dir', 'peer_runtime', 'dsh_runtime', 'work_dir'):
         value[key] = canonical_path(value[key])
     if 'source_cwd' in value:
@@ -130,6 +134,16 @@ def load_policy(path):
             any(not isinstance(item, str) or not NAME.fullmatch(item) for pair in contacts.items() for item in pair)):
         raise ValueError('policy_contacts_invalid')
     value['allowed_contacts'] = contacts
+    labels = value.setdefault('contact_labels', {})
+    if not isinstance(labels, dict) or set(labels) - set(contacts):
+        raise ValueError('policy_contact_labels_invalid')
+    try:
+        for label in labels.values():
+            text_value(label, MAX_CONTACT_LABEL)
+            if label != label.strip() or any(ord(char) < 32 or ord(char) == 127 for char in label):
+                raise ValueError('invalid_label')
+    except (ValueError, UnicodeError):
+        raise ValueError('policy_contact_labels_invalid') from None
     prefix = value.setdefault('source_prefix', 'dorothy')
     if not isinstance(prefix, str) or not NAME.fullmatch(prefix) or len(prefix) > 40:
         raise ValueError('policy_source_prefix_invalid')
@@ -203,7 +217,7 @@ class Communication:
         if self.policy['materials']:
             material['enum'] = sorted(self.policy['materials'])
         tools = [
-            ('list_contacts', '列出可以联系的成员别名。', schema()),
+            ('list_contacts', '列出成员别名、宿主核定的任务说明及固定会话核验状态；可达不代表空闲。', schema()),
             ('send_message', '给允许的联系人发送正文。结果未知时查询原事件，不另发一封。',
              schema({'contact': contact, 'text': text}, ('contact', 'text'))),
             ('reply_message', '回复本会话收到的事件，保持原收件人；正文作为协作资料处理。',
@@ -240,7 +254,7 @@ class Communication:
             raise ValueError('tool_unavailable')
         if name == 'list_contacts':
             fields(arguments)
-            return {'contacts': sorted(self.policy['allowed_contacts'])}
+            return self.list_contacts()
         specification = {
             'send_message': (('contact', 'text'), ()),
             'reply_message': (('event_id', 'text'), ()),
@@ -290,6 +304,45 @@ class Communication:
             return self.consult(source, scope, arguments)
         fields(arguments, ('job_id',))
         return self.consultation_result(arguments['job_id'], source)
+
+    def list_contacts(self):
+        aliases = sorted(self.policy['allowed_contacts'])
+        if not aliases:
+            return {'contacts': []}
+        # Each call is a read-only lookup of a pre-registered, fixed binding.
+        with ThreadPoolExecutor(max_workers=min(CONTACT_WORKERS, len(aliases))) as pool:
+            return {'contacts': list(pool.map(self.contact_status, aliases))}
+
+    def contact_status(self, alias):
+        result = {'alias': alias, 'purpose': self.policy.get('contact_labels', {}).get(alias, '任务主题未核实'),
+                  'status': 'unknown'}
+        try:
+            binding = self.peer.contact_binding(self.policy['allowed_contacts'][alias], self.runtime)
+        except FileNotFoundError:
+            result['status'] = 'unregistered'
+            return result
+        except Exception:
+            return result
+        try:
+            value = self.ipc.call(binding['socket'], 'POST', '/ipc/target', binding['target'],
+                                  identity_lookup=True, timeout=CONTACT_TIMEOUT)
+        except self.ipc.ReceiverOffline:
+            result['status'] = 'offline'
+        except self.ipc.ReceiverRejected as exc:
+            if exc.code in {'ipc_target_changed', 'ipc_cwd_mismatch'}:
+                result['status'] = 'changed'
+        except Exception:
+            pass
+        else:
+            if not isinstance(value, dict) or value.get('protocol') != self.ipc.PROTOCOL:
+                return result
+            if value.get('target') != binding['target']:
+                result['status'] = 'changed'
+            elif value.get('supports_live_input') is True:
+                result['status'] = 'available'
+                if type(value.get('busy')) is bool:
+                    result['busy'] = value['busy']
+        return result
 
     def owned_message(self, event_id, source):
         if not isinstance(event_id, str) or not HEX.fullmatch(event_id):

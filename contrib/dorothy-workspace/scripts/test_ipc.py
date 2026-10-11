@@ -755,6 +755,65 @@ class UnixTransportTests(unittest.TestCase):
             with self.assertRaises(ipc.ReceiverOffline):
                 ipc.call(path, 'GET', '/ipc/health')
 
+    def test_target_rejection_is_exposed_only_for_read_only_identity_lookup(self):
+        with tempfile.TemporaryDirectory(prefix='dsh-ipc-', dir='/tmp') as folder:
+            path = Path(folder) / 'api.sock'
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    body = json.dumps({'code': 'ipc_target_changed'}).encode()
+                    self.send_response(409)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *_):
+                    pass
+
+            server = socketserver.UnixStreamServer(str(path), Handler)
+            path.chmod(0o600)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with self.assertRaises(ipc.ReceiverRejected) as rejected:
+                    ipc.call(path, 'POST', '/ipc/target', binding()['target'], identity_lookup=True, timeout=2)
+                self.assertEqual(rejected.exception.code, 'ipc_target_changed')
+                with self.assertRaises(ipc.DeliveryUnknown):
+                    ipc.call(path, 'POST', '/ipc/target', binding()['target'])
+                with self.assertRaises(ipc.DeliveryUnknown):
+                    ipc.call(path, 'POST', '/ipc/event', {}, identity_lookup=True, timeout=2)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(2)
+
+    def test_identity_query_socket_timeout_bounds_an_unresponsive_receiver(self):
+        with tempfile.TemporaryDirectory(prefix='dsh-ipc-', dir='/tmp') as folder:
+            path = Path(folder) / 'api.sock'
+            release = threading.Event()
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    release.wait(5)
+
+                def log_message(self, *_):
+                    pass
+
+            server = socketserver.UnixStreamServer(str(path), Handler)
+            path.chmod(0o600)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                started = time.monotonic()
+                with self.assertRaises(ipc.DeliveryUnknown):
+                    ipc.call(path, 'POST', '/ipc/target', binding()['target'], identity_lookup=True, timeout=0.05)
+                self.assertLess(time.monotonic() - started, 0.75)
+            finally:
+                release.set()
+                server.shutdown()
+                server.server_close()
+                thread.join(2)
+
 
 class CanonicalWorkspaceTests(unittest.TestCase):
     def setUp(self):
