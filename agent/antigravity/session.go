@@ -19,43 +19,54 @@ import (
 
 // antigravitySession resumes a fixed conversation with one -p process per Send.
 type antigravitySession struct {
-	cmd              string
-	extraArgs        []string
-	workDir          string
-	model            string
-	effort           string
-	reviewCommand    []string
-	mode             string
-	timeout          time.Duration
-	extraEnv         []string
-	events           chan core.Event
-	closeOnce        sync.Once
-	chatID           atomic.Value // stores string
-	ctx              context.Context
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup
-	alive            atomic.Bool
-	startMu          sync.Mutex // prevents Send/Close WaitGroup races
-	activeRun        *agyRun
-	permissionBridge *agyPermissionBridge
-	invocationBridge *agyInvocationBridge
+	cmd                 string
+	extraArgs           []string
+	workDir             string
+	model               string
+	effort              string
+	reviewCommand       []string
+	mode                string
+	timeout             time.Duration
+	extraEnv            []string
+	events              chan core.Event
+	closeOnce           sync.Once
+	chatID              atomic.Value // stores string
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	wg                  sync.WaitGroup
+	alive               atomic.Bool
+	startMu             sync.Mutex // prevents Send/Close WaitGroup races
+	activeRun           *agyRun
+	permissionBridge    *agyPermissionBridge
+	invocationBridge    *agyInvocationBridge
+	communication       *agyCommunicationOptions
+	communicationBridge *agyCommunicationBridge
 }
 
 func newAntigravitySession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, resumeID string, extraEnv []string, timeout time.Duration) (*antigravitySession, error) {
+	return newAntigravitySessionMode(ctx, cmd, extraArgs, workDir, model, mode, resumeID, extraEnv, timeout, nil)
+}
+
+func newAntigravitySessionMode(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, resumeID string, extraEnv []string, timeout time.Duration, communication *agyCommunicationOptions) (*antigravitySession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	as := &antigravitySession{
 		cmd: cmd, extraArgs: extraArgs, workDir: workDir, model: model, mode: mode,
 		timeout: timeout, extraEnv: extraEnv, events: make(chan core.Event, 64), ctx: sessionCtx, cancel: cancel,
+		communication: communication,
 	}
-	if mode == "default" || mode == "acceptEdits" {
-		bridge, err := newAgyPermissionBridge(sessionCtx, as.events)
+	if mode == "default" || mode == "acceptEdits" || communication != nil {
+		schemaDir := ""
+		if communication != nil {
+			schemaDir = filepath.Join(communication.runtimeDir, "antigravity-cli", "mcp", "cc_communication")
+		}
+		bridge, err := newAgyPermissionBridgeMode(sessionCtx, as.events, communication != nil, schemaDir)
 		if err != nil {
 			cancel()
 			return nil, fmt.Errorf("antigravity: initialize permission bridge: %w", err)
 		}
 		as.permissionBridge = bridge
 	}
-	bridge, err := newAgyInvocationBridge(sessionCtx, as.permissionBridge != nil)
+	bridge, err := newAgyInvocationBridgeMode(sessionCtx, as.permissionBridge != nil, communication != nil)
 	if err != nil {
 		cancel()
 		if as.permissionBridge != nil {
@@ -64,6 +75,17 @@ func newAntigravitySession(ctx context.Context, cmd string, extraArgs []string, 
 		return nil, fmt.Errorf("antigravity: initialize invocation bridge: %w", err)
 	}
 	as.invocationBridge = bridge
+	if communication != nil {
+		if err := as.initializeCommunication(); err != nil {
+			cancel()
+			as.invocationBridge.Close()
+			as.permissionBridge.Close()
+			if as.communicationBridge != nil {
+				as.communicationBridge.Close()
+			}
+			return nil, err
+		}
+	}
 	if resumeID != "" && resumeID != core.ContinueSession {
 		as.chatID.Store(resumeID)
 	}
@@ -138,6 +160,12 @@ func (as *antigravitySession) startRun(prompt, messageID string, images []core.I
 			}
 		}
 	}()
+	if as.communicationBridge != nil {
+		if err := as.communicationBridge.setRun(run, messageID); err != nil {
+			return nil, err
+		}
+		fullPrompt = appendAgyCommunicationInstructions(fullPrompt)
+	}
 	if len(as.reviewCommand) > 0 {
 		task, err := as.beginReview(run.ctx, fullPrompt, ipcEventID(messageID), as.CurrentSessionID())
 		if err != nil {
@@ -164,13 +192,26 @@ func (as *antigravitySession) startProcess(run *agyRun, fullPrompt string, tempF
 	chatID := as.CurrentSessionID()
 	args := as.buildAntigravityArgs(chatID, chatID != "", as.mode, as.invocationBridge.configDir, fullPrompt)
 	cmd := exec.CommandContext(run.ctx, as.cmd, args...)
+	if as.communication != nil {
+		var err error
+		cmd, err = as.communicationCommand(run.ctx, args)
+		if err != nil {
+			return err
+		}
+	}
 	cmd.WaitDelay = time.Second
 	cmd.Dir = as.workDir
 	cmd.Env = core.MergeEnv(os.Environ(), as.extraEnv)
+	if as.communication != nil {
+		cmd.Env = as.communicationEnv()
+	}
 	if as.permissionBridge != nil {
 		cmd.Env = core.MergeEnv(cmd.Env, as.permissionBridge.Env())
 	}
 	cmd.Env = core.MergeEnv(cmd.Env, as.invocationBridge.Env(run))
+	if as.communicationBridge != nil {
+		cmd.Env = core.MergeEnv(cmd.Env, as.communicationBridge.Env(run))
+	}
 	if run.reviewTask != nil {
 		cmd.Env = core.MergeEnv(cmd.Env, run.reviewTask.Env())
 	}
@@ -314,7 +355,7 @@ func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool,
 		args = append(args, "--dangerously-skip-permissions")
 	case "acceptEdits":
 		args = append(args, "--mode", "accept-edits")
-	case "plan":
+	case "plan", "communication":
 		args = append(args, "--sandbox")
 	}
 	return append(args, "-p", fullPrompt)
@@ -414,6 +455,9 @@ func (as *antigravitySession) Close() error {
 	as.invocationBridge.Close()
 	if as.permissionBridge != nil {
 		as.permissionBridge.Close()
+	}
+	if as.communicationBridge != nil {
+		as.communicationBridge.Close()
 	}
 	done := make(chan struct{})
 	go func() {

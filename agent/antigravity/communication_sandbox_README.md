@@ -17,6 +17,11 @@ The trusted host supplies `CommunicationSandboxOptions`:
   bridge addresses, each with an explicit loopback IP and fixed port.
 - `AllowHTTPS`: permit outbound TCP 443 outside localhost, the system DNS
   resolver, and certificate trust services. Other localhost ports stay denied.
+- `AllowNativeRPC`: explicitly permit TCP listeners required by the installed
+  CLI. It defaults to false. The CLI must bind loopback itself: on the tested
+  macOS version, Seatbelt's `localhost` inbound predicate also permits wildcard
+  and non-loopback binds. Verify the real CLI's listening addresses during
+  deployment. No outbound connection is granted by enabling a listener.
 
 Build the command before merging the explicit session environment. Use
 `cmd.Environ()` as the base so `PWD` matches `cmd.Dir`. Place `TMPDIR` under
@@ -51,7 +56,7 @@ macOS aliases. `/private/var/select/sh` supplies the system shell selection.
 
 Seatbelt only accepts `localhost` or `*` in endpoint expressions. Validated
 `127.0.0.1:port` and `[::1]:port` inputs therefore become a localhost-port grant
-covering loopback address families. No other port is granted implicitly.
+covering loopback address families. No other outbound port is granted implicitly.
 Unix-domain sockets are denied, even when the socket file is in `WorkDir`.
 The only optional Unix socket exception is the system DNS resolver when HTTPS
 is enabled. The host's raw CC Connect Unix socket must never be added.
@@ -73,12 +78,14 @@ the host's fixed tool names; do not allow every MCP server. The hook's emitted
 tool-name representation must be verified against an actual invocation instead
 of inferred from the resource syntax.
 
-The installed CLI contains the Antigravity credential-file name
-`jetski-standalone-oauth-token`. Metadata inspection found that file separately
-from Gemini CLI's `oauth_creds.json`; no credential contents were read by these
-tests. The host can stage only the required Antigravity credential in its
-dedicated runtime. Login, token refresh, and model transport require a final
-real-session check; the metadata tests do not establish those behaviors.
+The installed CLI's `NewCLITokenStorage` uses
+`<gemini_dir>/antigravity-oauth-token`. The binary also contains the older
+`jetski-standalone-oauth-token` name, which is not the CLI's current lookup.
+The host stages the explicitly configured credential under the current name
+in the dedicated runtime, preserving refreshed credentials across sessions.
+It does not link token writes back to the original host credential. Login,
+token refresh, and model transport require a final real-session check; the
+metadata tests do not establish those behaviors.
 
 Sources: [MCP](https://antigravity.google/docs/mcp/),
 [permissions](https://antigravity.google/docs/permissions/),

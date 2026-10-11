@@ -25,6 +25,7 @@ type CommunicationSandboxOptions struct {
 	ReadOnlyPaths     []string
 	LoopbackAddresses []string
 	AllowHTTPS        bool
+	AllowNativeRPC    bool
 }
 
 type communicationSandboxPath struct {
@@ -105,6 +106,13 @@ func BuildCommunicationSandboxProfile(opts CommunicationSandboxOptions) (string,
 	}
 	for _, path := range communicationSortedKeys(ancestors) {
 		fmt.Fprintf(&out, "(allow file-read-metadata (literal %s))\n", strconv.Quote(path))
+	}
+	// The installed CLI starts its own RPC listeners on OS-selected ports.
+	// macOS does not enforce a loopback-only bind with the localhost predicate;
+	// the trusted CLI must bind loopback itself. This explicit exception does
+	// not grant outbound access to the listeners or to other host services.
+	if opts.AllowNativeRPC {
+		out.WriteString("(allow network-bind network-inbound (local tcp \"localhost:*\"))\n")
 	}
 	for _, addr := range addresses {
 		// Seatbelt's endpoint grammar only accepts '*' or 'localhost', not

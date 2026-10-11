@@ -34,14 +34,16 @@ type agyQueuedInput struct {
 // A run is one -p process, not an Antigravity user turn. The CLI can add user
 // turns after hook injection while keeping this process and conversation alive.
 type agyRun struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	generation string
-	token      string
-	expectedID string
-	bound      chan struct{}
-	accepted   chan error
-	acceptOnce sync.Once
+	ctx         context.Context
+	cancel      context.CancelFunc
+	toolCtx     context.Context
+	cancelTools context.CancelFunc
+	generation  string
+	token       string
+	expectedID  string
+	bound       chan struct{}
+	accepted    chan error
+	acceptOnce  sync.Once
 
 	mu            sync.Mutex
 	sessionID     string
@@ -59,8 +61,10 @@ func newAgyRun(ctx context.Context, cancel context.CancelFunc, expectedID string
 	if _, err := rand.Read(random); err != nil {
 		return nil, fmt.Errorf("generate Agy invocation identity: %w", err)
 	}
+	toolCtx, cancelTools := context.WithCancel(ctx)
 	return &agyRun{
 		ctx: ctx, cancel: cancel, expectedID: expectedID,
+		toolCtx: toolCtx, cancelTools: cancelTools,
 		generation: hex.EncodeToString(random[:16]), token: hex.EncodeToString(random[16:]),
 		bound: make(chan struct{}), accepted: make(chan error, 1),
 		inputs: make(map[string]*agyQueuedInput),
@@ -212,6 +216,9 @@ func (r *agyRun) end(stopped bool) {
 		return
 	}
 	r.ended, r.stopped = true, stopped
+	if r.cancelTools != nil {
+		r.cancelTools()
+	}
 	type pendingReport struct {
 		item     *agyQueuedInput
 		progress core.LiveInputProgress
@@ -253,17 +260,24 @@ type agyInvocationBridge struct {
 }
 
 func newAgyInvocationBridge(ctx context.Context, permission bool) (*agyInvocationBridge, error) {
+	return newAgyInvocationBridgeMode(ctx, permission, false)
+}
+
+func newAgyInvocationBridgeMode(ctx context.Context, permission, communication bool) (*agyInvocationBridge, error) {
 	bridgeCtx, cancel := context.WithCancel(ctx)
 	root, err := os.MkdirTemp("", "cc-connect-agy-invocation-")
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("create Agy invocation directory: %w", err)
 	}
-	configDir, err := createAgyConfigOverlayForHooks(root, permission, true)
-	if err != nil {
-		cancel()
-		_ = os.RemoveAll(root)
-		return nil, err
+	configDir := ""
+	if !communication {
+		configDir, err = createAgyConfigOverlayForHooks(root, permission, true)
+		if err != nil {
+			cancel()
+			_ = os.RemoveAll(root)
+			return nil, err
+		}
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

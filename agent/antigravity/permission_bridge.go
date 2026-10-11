@@ -32,14 +32,16 @@ type agyHookInput struct {
 }
 
 type agyPermissionBridge struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	listener  net.Listener
-	address   string
-	token     string
-	rootDir   string
-	configDir string
-	events    chan<- core.Event
+	ctx           context.Context
+	cancel        context.CancelFunc
+	listener      net.Listener
+	address       string
+	token         string
+	rootDir       string
+	configDir     string
+	events        chan<- core.Event
+	communication bool
+	schemaDir     string
 
 	nextID    atomic.Uint64
 	pendingMu sync.Mutex
@@ -49,6 +51,10 @@ type agyPermissionBridge struct {
 }
 
 func newAgyPermissionBridge(ctx context.Context, events chan<- core.Event) (*agyPermissionBridge, error) {
+	return newAgyPermissionBridgeMode(ctx, events, false, "")
+}
+
+func newAgyPermissionBridgeMode(ctx context.Context, events chan<- core.Event, communication bool, schemaDir string) (*agyPermissionBridge, error) {
 	bridgeCtx, cancel := context.WithCancel(ctx)
 	rootDir, err := os.MkdirTemp("", "cc-connect-agy-permission-")
 	if err != nil {
@@ -56,11 +62,14 @@ func newAgyPermissionBridge(ctx context.Context, events chan<- core.Event) (*agy
 		return nil, fmt.Errorf("create permission bridge directory: %w", err)
 	}
 
-	configDir, err := createAgyConfigOverlay(rootDir)
-	if err != nil {
-		cancel()
-		_ = os.RemoveAll(rootDir)
-		return nil, err
+	configDir := ""
+	if !communication {
+		configDir, err = createAgyConfigOverlay(rootDir)
+		if err != nil {
+			cancel()
+			_ = os.RemoveAll(rootDir)
+			return nil, err
+		}
 	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -79,15 +88,17 @@ func newAgyPermissionBridge(ctx context.Context, events chan<- core.Event) (*agy
 	}
 
 	bridge := &agyPermissionBridge{
-		ctx:       bridgeCtx,
-		cancel:    cancel,
-		listener:  listener,
-		address:   listener.Addr().String(),
-		token:     base64.RawURLEncoding.EncodeToString(tokenBytes),
-		rootDir:   rootDir,
-		configDir: configDir,
-		events:    events,
-		pending:   make(map[string]chan core.PermissionResult),
+		ctx:           bridgeCtx,
+		cancel:        cancel,
+		listener:      listener,
+		address:       listener.Addr().String(),
+		token:         base64.RawURLEncoding.EncodeToString(tokenBytes),
+		rootDir:       rootDir,
+		configDir:     configDir,
+		events:        events,
+		communication: communication,
+		schemaDir:     schemaDir,
+		pending:       make(map[string]chan core.PermissionResult),
 	}
 	bridge.wg.Add(1)
 	go bridge.acceptLoop()
@@ -347,6 +358,16 @@ func (b *agyPermissionBridge) handleConnection(conn net.Conn) {
 	if input.ToolCall.Args == nil {
 		input.ToolCall.Args = make(map[string]any)
 	}
+	if b.communication {
+		decision := "deny"
+		reason := "This session supports web research and communication tools. Project operations require a separately configured task."
+		if isAgyCommunicationTool(input.ToolCall.Name, input.ToolCall.Args) ||
+			(input.ToolCall.Name == "view_file" && isAgyCommunicationSchemaRead(input.ToolCall.Args, b.schemaDir)) {
+			decision, reason = "allow", ""
+		}
+		b.writeResponse(conn, antigravityhook.BridgeResponse{Decision: decision, Reason: reason})
+		return
+	}
 
 	requestID := fmt.Sprintf("agy-perm-%d", b.nextID.Add(1))
 	resultCh := make(chan core.PermissionResult, 1)
@@ -406,6 +427,9 @@ func (b *agyPermissionBridge) writeResponse(conn net.Conn, response antigravityh
 }
 
 func (b *agyPermissionBridge) RespondPermission(requestID string, result core.PermissionResult) error {
+	if b.communication {
+		return fmt.Errorf("antigravity: communication permissions are fixed by the host policy")
+	}
 	behavior := strings.ToLower(strings.TrimSpace(result.Behavior))
 	if behavior != "allow" && behavior != "deny" {
 		return fmt.Errorf("antigravity: invalid permission behavior %q", result.Behavior)

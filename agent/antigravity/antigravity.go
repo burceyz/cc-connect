@@ -35,6 +35,7 @@ type Agent struct {
 	model         string
 	effort        string
 	reviewCommand []string
+	communication *agyCommunicationOptions
 	mode          string
 	cmd           string   // CLI binary name, default "agy"
 	cliExtraArgs  []string // extra args from cmd after the binary name
@@ -63,6 +64,13 @@ func New(opts map[string]any) (core.Agent, error) {
 	mode, _ := opts["mode"].(string)
 	mode = normalizeMode(mode)
 	cmd, extraArgs := core.ParseCmdOpts(opts, "agy")
+	communication, err := parseAgyCommunicationOptions(opts, workDir, reviewCommand, extraArgs)
+	if err != nil {
+		return nil, err
+	}
+	if communication != nil {
+		mode = "communication"
+	}
 
 	var timeoutMins int64
 	switch v := opts["timeout_mins"].(type) {
@@ -98,6 +106,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		model:         model,
 		effort:        effort,
 		reviewCommand: reviewCommand,
+		communication: communication,
 		mode:          mode,
 		cmd:           cmd,
 		cliExtraArgs:  extraArgs,
@@ -144,6 +153,10 @@ func (a *Agent) SupportsLiveInput() bool { return true }
 func (a *Agent) SetWorkDir(dir string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.communication != nil {
+		slog.Warn("antigravity: communication work_dir is fixed by configuration")
+		return
+	}
 	a.workDir = dir
 	slog.Info("antigravity: work_dir changed", "work_dir", dir)
 }
@@ -248,6 +261,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	model := a.model
 	effort := a.effort
 	reviewCommand := append([]string(nil), a.reviewCommand...)
+	communication := a.communication
 	mode := a.mode
 	cmd := a.cmd
 	extraArgs := append([]string{}, a.cliExtraArgs...)
@@ -264,7 +278,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	a.mu.Unlock()
 
 	if sessionID != "" && sessionID != core.ContinueSession {
-		valid, err := validateAntigravitySessionID(ctx, workDir, sessionID)
+		valid, err := a.validateConfiguredSessionID(ctx, workDir, sessionID)
 		if err != nil {
 			return nil, &core.ResumeUnavailableError{Err: fmt.Errorf("antigravity: cannot verify the saved conversation workspace; retry when its index is available: %w", err)}
 		}
@@ -273,7 +287,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 
-	session, err := newAntigravitySession(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv, timeout)
+	session, err := newAntigravitySessionMode(ctx, cmd, extraArgs, workDir, model, mode, sessionID, extraEnv, timeout, communication)
 	if err != nil {
 		return nil, err
 	}
@@ -283,10 +297,17 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 }
 
 func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {
+	if a.communication != nil {
+		sessions, _, err := listSQLiteAntigravitySessions(ctx, filepath.Join(a.communication.runtimeDir, "antigravity-cli"), a.GetWorkDir())
+		return sessions, err
+	}
 	return listAntigravitySessions(ctx, a.GetWorkDir())
 }
 
 func (a *Agent) DeleteSession(ctx context.Context, sessionID string) error {
+	if a.communication != nil {
+		return fmt.Errorf("antigravity: SQLite conversation deletion is not supported by the CLI's non-interactive interface")
+	}
 	return deleteAntigravitySession(ctx, a.GetWorkDir(), sessionID)
 }
 
@@ -294,7 +315,7 @@ func (a *Agent) DeleteSession(ctx context.Context, sessionID string) error {
 // stored ID when the CLI's index is temporarily unavailable. The core interface
 // has no "unknown" result and treats false as permission to clear the history.
 func (a *Agent) ValidateSessionID(ctx context.Context, sessionID string) bool {
-	valid, err := validateAntigravitySessionID(ctx, a.GetWorkDir(), sessionID)
+	valid, err := a.validateConfiguredSessionID(ctx, a.GetWorkDir(), sessionID)
 	if err != nil {
 		slog.Warn("antigravity: session validation unavailable; preserving stored ID", "error", err)
 		return true
@@ -307,6 +328,10 @@ func (a *Agent) Stop() error { return nil }
 func (a *Agent) SetMode(mode string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.communication != nil {
+		a.mode = "communication"
+		return
+	}
 	a.mode = normalizeMode(mode)
 	slog.Info("antigravity: mode changed", "mode", a.mode)
 }
@@ -318,6 +343,9 @@ func (a *Agent) GetMode() string {
 }
 
 func (a *Agent) PermissionModes() []core.PermissionModeInfo {
+	if a.communication != nil {
+		return []core.PermissionModeInfo{{Key: "communication", Name: "Communication", NameZh: "交流模式", Desc: "Host-restricted communication tools", DescZh: "仅使用宿主限定的交流工具"}}
+	}
 	return []core.PermissionModeInfo{
 		{Key: "default", Name: "Default", NameZh: "默认", Desc: "Ask for approval through cc-connect on each tool use", DescZh: "每次工具调用都通过 cc-connect 请求确认"},
 		{Key: "acceptEdits", Name: "Accept Edits", NameZh: "自动编辑", Desc: "Auto-approve workspace edits; ask for other tool calls", DescZh: "自动批准工作区编辑，其他工具调用仍请求确认"},
@@ -327,6 +355,9 @@ func (a *Agent) PermissionModes() []core.PermissionModeInfo {
 }
 
 func (a *Agent) CommandDirs() []string {
+	if a.communication != nil {
+		return nil
+	}
 	workDir := a.GetWorkDir()
 	absDir, err := filepath.Abs(workDir)
 	if err != nil {
@@ -340,6 +371,9 @@ func (a *Agent) CommandDirs() []string {
 }
 
 func (a *Agent) SkillDirs() []string {
+	if a.communication != nil {
+		return nil
+	}
 	workDir := a.GetWorkDir()
 	absDir, err := filepath.Abs(workDir)
 	if err != nil {
@@ -364,6 +398,9 @@ func (a *Agent) ProjectMemoryFile() string {
 }
 
 func (a *Agent) GlobalMemoryFile() string {
+	if a.communication != nil {
+		return ""
+	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return ""

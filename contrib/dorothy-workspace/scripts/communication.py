@@ -243,12 +243,19 @@ class Communication:
         scope = text_value(request['context']['operation_scope'], 512)
         if any(ord(char) < 32 for char in scope):
             raise ValueError('operation_scope_invalid')
+        params = request['params']
+        if isinstance(params, dict) and '_meta' in params:
+            # Native MCP adds progress and artifact metadata. It is transport
+            # information, never a source of identity, paths or operation scope.
+            if not isinstance(params['_meta'], dict):
+                raise ValueError('invalid_fields')
+            params = {key: value for key, value in params.items() if key != '_meta'}
         if request['method'] == 'tools/list':
-            fields(request['params'])
+            fields(params)
             return {'tools': self.tools()}
         if request['method'] != 'tools/call':
             raise ValueError('method_invalid')
-        params = fields(request['params'], ('name', 'arguments'))
+        params = fields(params, ('name', 'arguments'))
         name, arguments = params['name'], params['arguments']
         if not isinstance(name, str) or name not in {tool['name'] for tool in self.tools()}:
             raise ValueError('tool_unavailable')

@@ -1,7 +1,7 @@
 # Dorothy workspace deployment sources
 
-This directory versions the companion Python files changed by the Dorothy
-recovery repair together with the Antigravity adapter. These are exact source
+This directory versions the companion Python files for Dorothy communication
+mode and the retained review-gate integration, together with the Antigravity adapter. These are source
 copies for the existing `cc-dsh-collaboration` workspace integration, not a
 standalone review service or a default CC Connect installation.
 
@@ -13,10 +13,20 @@ private runtime configuration. Credentials, provider configuration, conversation
 data, task receipts, and native logs are deliberately absent from this source
 distribution.
 
-The adapter and review gate must be deployed together: the adapter now uses
-the gate's `bind`, `refresh`, and `finalize` operations. Back up the installed
-binary and scripts before switching a running service. Only the dedicated
-Dorothy service needs restarting.
+## Communication mode
+
+For ordinary conversation, web research, fixed-contact messaging, and optional
+Hermes consultation, configure `communication_mode = true` as described in
+[communication deployment](COMMUNICATION.md). This mode rejects `review_command`
+and does not require review before each reply. Use a dedicated work directory,
+CC Connect data directory, and native CLI runtime; do not import old tasks or
+global hooks into that runtime.
+
+Back up the installed binary, selected scripts and private configuration before
+switching the dedicated Dorothy service. Preserve the existing support modules
+and unrelated running jobs. Consultation sets `tool_policy='none'` only for that
+explicit request; ordinary Hermes tasks and global provider settings keep their
+existing capabilities.
 
 The callback-only repair in `ipc.py` works with the existing receiver. It does
 not require a service restart. New callback workers load the fixed client;
@@ -27,12 +37,19 @@ Validate from the existing integration's script directory (or an isolated copy
 with its existing support modules):
 
 ```sh
-python3 -B -m unittest test_bridge test_dorothy_review test_ipc test_peer_ipc
+python3 -B -m unittest test_bridge test_dorothy_review test_ipc test_peer_ipc test_communication
 ```
 
 These tests exercise protocol and recovery behavior with external boundaries
-mocked. A real Google model, Hermes review, author response and platform delivery
-still require a separate live check.
+mocked. Verify the real native CLI, search, web reading, message round trip,
+consultation callback, and process cleanup when deploying communication mode.
+
+## Retained legacy review gate
+
+The remaining review scripts and historical receipts support the explicitly
+configured `review_command` integration. They are not loaded by communication
+mode. That older adapter/gate pair uses `bind`, `refresh`, and `finalize` and
+must be deployed together when retaining that configuration.
 
 Review judgment and disposition are separate. A passing Hermes report may retain
 a noncritical `risk` or optional `preference` as confirmed or unresolved when Hermes explicitly assigns

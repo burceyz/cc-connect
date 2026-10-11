@@ -245,6 +245,10 @@ func main() {
 		runAntigravityInvocationHook(phase)
 		return
 	}
+	if len(os.Args) == 2 && os.Args[1] == "_agy-communication-tool" {
+		runAntigravityCommunicationTool()
+		return
+	}
 
 	checkUpdateAsync()
 	// When started as a daemon (CC_LOG_FILE set), redirect logs to a rotating file.

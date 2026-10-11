@@ -1,5 +1,49 @@
 # Dorothy communication backend
 
+## Native CLI integration
+
+On macOS, enable the Antigravity adapter's `communication_mode` with an absolute
+`work_dir`, a dedicated `communication_runtime_dir`, and a fixed
+`communication_command` argument array. `communication_auth_file` can point to
+the host's existing authentication file. A minimal agent options block is:
+
+```toml
+[projects.agent.options]
+cmd = "/Users/example/.local/bin/agy"
+work_dir = "/Users/example/workspace/workdir/dorothy"
+model = "gemini-3.8-flash-high"
+effort = "high"
+communication_mode = true
+communication_runtime_dir = "/Users/example/workspace/.local/dorothy-native"
+communication_auth_file = "/Users/example/.gemini/jetski-standalone-oauth-token"
+communication_command = ["/absolute/python3", "-B", "/absolute/communication.py", "--policy", "/absolute/private/policy.json"]
+```
+
+Use a separate CC Connect `data_dir` for the new mode. Existing global/native
+conversations and old review jobs are not imported. The mode rejects
+`review_command` and extra CLI arguments, fixes its directory and permission
+mode, and does not load parent/global skills or memory. Local rule aliases must
+point to the same local `AGENTS.md`.
+
+The adapter creates a host-managed hooks/MCP overlay and exposes only the
+`cc_communication` server. CLI 1.3.3 uses `call_mcp_tool` with a server and tool
+name; both are checked. Its lazy schema reads are limited to the eight known
+tool JSON files in the dedicated native cache, including canonical-path and
+symlink checks. `search_web`, `read_url_content`, and `view_content_chunk` remain
+available; web reads reject file URLs, embedded credentials, and literal local
+or private control endpoints.
+
+The initial OAuth file is copied only when absent to
+`<communication_runtime_dir>/antigravity-cli/antigravity-oauth-token`. Native
+refreshes stay in that dedicated copy. Native project state is also stored in
+the dedicated runtime. The CLI normalizes and writes its private `settings.json`
+on load, so that file is writable; host hooks/MCP configuration, binaries and
+workspace rules remain protected. Changing native settings or selecting
+"allow all" cannot override the host dispatcher or the Seatbelt process policy.
+See [process boundary](../../agent/antigravity/communication_sandbox_README.md).
+The CLI's own RPC listeners were observed on loopback; the macOS inbound rule
+does not itself prove wildcard binding is impossible.
+
 The trusted host starts one fixed command per request, outside the model's
 workspace sandbox:
 
@@ -105,6 +149,9 @@ fixed code and exit 0; raw exceptions and private paths are not returned.
 Complete stdout is capped at 512 KiB, including both JSON layers and escaping.
 Larger results return `result_too_large` without a partial or truncated body.
 Process-launch errors and transport failures remain host responsibilities.
+The optional MCP `_meta` object is accepted and ignored. In particular, native
+conversation/artifact metadata cannot select a sender, path, or operation scope;
+those continue to come from the host context and verified binding.
 
 The fixed tool names are:
 

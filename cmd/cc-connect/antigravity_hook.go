@@ -38,3 +38,14 @@ func runAntigravityInvocationHook(phase string) {
 		_ = json.NewEncoder(os.Stdout).Encode(antigravityhook.InvocationOutput{})
 	}
 }
+
+func runAntigravityCommunicationTool() {
+	err := antigravityhook.ServeCommunication(os.Stdin, os.Stdout,
+		os.Getenv(antigravityhook.EnvCommunicationAddress),
+		os.Getenv(antigravityhook.EnvCommunicationToken),
+		os.Getenv(antigravityhook.EnvCommunicationGeneration))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cc-connect communication tool stopped")
+		os.Exit(1)
+	}
+}

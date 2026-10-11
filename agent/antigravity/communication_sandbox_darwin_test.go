@@ -86,9 +86,9 @@ func TestCommunicationSandboxProcessBoundary(t *testing.T) {
 	}
 	defer unlisted.Close()
 	opts.LoopbackAddresses = []string{bridge.Addr().String()}
-	bridgeDone := make(chan error, 2)
+	bridgeDone := make(chan error, 4)
 	go func() {
-		for range 2 {
+		for range 4 {
 			conn, err := bridge.Accept()
 			if err == nil {
 				_, err = conn.Write([]byte("bridge-ok"))
@@ -101,10 +101,11 @@ func TestCommunicationSandboxProcessBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, https := range []bool{false, true} {
-		t.Run(fmt.Sprintf("https_%v", https), func(t *testing.T) {
+	for _, mode := range []struct{ https, nativeRPC bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("https_%v_native_rpc_%v", mode.https, mode.nativeRPC), func(t *testing.T) {
 			candidate := opts
-			candidate.AllowHTTPS = https
+			candidate.AllowHTTPS = mode.https
+			candidate.AllowNativeRPC = mode.nativeRPC
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			cmd, err := CommunicationSandboxCommand(ctx, candidate, executable, "-test.run=^TestCommunicationSandboxProcessBoundary$")
@@ -115,6 +116,7 @@ func TestCommunicationSandboxProcessBoundary(t *testing.T) {
 				"CC_AGY_SANDBOX_RUNTIME="+opts.RuntimeDir, "CC_AGY_SANDBOX_OUTSIDE="+outside,
 				"CC_AGY_SANDBOX_UNIX="+unixPath, "CC_AGY_SANDBOX_BRIDGE="+bridge.Addr().String(),
 				"CC_AGY_SANDBOX_LOCAL_UNIX="+localUnixPath,
+				fmt.Sprintf("CC_AGY_SANDBOX_NATIVE_RPC=%v", mode.nativeRPC),
 				"CC_AGY_SANDBOX_UNLISTED="+unlisted.Addr().String(), "TMPDIR="+opts.RuntimeDir)
 			output, err := cmd.CombinedOutput()
 			if err != nil {
@@ -183,6 +185,24 @@ func communicationSandboxHelper() {
 	results["settings_symlink_write_denied"] = os.WriteFile(filepath.Join(state, "settings.json"), []byte("wrong"), 0o600) != nil
 	results["work_write_allowed"] = os.WriteFile(filepath.Join(work, "own.txt"), []byte("own\n"), 0o600) == nil
 	results["runtime_write_allowed"] = os.WriteFile(filepath.Join(state, "cache.txt"), []byte("cache"), 0o600) == nil
+	listener, listenErr := net.Listen("tcp", "127.0.0.1:0")
+	nativeRPC := os.Getenv("CC_AGY_SANDBOX_NATIVE_RPC") == "true"
+	results["native_listener_requires_explicit_grant"] = (listenErr == nil) == nativeRPC
+	if listener != nil {
+		conn, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+		results["listener_does_not_grant_outbound"] = err != nil
+		if conn != nil {
+			conn.Close()
+		}
+		listener.Close()
+	}
+	listener, listenErr = net.Listen("tcp", "0.0.0.0:0")
+	if !nativeRPC {
+		results["public_listener_denied_by_default"] = listenErr != nil
+	}
+	if listener != nil {
+		listener.Close()
+	}
 	for _, entry := range []struct{ name, network, address string }{
 		{"raw_unix_denied", "unix", os.Getenv("CC_AGY_SANDBOX_UNIX")},
 		{"unix_inside_work_denied", "unix", os.Getenv("CC_AGY_SANDBOX_LOCAL_UNIX")},

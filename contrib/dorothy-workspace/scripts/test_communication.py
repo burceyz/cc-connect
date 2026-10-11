@@ -138,6 +138,30 @@ class CommunicationTests(unittest.TestCase):
         self.jobs.submit.assert_not_called()
         peer_ipc.launch_watch.assert_not_called()
 
+    def test_native_mcp_metadata_does_not_select_identity_or_paths(self):
+        metadata = {'progressToken': 1,
+                    'antigravity.google/conversation_id': 'untrusted-native-id',
+                    'antigravity.google/artifacts_dir': '/untrusted/path',
+                    'operation_scope': 'untrusted-scope'}
+        request = self.request('list_contacts')
+        request['params']['_meta'] = metadata
+        result = communication.execute(request, self.backend)
+        self.assertFalse(result['isError'], result)
+        ipc.capture.assert_not_called()
+        request = self.request('send_message', {'contact': 'atlas', 'text': 'native metadata test'})
+        request['params']['_meta'] = metadata
+        result = communication.execute(request, self.backend)
+        self.assertFalse(result['isError'], result)
+        self.assertEqual(len(self.event_posts), 1)
+        self.assertEqual(self.event_posts[0]['target'], self.atlas['target'])
+        self.assertEqual(self.current, self.source)
+        request['params']['context'] = {'operation_scope': 'forged'}
+        self.assertTrue(communication.execute(request, self.backend)['isError'])
+        request['params'].pop('context')
+        request['params']['_meta'] = 'invalid metadata'
+        self.assertTrue(communication.execute(request, self.backend)['isError'])
+        self.assertEqual(len(self.event_posts), 1)
+
     def test_contacts_show_two_verified_atlas_labels_and_only_actual_busy(self):
         self.policy.update(allowed_contacts={'atlas-current': 'atlas', 'atlas-review': 'other'},
                            contact_labels={'atlas-current': 'Dorothy接入迁移', 'atlas-review': '回调修复复核'})
