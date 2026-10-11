@@ -743,5 +743,106 @@ class UnixTransportTests(unittest.TestCase):
                 ipc.call(path, 'GET', '/ipc/health')
 
 
+class CanonicalWorkspaceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp.name).resolve()
+        self.child = self.workspace / 'dorothy'
+        self.child.mkdir()
+        self.workspace_patch = patch.object(bridge, 'WORKSPACE', self.workspace)
+        self.workspace_patch.start()
+
+    def tearDown(self):
+        self.workspace_patch.stop()
+        self.temp.cleanup()
+
+    def test_root_and_existing_child_bindings_remain_compatible(self):
+        for cwd in (self.workspace, self.child):
+            value = binding()
+            value['target']['cwd'] = str(cwd)
+            self.assertEqual(ipc.validate_binding(value), value)
+        self.assertEqual(bridge.WORKSPACE, self.workspace)
+
+    def test_capture_uses_host_cwd_and_pins_the_returned_origin(self):
+        value = binding()
+        value['target']['cwd'] = str(self.child)
+        reply = {'protocol': ipc.PROTOCOL, 'target': value['target'], 'supports_live_input': True}
+        environment = {'CC_IPC_ORIGIN': 'cc-origin-v1-' + 'a' * 64,
+                       'CC_PROJECT': 'test', 'CC_SESSION_KEY': 'test:owner', 'CC_IPC_CWD': str(self.child)}
+        with patch.dict(os.environ, environment, clear=True), patch.object(ipc, 'call', return_value=reply) as call:
+            self.assertEqual(ipc.capture(), value | {'socket': str(ipc.socket_path())})
+            self.assertEqual(call.call_args.args[3]['cwd'], str(self.child))
+            self.assertEqual(bridge.WORKSPACE, self.workspace)
+        environment.pop('CC_IPC_CWD')
+        reply['target']['cwd'] = str(self.workspace)
+        with patch.dict(os.environ, environment, clear=True), patch.object(ipc, 'call', return_value=reply) as call:
+            self.assertEqual(ipc.capture()['target']['cwd'], str(self.workspace))
+            self.assertEqual(call.call_args.args[3]['cwd'], str(self.workspace))
+
+    def test_legacy_capture_also_uses_the_fixed_host_cwd(self):
+        value = binding()
+        value['target']['cwd'] = str(self.child)
+        environment = {'CC_PROJECT': 'test', 'CC_SESSION_KEY': 'test:owner',
+                       'CODEX_THREAD_ID': 'thread-1', 'CC_IPC_CWD': str(self.child)}
+        reply = {'protocol': ipc.PROTOCOL, 'target': value['target'], 'supports_live_input': True}
+        with patch.dict(os.environ, environment, clear=True), patch.object(ipc, 'call', return_value=reply) as call:
+            self.assertEqual(ipc.capture()['target']['cwd'], str(self.child))
+            self.assertEqual(call.call_args.args[3]['cwd'], str(self.child))
+
+    def test_noncanonical_missing_and_external_workspaces_are_rejected(self):
+        with tempfile.TemporaryDirectory() as outside:
+            external = Path(outside).resolve()
+            link = self.workspace / 'escape'
+            link.symlink_to(external, target_is_directory=True)
+            invalid = ('relative', str(self.child) + '/..', str(self.child) + '/',
+                       str(self.workspace / 'missing'), str(external), str(link),
+                       str(self.workspace) + '/../' + external.name)
+            for cwd in invalid:
+                with self.subTest(cwd=cwd):
+                    value = binding()
+                    value['target']['cwd'] = cwd
+                    with self.assertRaisesRegex(ValueError, 'workspace_mismatch'):
+                        ipc.validate_binding(value)
+                    environment = {'CC_IPC_ORIGIN': 'cc-origin-v1-' + 'b' * 64,
+                                   'CC_PROJECT': 'test', 'CC_SESSION_KEY': 'test:owner', 'CC_IPC_CWD': cwd}
+                    with patch.dict(os.environ, environment, clear=True), patch.object(ipc, 'call') as call:
+                        with self.assertRaisesRegex(ValueError, 'workspace_mismatch'):
+                            ipc.capture()
+                        call.assert_not_called()
+
+    def test_wrong_returned_cwd_cannot_replace_the_current_origin(self):
+        environment = {'CC_IPC_ORIGIN': 'cc-origin-v1-' + 'c' * 64,
+                       'CC_PROJECT': 'test', 'CC_SESSION_KEY': 'test:owner', 'CC_IPC_CWD': str(self.child)}
+        reply = {'protocol': ipc.PROTOCOL, 'target': binding()['target'], 'supports_live_input': True}
+        with patch.dict(os.environ, environment, clear=True), patch.object(ipc, 'call', return_value=reply):
+            with self.assertRaisesRegex(ValueError, 'origin_mismatch'):
+                ipc.capture()
+
+    def test_worker_and_watcher_fresh_imports_accept_the_same_child_binding(self):
+        # Import both child-process entry points without executing a worker, watcher or model.
+        value = binding()
+        value['target']['cwd'] = str(self.child)
+        program = (
+            'import json, sys\nfrom pathlib import Path\n'
+            'payload = json.load(sys.stdin)\nimport bridge\n'
+            'bridge.WORKSPACE = Path(payload["workspace"])\n'
+            'import ipc, jobs\nvalue = payload["binding"]\n'
+            'assert jobs.ipc is ipc\n'
+            'jobs.ipc.validate_record({"delivery": "conversation", "callback": ipc.PROTOCOL, "callback_target": value}, '
+            '{"delivery": "conversation", "callback_target": value})\n'
+            'assert ipc.validate_binding(value) == value\n'
+            'assert ipc.source_cwd() == value["target"]["cwd"]\n'
+            'print(json.dumps({"worker": True, "watcher": True}))\n')
+        environment = os.environ.copy()
+        environment.update(CC_IPC_CWD=str(self.child),
+                           PYTHONPATH=os.pathsep.join((str(Path(ipc.__file__).resolve().parent),
+                                                      str(Path(jobs.__file__).resolve().parent))))
+        result = subprocess.run([sys.executable, '-B', '-c', program], cwd=self.workspace,
+                                input=json.dumps({'workspace': str(self.workspace), 'binding': value}),
+                                text=True, capture_output=True, env=environment, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {'worker': True, 'watcher': True})
+
+
 if __name__ == '__main__':
     unittest.main()

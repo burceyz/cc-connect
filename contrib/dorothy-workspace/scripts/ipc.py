@@ -110,6 +110,22 @@ def call(path, method, route, body=None, *, identity_lookup=False):
         transport.close()
 
 
+def workspace_cwd(value):
+    """A fixed IPC identity may name the workspace or an existing canonical child."""
+    if not isinstance(value, str) or not value or any(ord(char) < 32 for char in value):
+        raise ValueError('ipc_target_workspace_mismatch')
+    path = Path(value)
+    if (not path.is_absolute() or str(path) != value or path.resolve() != path or
+            not path.is_dir() or not path.is_relative_to(bridge.WORKSPACE.resolve())):
+        raise ValueError('ipc_target_workspace_mismatch')
+    return str(path)
+
+
+def source_cwd():
+    # The invoking host owns this environment; it is never a model argument.
+    return workspace_cwd(os.environ.get('CC_IPC_CWD', str(bridge.WORKSPACE.resolve())))
+
+
 def validate_binding(binding):
     if not isinstance(binding, dict) or set(binding) != {'protocol', 'socket', 'target'}:
         raise ValueError('ipc_binding_invalid')
@@ -122,8 +138,7 @@ def validate_binding(binding):
     if any(not isinstance(v, str) or not v or len(v) > 2048 or any(ord(c) < 32 for c in v)
            for v in target.values()):
         raise ValueError('ipc_target_invalid')
-    if target['cwd'] != str(bridge.WORKSPACE.resolve()):
-        raise ValueError('ipc_target_workspace_mismatch')
+    workspace_cwd(target['cwd'])
     return binding
 
 
@@ -134,7 +149,7 @@ def capture():
     target = {'project': os.environ.get('CC_PROJECT', ''),
               'session_key': os.environ.get('CC_SESSION_KEY', ''), 'session_id': '',
               'agent_session_id': os.environ.get('CODEX_THREAD_ID', ''),
-              'cwd': str(bridge.WORKSPACE.resolve())}
+              'cwd': source_cwd()}
     if not all(target[k] for k in ['project', 'session_key', 'agent_session_id']):
         raise ValueError('ipc_origin_environment_missing')
     path = socket_path()
@@ -158,7 +173,7 @@ def capture_origin(origin):
         raise ValueError('ipc_origin_invalid')
     requested = {'origin_id': origin, 'project': os.environ.get('CC_PROJECT', ''),
                  'session_key': os.environ.get('CC_SESSION_KEY', ''),
-                 'cwd': str(bridge.WORKSPACE.resolve())}
+                 'cwd': source_cwd()}
     if not requested['project'] or not requested['session_key']:
         raise ValueError('ipc_origin_environment_missing')
     path = socket_path()
