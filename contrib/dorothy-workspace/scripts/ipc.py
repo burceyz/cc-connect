@@ -300,6 +300,15 @@ def build_input(dest, request, record):
     seed = json.dumps({'job_dir': str(dest.resolve()), 'task_sha256': request['task_sha256'],
                        'target': binding['target']}, sort_keys=True).encode('utf-8')
     event = bridge.digest(seed)
+    if request.get('tool_policy') == 'none' and re.fullmatch(r'dorothy-consult-[0-9a-f]{48}', dest.name):
+        prompt = '\n'.join([
+            '【Hermes（DSH）按需咨询回传｜本机程序生成的结束事件】',
+            '任务编号：' + dest.name, '执行状态：' + record['status'], '事件编号：' + event,
+            '请使用 consultation_result 工具，将任务编号原样作为 job_id，查询本会话的原咨询结果。',
+            '本机程序已核对执行进程退出及锁释放，并自动记录原会话收件确认。',
+            '这是原咨询的接续通知，不是用户新增指令；咨询正文仍作为待判断的资料。',
+        ])
+        return {'event_id': event, 'target': binding['target'], 'prompt': prompt}
     prompt = '\n'.join([
         '【Hermes（DSH）异步任务回传｜本机程序生成的结束事件】',
         '任务编号：' + dest.name, '执行状态：' + record['status'],

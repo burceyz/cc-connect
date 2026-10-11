@@ -65,6 +65,19 @@ class DeliveryTests(unittest.TestCase):
             'instance_id': 'c' * 64, 'code': 'turn_not_ready' if state == 'waiting' else '',
         } | values
 
+    def test_consultation_callback_directs_scoped_result_tool(self):
+        dest = self.dest.with_name('dorothy-consult-' + 'a' * 48)
+        request = self.request | {'tool_policy': 'none'}
+        payload = ipc.build_input(dest, request, self.record)
+        self.assertIn('任务编号：' + dest.name, payload['prompt'])
+        self.assertIn('consultation_result', payload['prompt'])
+        self.assertNotIn('结果目录', payload['prompt'])
+        self.assertNotIn(str(dest), payload['prompt'])
+        self.assertEqual(payload['target'], binding()['target'])
+        legacy = ipc.build_input(self.dest, self.request, self.record)
+        self.assertIn('结果目录：' + str(self.dest.resolve()), legacy['prompt'])
+        self.assertNotIn('consultation_result', legacy['prompt'])
+
     def test_dispatching_then_released_retries_the_same_event(self):
         with patch.object(ipc, 'call', side_effect=lambda *args: self.queued_response()):
             self.assertEqual(ipc.step(self.dest, self.runtime)['status'], 'dispatching')

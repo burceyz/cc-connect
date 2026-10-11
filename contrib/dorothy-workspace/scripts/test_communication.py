@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 import bridge
 import communication as communication
 import ipc
+import jobs
 import peer_ipc
 
 
@@ -110,10 +111,10 @@ class CommunicationTests(unittest.TestCase):
         self.assertEqual(result['isError'], error, result)
         return json.loads(result['content'][0]['text'])
 
-    def incoming(self, sender='atlas'):
+    def incoming(self, sender='atlas', text='请核对这段资料。'):
         self.current = self.atlas if sender == 'atlas' else self.other
         path = self.root / 'incoming.txt'
-        communication.immutable(path, '请核对这段资料。'.encode())
+        communication.immutable(path, text.encode())
         result = peer_ipc.send(sender, 'dorothy', 'incoming-' + sender, path, self.runtime)
         self.current = self.source
         return result['event_id']
@@ -133,6 +134,20 @@ class CommunicationTests(unittest.TestCase):
         ipc.capture.assert_not_called()
         self.jobs.submit.assert_not_called()
         peer_ipc.launch_watch.assert_not_called()
+
+    def test_empty_allowlists_do_not_publish_invalid_empty_enums(self):
+        self.policy.update(allowed_contacts={}, enable_consultation=True, materials={})
+        published = {item['name']: item for item in self.backend.tools()}
+        contact = published['send_message']['inputSchema']['properties']['contact']
+        material = published['consult_hermes']['inputSchema']['properties']['material_ids']['items']
+        self.assertEqual(contact, {'type': 'string'})
+        self.assertEqual(material, {'type': 'string'})
+        self.assertEqual(self.call('list_contacts'), {'contacts': []})
+        self.assertEqual(self.call('send_message', {'contact': 'atlas', 'text': '正文'}, error=True)['code'],
+                         'contact_not_allowed')
+        self.assertEqual(self.call('consult_hermes', {'question': '问题', 'material_ids': ['unknown']}, error=True)['code'],
+                         'material_id_invalid')
+        self.assertEqual(self.call('consult_hermes', {'question': '问题'})['status'], 'accepted')
 
     def test_send_preserves_text_and_uses_current_source_without_paths_in_result(self):
         body = '第一行。\n第二行。\n'
@@ -258,6 +273,14 @@ class CommunicationTests(unittest.TestCase):
         (directory / 'body.md').write_text('changed')
         self.assertEqual(self.call('read_message', {'event_id': event}, error=True)['code'], 'peer_body_modified')
 
+    def test_large_escaped_message_has_explicit_bounded_error(self):
+        event = self.incoming(text='"\\\t' * 140000)
+        result = communication.execute(self.request('read_message', {'event_id': event}), self.backend)
+        self.assertTrue(result['isError'])
+        self.assertEqual(json.loads(result['content'][0]['text']), {'status': 'error', 'code': 'result_too_large'})
+        self.assertLessEqual(len((json.dumps(result, ensure_ascii=False) + '\n').encode()), communication.MAX_OUTPUT)
+        self.assertEqual(self.call('message_status', {'event_id': event})['event_id'], event)
+
     def test_source_policy_mismatch_and_transport_errors_do_not_leak_details(self):
         self.current = self.atlas
         self.assertEqual(self.call('send_message', {'contact': 'atlas', 'text': '正文'}, error=True)['code'], 'source_workspace_mismatch')
@@ -343,6 +366,82 @@ class CommunicationTests(unittest.TestCase):
         self.jobs.result.assert_not_called()
         self.job_records[job]['cleanup']['worker_process'] = 'absent'
         self.assertEqual(self.call('consultation_result', {'job_id': job})['text'], '只读咨询结论。')
+
+    def test_large_consultation_answer_has_explicit_bounded_error(self):
+        self.policy['enable_consultation'] = True
+        job = self.call('consult_hermes', {'question': '问题'})['job_id']
+        self.completed(job)
+        self.jobs.result.return_value = {'response': '"\\\t' * 140000}
+        self.assertEqual(self.call('consultation_result', {'job_id': job}, error=True)['code'], 'result_too_large')
+
+    def real_completed_job(self):
+        """Native job/receipt/run shape; no worker, transport or model is started."""
+        self.policy['enable_consultation'] = True
+        job_id = self.call('consult_hermes', {'question': '问题'})['job_id']
+        directory = self.dsh / 'jobs' / job_id
+        request = json.loads((directory / 'request.json').read_text())
+        policy = {'tool_policy': 'none', 'tool_policy_version': 1,
+                  'model_config_sha256': communication.digest(b'fixture model'),
+                  'tool_policy_plugin_sha256': communication.digest(b'fixture plugin'),
+                  'tool_policy_overlay_sha256': communication.digest(b'fixture overlay')}
+        policy['config_sha256'] = communication.digest(communication.encoded(policy))
+        request.update(policy, instance_id='fixture-instance')
+        instance = self.dsh / 'instances' / request['instance_id']
+        (instance / 'home').mkdir(mode=0o700, parents=True)
+        (instance / 'work').mkdir(mode=0o700)
+        communication.immutable(instance / 'bridge.lock', b'')
+        communication.immutable(directory / 'worker.lock', b'')
+        run_dir = self.dsh / 'runs' / 'fixture-run'
+        run_dir.mkdir(mode=0o700, parents=True)
+        response = '实际 jobs.result 校验过的咨询结论。'.encode()
+        communication.immutable(run_dir / 'response.md', response)
+        task = self.work / 'consultations' / job_id / 'task.md'
+        communication.immutable(run_dir / 'task.md', task.read_bytes())
+        run = {**policy, 'status': 'completed', 'instance_id': request['instance_id'],
+               'cwd': request['cwd'], 'profile': request['profile'], 'reasoning_effort': request['reasoning_effort'],
+               'task_sha256': request['task_sha256'], 'response_sha256': communication.digest(response),
+               'session_id': 'fixture-native-session', 'child_pid': 2147483646, 'returncode': 0}
+        run['tool_policy_attestation'] = {
+            'policy': 'none', 'version': 1, 'schema_count': 0, 'presentation': 'native', 'guard': 'deny_all',
+            'plugin_sha256': policy['tool_policy_plugin_sha256'], 'overlay_sha256': policy['tool_policy_overlay_sha256'],
+            'config_sha256': policy['config_sha256'], 'session_id': run['session_id']}
+        record = {**request, 'job_id': job_id, 'status': 'completed', 'callback': ipc.PROTOCOL,
+                  'run_dir': str(run_dir), 'worker_pid': 2147483647}
+        ipc.write_state(run_dir / 'result.json', run)
+        ipc.write_state(directory / 'request.json', request)
+        ipc.write_state(directory / 'receipt.json', record)
+        self.backend.jobs = jobs
+        return job_id, directory, request, record, run_dir, run
+
+    @unittest.skipUnless(callable(getattr(bridge, 'tool_policy_record', None)), 'requires companion zero-tool integration')
+    def test_consultation_callback_id_reads_real_verified_job_result(self):
+        job_id, directory, request, record, _, _ = self.real_completed_job()
+        callback = ipc.build_input(directory, request, record)
+        self.assertEqual(callback['target'], self.source['target'])
+        self.assertIn('consultation_result', callback['prompt'])
+        self.assertNotIn(str(self.root), callback['prompt'])
+        callback_job = next(line.split('：', 1)[1] for line in callback['prompt'].splitlines()
+                            if line.startswith('任务编号：'))
+        self.assertEqual(callback_job, job_id)
+        with patch.object(jobs, 'pid_probe', return_value='absent'):
+            result = self.call('consultation_result', {'job_id': callback_job})
+        self.assertEqual(result, {'job_id': job_id, 'status': 'completed',
+                                 'text': '实际 jobs.result 校验过的咨询结论。', 'processes_released': True})
+        self.jobs.result.assert_not_called()
+
+    @unittest.skipUnless(callable(getattr(bridge, 'tool_policy_record', None)), 'requires companion zero-tool integration')
+    def test_real_result_rejects_unproven_policy_and_modified_answer(self):
+        job_id, _, _, _, run_dir, run = self.real_completed_job()
+        run['tool_policy_attestation']['schema_count'] = 1
+        ipc.write_state(run_dir / 'result.json', run)
+        with patch.object(jobs, 'pid_probe', return_value='absent'):
+            self.assertEqual(self.call('consultation_result', {'job_id': job_id}, error=True)['code'],
+                             'tool_policy_unverified')
+            run['tool_policy_attestation']['schema_count'] = 0
+            ipc.write_state(run_dir / 'result.json', run)
+            (run_dir / 'response.md').write_text('modified answer')
+            self.assertEqual(self.call('consultation_result', {'job_id': job_id}, error=True)['code'],
+                             'artifact_modified')
 
 
 class PolicyTests(unittest.TestCase):

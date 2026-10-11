@@ -16,6 +16,8 @@ Install `communication.py` and the companion `ipc.py` in the existing integratio
 scripts directory. The installation also needs the consultation implementation
 of `jobs.submit(..., tool_policy='none')` when consultation is enabled. That
 implementation, rather than a prompt alone, enforces the zero-tool policy.
+Enabling consultation requires the policy-verification helpers and the
+`tool_policy` submission parameter; an older integration fails closed.
 
 ## Host policy
 
@@ -81,6 +83,8 @@ Stdin contains exactly one JSON object:
 MCP result object with `content: [{"type":"text","text":"<JSON result>"}]`
 and `isError: false` or `true`. Validation failures use an error result with a
 fixed code and exit 0; raw exceptions and private paths are not returned.
+Complete stdout is capped at 512 KiB, including both JSON layers and escaping.
+Larger results return `result_too_large` without a partial or truncated body.
 Process-launch errors and transport failures remain host responsibilities.
 
 The fixed tool names are:
@@ -114,6 +118,9 @@ Unknown submissions are queried under the original job ID and never resubmitted.
 Results verify ownership, accepted request, policy, original task and process
 release before reporting completion. These tools do not alter historical
 Dorothy publication-gate receipts.
+Consultation completion callbacks carry the original job ID and direct Dorothy
+to `consultation_result`; they do not require general file access or inject the
+consultation answer into the conversation.
 
 Run deterministic validation in an isolated integration containing its existing
 support modules:
