@@ -533,6 +533,7 @@ class Gate:
         revision = read_json(revision_dir / 'revision.json')
         if note is None:
             note = ('hermes_launch_failed' if (revision_dir / 'failed-review.json').exists() else
+                    'hermes_report_invalid_json' if (revision_dir / 'invalid-review.json').exists() else
                     '已冻结实际答复；仍须完整核验并由你实际阅读回应' if (revision_dir / 'hermes-response.txt').exists()
                     else 'hermes_review_pending')
         response = {'schema': RESPONSE_SCHEMA, 'task_id': task['task_id'],
@@ -549,6 +550,9 @@ class Gate:
             'Hermes 原始答复：' + str(revision_dir / 'hermes-response.txt'),
             '审查状态：' + (note or '已取得；仍需你实际阅读并回应'),
             '若审查状态为 hermes_launch_failed，上一作业已确认未启动模型且进程已释放；在 manifest 添加 retry_review={"job_id":"' + revision['job_id'] + '","reason":"已核实的恢复依据"} 后形成新修订重审。不得重投不明作业。',
+            '若审查状态为 hermes_report_invalid_json，实际 Hermes 答复已保留，但 JSON 内部格式错误；不得修改、猜测提取或放行旧报告，也不得为它写通过回应。',
+            '格式错误时，保持原任务、候选和验收条件，在 manifest 添加 retry_review={"job_id":"' + revision['job_id'] + '","reason":"实际阅读无效报告后的恢复依据"}，然后输出原候选供新的真实独立复核；旧原件及未关闭发现会随新修订保留。',
+            '连续三次真实报告格式失败后停止重审，状态 review_format_attempts_exhausted；保留未完成状态，不改编号或缩减验收条件继续重试。',
             '实际读完审查后写 ' + str(dest / 'response.json') + '：' + json.dumps(response, ensure_ascii=False),
             'responses 对每条 finding 和 followup 各含 finding_id、resolution（verified/not_applicable/disputed/pending）、assessment、evidence（非空字符串数组）。无发现可用空数组。',
             '有修改就更新 manifest 中的源哈希和测试证据，提交新候选供重新审查。关键异议须补证据并复核，不能只写同意。',
@@ -777,6 +781,7 @@ class Gate:
             '缺材料、缺子 Agent 实际返回、关键未决或不能验证修复时用 unresolved/changes_required，不要输出 pass。',
             '最终回答只能是一个 JSON 对象：首个与末个非空白字符必须分别是 { 和 }，不加 Markdown 围栏、前导语或结语。',
             '不要在最终 JSON 前后写“已经完成审查”“两个审查者已返回”“下面输出 JSON”等进度或说明文字。',
+            'JSON 字符串中的双引号、反斜杠和换行必须正确转义；可用中文引号描述引文，不能把未转义的代码引号直接嵌入字符串。',
             '格式如下（reviewers 实际至少两条且标识及视角不同）：',
             json.dumps(sample, ensure_ascii=False, indent=2),
             'reviewers[].findings 必须是字符串摘要数组，例如 ["F1：具体发现摘要"] 或 []；不得在该数组中放 JSON 对象。',
@@ -909,7 +914,22 @@ class Gate:
         atomic_json(revision_dir / 'revision.json', revision)
         native = verify_native(run, read_bytes(run_dir / 'task.md').decode('utf-8'), raw.decode('utf-8'),
                                self.runtime, revision_dir / 'materials', revision['revision'])
-        report = self.parse_review(raw, task, revision)
+        try:
+            report = self.parse_review(raw, task, revision)
+        except ValueError as exc:
+            if str(exc) != 'hermes_report_invalid_json':
+                raise
+            # This is a known, finished, authentic review, not an ambiguous
+            # submission. Preserve it verbatim and require the author to request
+            # a new independent review; never repair or extract a verdict here.
+            immutable(revision_dir / 'invalid-review.json', json_bytes({
+                'schema': 'dorothy-invalid-review-v1', 'code': 'hermes_report_invalid_json',
+                'job_id': revision['job_id'], 'response_sha256': sha(raw),
+                'run_dir': str(run_dir), 'processes_released': True, 'native': native,
+            }))
+            if self.consecutive_failures(task, revision_dir.parent.parent, 'invalid-review.json') >= 3:
+                return None, 'review_format_attempts_exhausted'
+            return None, 'hermes_report_invalid_json'
         aliases = {alias: item['call_id'] for item in native['subreviews']
                    for alias in (item['call_id'], item['child_session_id'], item['description'])}
         linked = [aliases.get(reviewer['agent_id']) for reviewer in report['reviewers']]
@@ -951,8 +971,20 @@ class Gate:
         }))
         return True
 
+    @staticmethod
+    def consecutive_failures(task, dest, filename):
+        count = 0
+        for previous in reversed(task['revisions']):
+            if not (dest / 'revisions' / previous / filename).exists():
+                break
+            count += 1
+        return count
+
     def parse_review(self, raw, task, revision):
-        report = json.loads(raw)
+        try:
+            report = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError('hermes_report_invalid_json') from None
         if not isinstance(report, dict) or report.get('schema') != REVIEW_SCHEMA:
             raise ValueError('hermes_report_schema_mismatch')
         for key in ('task_id', 'revision', 'candidate_sha256', 'manifest_sha256'):
@@ -1096,28 +1128,25 @@ class Gate:
             revision_dir = dest / 'revisions' / task['active_revision']
             revision = read_json(revision_dir / 'revision.json')
         if not revision or (revision['candidate_sha256'], revision['manifest_sha256']) != (sha(candidate), sha(raw_manifest)):
-            if (revision and revision['submit_state'] != 'not_started' and
-                    not (revision_dir / 'hermes-response.txt').exists()):
+            if revision and revision['submit_state'] != 'not_started':
                 # A new candidate cannot discard a submitted review whose findings
-                # have not been collected yet. Preserve invalid real replies too.
+                # have not been collected yet, or silently skip a malformed report.
                 try:
                     _, reason = self.collect_review(task, revision_dir, revision)
                 except Exception:
                     if not (revision_dir / 'hermes-response.txt').exists():
                         raise
                 else:
-                    if reason == 'hermes_launch_failed':
+                    if reason == 'review_format_attempts_exhausted':
+                        return self.outcome('blocked', reason, instructions=self.instructions(dest, task, note=reason))
+                    if reason in ('hermes_launch_failed', 'hermes_report_invalid_json'):
                         retry = manifest.get('retry_review')
                         if (not isinstance(retry, dict) or retry.get('job_id') != revision['job_id'] or
                                 not isinstance(retry.get('reason'), str) or not retry['reason'].strip()):
                             return self.outcome('pending_review', reason,
                                                 instructions=self.instructions(dest, task))
-                        consecutive = 0
-                        for previous in reversed(task['revisions']):
-                            if not (dest / 'revisions' / previous / 'failed-review.json').exists():
-                                break
-                            consecutive += 1
-                        if consecutive >= 3:
+                        if (reason == 'hermes_launch_failed' and
+                                self.consecutive_failures(task, dest, 'failed-review.json') >= 3):
                             return self.outcome('blocked', 'review_launch_attempts_exhausted')
                     elif reason:
                         return self.outcome('pending_review', 'previous_' + reason,
@@ -1131,7 +1160,8 @@ class Gate:
                                 instructions='等待 Hermes 回传；任务及固定候选已保留，不能报告完成。')
         report, reason = self.collect_review(task, revision_dir, revision)
         if not report:
-            return self.outcome('pending_review', reason, instructions=self.instructions(dest, task, note=reason))
+            status = 'blocked' if reason == 'review_format_attempts_exhausted' else 'pending_review'
+            return self.outcome(status, reason, instructions=self.instructions(dest, task, note=reason))
         self.reply['evidence_refs'] = [
             {'path': str(revision_dir / 'materials/candidate.txt'), 'sha256': revision['candidate_sha256']},
             {'path': str(revision_dir / 'manifest.json'), 'sha256': revision['manifest_sha256']},

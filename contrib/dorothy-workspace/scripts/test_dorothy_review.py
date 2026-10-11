@@ -157,7 +157,11 @@ class DorothyReviewTests(unittest.TestCase):
         run = self.runtime / 'runs' / revision['job_id']
         report = json.loads((run / 'response.md').read_bytes())
         update(report)
-        data = review.json_bytes(report)
+        self.replace_report_bytes(review.json_bytes(report))
+
+    def replace_report_bytes(self, data):
+        _, revision = self.current()
+        run = self.runtime / 'runs' / revision['job_id']
         (run / 'response.md').write_bytes(data)
         record = review.read_json(run / 'result.json')
         record['response_sha256'] = review.sha(data)
@@ -711,6 +715,87 @@ class DorothyReviewTests(unittest.TestCase):
         self.write_manifest()
         self.assertEqual(self.check()['reasons'], ['hermes_review_pending'])
         self.assertEqual(self.check()['reasons'], ['prior_findings_not_verified'])
+
+    def test_malformed_report_is_diagnosed_without_repairing_or_resubmitting_it(self):
+        self.check()
+        raw = b'{"scope":"unescaped "quote" inside JSON"}'
+        self.replace_report_bytes(raw)
+        for result in (self.refresh(), self.check(), self.check()):
+            self.assertEqual(result['reasons'], ['hermes_report_invalid_json'])
+            self.assertFalse(result['allow_publish'])
+            self.assertIn('retry_review', result['instructions'])
+        directory, revision = self.current()
+        self.assertEqual((directory / 'hermes-response.txt').read_bytes(), raw)
+        failure = review.read_json(directory / 'invalid-review.json')
+        self.assertEqual(failure['job_id'], revision['job_id'])
+        self.assertEqual(failure['response_sha256'], review.sha(raw))
+        self.assertTrue(failure['processes_released'])
+        self.assertEqual(len(self.submissions), 1)
+        self.assertFalse((directory / 'completion.json').exists())
+
+    def test_malformed_report_recovery_requires_bound_author_request_and_real_followup(self):
+        self.check()
+        raw = b'{"verdict":"pass",}'
+        self.replace_report_bytes(raw)
+        self.refresh()
+        old_dir, old = self.current()
+        self.candidate = '四个单位合计为 4。\n'
+        self.assertEqual(self.check()['reasons'], ['hermes_report_invalid_json'])
+        self.assertEqual(self.current()[1]['revision'], old['revision'])
+        self.manifest['retry_review'] = {'job_id': 'wrong-job', 'reason': '重新独立核验'}
+        self.write_manifest()
+        self.assertEqual(self.check()['reasons'], ['hermes_report_invalid_json'])
+        self.manifest['retry_review'] = {'job_id': old['job_id'], 'reason': '原件格式无效，重新独立核验'}
+        self.write_manifest()
+        self.assertEqual(self.check()['reasons'], ['hermes_review_pending'])
+        new_dir, new = self.current()
+        self.assertNotEqual(old['job_id'], new['job_id'])
+        self.assertEqual((old_dir / 'hermes-response.txt').read_bytes(), raw)
+        self.assertEqual((new_dir / 'materials/previous-review.json').read_bytes(), raw)
+        self.assertEqual(self.check()['reasons'], ['prior_findings_not_verified'])
+        self.assertEqual(len(self.submissions), 2)
+
+    def test_malformed_report_recovery_stops_after_three_verified_failures(self):
+        self.check()
+        for attempt in range(3):
+            self.replace_report_bytes(b'{"verdict":"pass",}')
+            result = self.refresh()
+            _, revision = self.current()
+            self.manifest['retry_review'] = {'job_id': revision['job_id'], 'reason': '真实审查返回无效 JSON'}
+            self.write_manifest()
+            expected = 'hermes_review_pending' if attempt < 2 else 'review_format_attempts_exhausted'
+            self.assertEqual(self.check()['reasons'], [expected])
+            self.assertFalse(result['allow_publish'])
+        self.assertEqual(len(self.submissions), 3)
+        self.assertEqual(self.check()['reasons'], ['review_format_attempts_exhausted'])
+
+    def test_malformed_report_recovery_can_finish_only_with_new_review_and_author_response(self):
+        self.check()
+        self.replace_report_bytes(b'{"verdict":"pass",}')
+        self.refresh()
+        _, old = self.current()
+        self.manifest['retry_review'] = {'job_id': old['job_id'], 'reason': '原报告语法无效，重新独立核验'}
+        self.write_manifest()
+        self.assertEqual(self.check()['reasons'], ['hermes_review_pending'])
+        _, revision = self.current()
+        followup = revision['prior_findings'][0] | {'judgment': 'confirmed', 'disposition': 'verified_closed',
+            'claim': '已独立重审原候选与旧报告可见内容，本轮按约定返回结构化结论。',
+            'evidence': ['candidate.txt', 'previous-review.json', 'review-input.json']}
+        self.change_report(lambda report: report.update(followup=[followup]))
+        self.assertEqual(self.check()['reasons'], ['dorothy_response_missing'])
+        self.respond()
+        self.assertTrue(self.check()['allow_publish'])
+        self.assertEqual(len(self.submissions), 2)
+
+    def test_malformed_report_cannot_mask_missing_native_subreviews(self):
+        self.check()
+        self.replace_report_bytes(b'{"verdict":"pass",}')
+        directory, revision = self.current()
+        run = review.read_json(self.runtime / 'runs' / revision['job_id'] / 'result.json')
+        self.native_rows[run['session_id']] = [row for row in self.native_rows[run['session_id']]
+                                              if not row.get('type', '').startswith(('tool/', 'subagent/'))]
+        self.assertEqual(self.check()['reasons'], ['native_two_subreviews_missing'])
+        self.assertFalse((directory / 'invalid-review.json').exists())
 
     def test_report_cannot_invent_successful_subagent_execution(self):
         self.check()

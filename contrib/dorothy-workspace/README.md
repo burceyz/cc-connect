@@ -42,3 +42,12 @@ them as a noncritical risk or preference in a later revision.
 Acceptance criteria describe the user's deliverable. The host separately checks
 manifest binding, real review participation and publication; those future review
 steps must not become circular preconditions for reviewing the candidate.
+
+A completed, authentic Hermes response containing malformed JSON is preserved
+unchanged and returns `hermes_report_invalid_json`. Recovery requires Dorothy
+to bind a `retry_review` request to that job in the manifest; it creates a new
+independent review with the original report and unresolved findings included.
+It never fixes JSON locally or extracts a passing verdict from invalid text.
+Three consecutive format failures stop recovery with
+`review_format_attempts_exhausted`. Unknown submissions, unsuccessful exits and
+missing native reviewers remain outside this recovery path.

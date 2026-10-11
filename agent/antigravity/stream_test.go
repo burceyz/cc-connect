@@ -16,6 +16,29 @@ import (
 const testAgyCandidate = "候选结果  \nexact trailing newline\n"
 const testAgyProgress = "Checking the completed review.\n"
 
+func TestNativeToolErrorStateProducesFailedResult(t *testing.T) {
+	for _, terminal := range []string{
+		`{"step_index":2,"step_type":"tool","state":"ERROR","tool_name":"run_command","tool_info":{"error":{"message":"tool call denied by pre-tool hook: not now"}}}`,
+		`{"step_index":2,"step_type":"tool","state":"ERROR","tool_name":"run_command","tool_info":{"output":"tool failed without error details"}}`,
+	} {
+		session := &antigravitySession{ctx: context.Background(), events: make(chan core.Event, 4)}
+		stream := &agyStream{session: session}
+		var step agyStreamStep
+		if err := json.Unmarshal([]byte(terminal), &step); err != nil {
+			t.Fatal(err)
+		}
+		stream.handleTool(step)
+		if len(session.events) != 2 {
+			t.Fatalf("native ERROR must finish the tool progress: got %d events", len(session.events))
+		}
+		<-session.events // tool use is emitted even when ACTIVE was not observed
+		result := <-session.events
+		if result.Type != core.EventToolResult || result.ToolName != "run_command" || result.ToolStatus != "failed" || result.ToolResult == "" {
+			t.Fatalf("native ERROR was not surfaced as a failed tool result: %#v", result)
+		}
+	}
+}
+
 // This is an isolated test executable, not the installed agy or a model call.
 func TestAgyCLIHelper(t *testing.T) {
 	if os.Getenv("GO_WANT_AGY_CLI_HELPER") != "1" {

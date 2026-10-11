@@ -2,6 +2,7 @@ package antigravity
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -191,6 +192,22 @@ func TestDefaultModeCreatesPermissionBridge(t *testing.T) {
 			}
 			if _, err := os.Stat(filepath.Join(s.permissionBridge.AgyConfigDir(), "config", "hooks.json")); err != nil {
 				t.Fatalf("stat Agy hook overlay: %v", err)
+			}
+			// This is the overlay actually passed to --gemini_dir by startProcess.
+			data, err := os.ReadFile(filepath.Join(s.invocationBridge.configDir, "config", "hooks.json"))
+			var hooks map[string]json.RawMessage
+			if err != nil || json.Unmarshal(data, &hooks) != nil || hooks[agyPermissionHookName] == nil {
+				t.Fatalf("actual CLI overlay is missing its permission hook: %v", err)
+			}
+			data, err = os.ReadFile(filepath.Join(s.invocationBridge.configDir, "antigravity-cli", "settings.json"))
+			var settings struct {
+				Permissions struct {
+					Allow []string `json:"allow"`
+				} `json:"permissions"`
+			}
+			if err != nil || json.Unmarshal(data, &settings) != nil ||
+				!contains(settings.Permissions.Allow, "command(*)") || !contains(settings.Permissions.Allow, "unsandboxed(*)") {
+				t.Fatalf("actual CLI overlay is missing native command routing: %v", err)
 			}
 			if mode == "acceptEdits" {
 				args := s.buildAntigravityArgs("", false, mode, s.invocationBridge.configDir, "request")

@@ -67,7 +67,12 @@ unfinished final response, or a later tool/input step without a final response
 fails closed before a new candidate is reviewed; it does not fall back to an
 earlier message. Known missing-material or author-response conditions allow at
 most two internal repairs, keeping the same task, conversation and deadline.
-An ambiguous external submission is never automatically submitted again.
+An ambiguous external submission is never automatically submitted again. An
+authentic, finished Hermes review with malformed JSON is retained verbatim and
+reported as `hermes_report_invalid_json`. Its author can request another real
+review by binding `retry_review` to the failed job in the manifest. The new
+revision keeps the old report and requires explicit follow-up verification;
+three consecutive malformed reports stop recovery.
 
 ## Conversation storage
 
@@ -82,10 +87,21 @@ the adapter does not remove shared database records itself.
 ## Live input
 
 All permission modes receive independent `PreInvocation` and `PostInvocation`
-hooks. The default mode additionally retains its tool permission bridge. The
+hooks. Default and `acceptEdits` modes also retain the tool permission bridge. The
 temporary config overlay preserves existing user hooks; an owned hook name
 collision is reported instead of silently replacing a user hook. Original
 configuration files are not edited.
+
+CLI 1.3.3 checks native resource permissions inside tools even after a
+`PreToolUse` hook allows them. Print mode soft-denies those secondary approval
+requests. Bridged modes therefore copy native settings into the private overlay
+and add native allow rules for command and unsandboxed resources.
+Every tool still passes through the authenticated CC Connect permission hook;
+its denial or failure blocks execution. Existing native deny and ask rules keep
+their higher precedence, and unrelated settings and real conversation storage
+are preserved. Modes without that bridge receive no additional native grants.
+This does not set `--dangerously-skip-permissions` or change global settings.
+No extra native grants are added for file, URL or MCP resources.
 
 `LiveInputQueuer` accepts generic sender text. Each process has a fresh public
 run generation and a separate secret hook token. Only the bound primary

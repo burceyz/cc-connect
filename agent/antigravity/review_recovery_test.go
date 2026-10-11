@@ -33,6 +33,23 @@ type agyRecoveryRequest struct {
 	ObservedCLITask string   `json:"observed_cli_task,omitempty"`
 }
 
+func TestMalformedReviewRecoveryIsBoundedAndDoesNotRetryAmbiguousSubmissions(t *testing.T) {
+	for _, test := range []struct {
+		code   string
+		repair bool
+	}{
+		{"hermes_report_invalid_json", true},
+		{"review_format_attempts_exhausted", false},
+		{"submission_unconfirmed", false},
+		{"native_two_subreviews_missing", false},
+	} {
+		pending := pendingReview(agyReviewResponse{Status: "pending_review", Reasons: []string{test.code}})
+		if pending.repair != test.repair || pending.code != test.code {
+			t.Fatalf("%s: got repair=%v, code=%s", test.code, pending.repair, pending.code)
+		}
+	}
+}
+
 // This executable tests the Go gate transport and publication boundary only.
 // It never calls Hermes or proves an actual review; the Python gate tests and
 // the real service acceptance run cover that separate boundary.

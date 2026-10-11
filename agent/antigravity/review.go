@@ -81,7 +81,7 @@ func pendingReview(response agyReviewResponse) *agyReviewPending {
 		"dorothy_review_not_read", "dorothy_findings_not_answered", "dorothy_response_schema_mismatch",
 		"manifest_schema_mismatch", "manifest_task_mismatch", "explicit_manifest_mode_required",
 		"independent_judgment_missing", "invalid_manifest_files", "invalid_manifest_file",
-		"artifact_hash_mismatch", "source_changed_after_review", "hermes_launch_failed":
+		"artifact_hash_mismatch", "source_changed_after_review", "hermes_launch_failed", "hermes_report_invalid_json":
 		p.stage, p.repair = "preparation", true
 	case "hermes_changes_or_unresolved", "prior_findings_not_verified", "dorothy_findings_unresolved",
 		"dorothy_resolution_requires_review":

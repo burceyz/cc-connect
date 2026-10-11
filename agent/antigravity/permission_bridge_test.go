@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,98 @@ import (
 	"github.com/chenhg5/cc-connect/agent/antigravityhook"
 	"github.com/chenhg5/cc-connect/core"
 )
+
+func TestAgyPermissionOverlayRoutesNativeChecksWithoutChangingUserSettings(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	cliDir := filepath.Join(homeDir, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(filepath.Join(cliDir, "conversations"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte(`{"trustedWorkspaces":["/workspace"],"extra":{"keep":true},"permissions":{"allow":["command(git)"],"deny":["command(sudo)"],"ask":["command(rm)"]}}`)
+	path := filepath.Join(cliDir, "settings.json")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, permission := range []bool{false, true} {
+		overlay, err := createAgyConfigOverlayForHooks(t.TempDir(), permission, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(overlay, "antigravity-cli", "settings.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !permission {
+			if !bytes.Equal(data, original) {
+				t.Fatal("non-bridged mode changed native permissions")
+			}
+			continue
+		}
+		info, err := os.Lstat(filepath.Join(overlay, "antigravity-cli", "settings.json"))
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			t.Fatalf("overlay settings must be a private regular file: %v, %v", info, err)
+		}
+		var got, before map[string]any
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(original, &before); err != nil {
+			t.Fatal(err)
+		}
+		permissions := got["permissions"].(map[string]any)
+		for _, key := range []string{"deny", "ask"} {
+			if !reflect.DeepEqual(permissions[key], before["permissions"].(map[string]any)[key]) {
+				t.Fatalf("native %s rules changed", key)
+			}
+		}
+		for _, rule := range []string{"command(git)", "command(*)", "unsandboxed(*)"} {
+			found := false
+			for _, allowed := range permissions["allow"].([]any) {
+				found = found || allowed == rule
+			}
+			if !found {
+				t.Fatalf("native check %q still bypasses the external permission bridge", rule)
+			}
+		}
+		if len(permissions["allow"].([]any)) != 3 {
+			t.Fatal("bridge added native grants outside command execution")
+		}
+		delete(got, "permissions")
+		delete(before, "permissions")
+		if !reflect.DeepEqual(got, before) {
+			t.Fatal("unrelated CLI settings changed")
+		}
+		target, err := os.Readlink(filepath.Join(overlay, "antigravity-cli", "conversations"))
+		if err != nil || target != filepath.Join(cliDir, "conversations") {
+			t.Fatalf("native conversation storage changed: %q, %v", target, err)
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(data, original) {
+		t.Fatal("global settings were modified")
+	}
+}
+
+func TestAgyPermissionOverlayRejectsMalformedNativeSettings(t *testing.T) {
+	for _, settings := range []string{`{`, `[]`, `{"permissions":[]}`, `{"permissions":{"allow":"command(*)"}}`,
+		`{"permissions":{"deny":"command(*)"}}`, `{"permissions":{"ask":{}}}`} {
+		t.Run(settings, func(t *testing.T) {
+			homeDir := t.TempDir()
+			t.Setenv("HOME", homeDir)
+			dir := filepath.Join(homeDir, ".gemini", "antigravity-cli")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(settings), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := createAgyConfigOverlayForHooks(t.TempDir(), true, true); err == nil {
+				t.Fatal("malformed native permissions must not start a bridged session")
+			}
+		})
+	}
+}
 
 func TestAgyPermissionBridgePreservesHooksAndRelaysDecisions(t *testing.T) {
 	homeDir := t.TempDir()

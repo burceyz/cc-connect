@@ -270,9 +270,12 @@ func (s *agyStream) handleTool(step agyStreamStep) {
 		s.session.emit(core.Event{Type: core.EventToolUse, ToolName: name,
 			ToolInput: formatAgyToolInput(info.Parameters), ToolInputRaw: info.Parameters})
 	}
-	if step.State == "DONE" {
+	if step.State == "DONE" || step.State == "ERROR" {
 		output := info.Output
 		status := "completed"
+		if step.State == "ERROR" {
+			status = "failed"
+		}
 		if info.Error != nil {
 			status = "failed"
 			output = info.Error.Message

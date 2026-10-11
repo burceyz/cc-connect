@@ -112,7 +112,8 @@ func createAgyConfigOverlayForHooks(rootDir string, permission, invocation bool)
 		return "", fmt.Errorf("create Agy permission overlay: %w", err)
 	}
 
-	if err := mirrorDirectoryEntries(realConfigRoot, overlayConfigRoot, map[string]bool{"config": true}); err != nil {
+	skipped := map[string]bool{"config": true, "antigravity-cli": permission}
+	if err := mirrorDirectoryEntries(realConfigRoot, overlayConfigRoot, skipped); err != nil {
 		return "", err
 	}
 	realConfigDir := filepath.Join(realConfigRoot, "config")
@@ -186,7 +187,81 @@ func createAgyConfigOverlayForHooks(rootDir string, permission, invocation bool)
 	if err := os.WriteFile(filepath.Join(overlayConfigDir, "hooks.json"), data, 0o600); err != nil {
 		return "", fmt.Errorf("write Agy hooks overlay: %w", err)
 	}
+	if permission {
+		if err := createAgyNativePermissionOverlay(realConfigRoot, overlayConfigRoot); err != nil {
+			return "", err
+		}
+	}
 	return overlayConfigRoot, nil
+}
+
+// CLI 1.3.3 checks command permissions again inside run_command, after PreToolUse.
+// An external Allow would otherwise still be soft-denied in print mode. Route
+// those default resource checks through the installed, authenticated hook. The
+// hook still requires the owning session's decision and hook failures block
+// execution. Explicit native deny/ask rules retain their higher precedence.
+// Only this private overlay changes; user settings and conversation stores stay
+// intact. Never install these rules for a mode without the permission bridge.
+func createAgyNativePermissionOverlay(realRoot, overlayRoot string) error {
+	realCLI := filepath.Join(realRoot, "antigravity-cli")
+	overlayCLI := filepath.Join(overlayRoot, "antigravity-cli")
+	if err := os.MkdirAll(overlayCLI, 0o700); err != nil {
+		return fmt.Errorf("create Agy CLI overlay: %w", err)
+	}
+	if err := mirrorDirectoryEntries(realCLI, overlayCLI, map[string]bool{"settings.json": true}); err != nil {
+		return err
+	}
+	settings := make(map[string]json.RawMessage)
+	if data, err := os.ReadFile(filepath.Join(realCLI, "settings.json")); err == nil {
+		if err := json.Unmarshal(data, &settings); err != nil {
+			return fmt.Errorf("parse Agy CLI settings: %w", err)
+		}
+		if settings == nil {
+			settings = make(map[string]json.RawMessage)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read Agy CLI settings: %w", err)
+	}
+	permissions := make(map[string]json.RawMessage)
+	if raw, ok := settings["permissions"]; ok {
+		if err := json.Unmarshal(raw, &permissions); err != nil {
+			return fmt.Errorf("parse Agy native permissions: %w", err)
+		}
+		if permissions == nil {
+			permissions = make(map[string]json.RawMessage)
+		}
+	}
+	var allowed []string
+	for _, name := range []string{"allow", "deny", "ask"} {
+		if raw, ok := permissions[name]; ok {
+			var rules []string
+			if err := json.Unmarshal(raw, &rules); err != nil {
+				return fmt.Errorf("parse Agy native %s rules: %w", name, err)
+			}
+			if name == "allow" {
+				allowed = rules
+			}
+		}
+	}
+	seen := make(map[string]bool, len(allowed))
+	for _, rule := range allowed {
+		seen[rule] = true
+	}
+	for _, rule := range []string{"command(*)", "unsandboxed(*)"} {
+		if !seen[rule] {
+			allowed = append(allowed, rule)
+		}
+	}
+	permissions["allow"], _ = json.Marshal(allowed)
+	settings["permissions"], _ = json.Marshal(permissions)
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal Agy CLI settings overlay: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(overlayCLI, "settings.json"), append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write Agy CLI settings overlay: %w", err)
+	}
+	return nil
 }
 
 func mirrorDirectoryEntries(sourceDir, targetDir string, skip map[string]bool) error {
