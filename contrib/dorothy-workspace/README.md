@@ -29,6 +29,9 @@ and unrelated running jobs. Consultation uses `tool_policy='none'` for text and
 has separate frozen host artifacts; ordinary Hermes tasks and global provider
 settings keep their existing capabilities. Dorothy hands material to Atlas for
 authorized repository ingestion; consultation never grants repository access.
+Long consultation results and incoming messages are read with the same tool's
+pagination cursor, preserving the complete text without native spill-file
+access. Short results keep their previous shape.
 
 The callback-only repair in `ipc.py` works with the existing receiver. It does
 not require a service restart. New callback workers load the fixed client;

@@ -396,13 +396,51 @@ class CommunicationTests(unittest.TestCase):
         (directory / 'body.md').write_text('changed')
         self.assertEqual(self.call('read_message', {'event_id': event}, error=True)['code'], 'peer_body_modified')
 
-    def test_large_escaped_message_has_explicit_bounded_error(self):
+    def test_large_escaped_message_stays_inline(self):
         event = self.incoming(text='"\\\t' * 140000)
         result = communication.execute(self.request('read_message', {'event_id': event}), self.backend)
-        self.assertTrue(result['isError'])
-        self.assertEqual(json.loads(result['content'][0]['text']), {'status': 'error', 'code': 'result_too_large'})
-        self.assertLessEqual(len((json.dumps(result, ensure_ascii=False) + '\n').encode()), communication.MAX_OUTPUT)
+        self.assertFalse(result['isError'])
+        page = json.loads(result['content'][0]['text'])
+        self.assertTrue(page['pagination']['next_cursor'])
+        self.assertTrue(('"\\\t' * 140000).startswith(page['text']))
+        self.assertLessEqual(len((json.dumps(result, ensure_ascii=False) + '\n').encode()), 4096)
         self.assertEqual(self.call('message_status', {'event_id': event})['event_id'], event)
+
+    def test_long_received_message_is_reassembled_and_rechecks_its_body(self):
+        body = '公开资料与来源链接。😀\n' * 700
+        event = self.incoming(text=body)
+        pieces, arguments = [], {'event_id': event}
+        first = self.call('read_message', arguments)
+        while True:
+            result = self.call('read_message', arguments)
+            self.assertLessEqual(len((json.dumps(communication.mcp_result(result), ensure_ascii=False) + '\n').encode()), 4096)
+            self.assertEqual(result['pagination']['offset'], sum(map(len, pieces)))
+            self.assertEqual(result['body_sha256'], communication.digest(body.encode()))
+            pieces.append(result['text'])
+            cursor = result['pagination']['next_cursor']
+            if cursor is None:
+                break
+            arguments = {'event_id': event, 'cursor': cursor}
+        self.assertEqual(''.join(pieces), body)
+        self.assertGreater(len(pieces), 1)
+        directory, _, _ = peer_ipc.load_message(event, self.runtime)
+        (directory / 'body.md').write_text('changed')
+        self.assertEqual(self.call('read_message', {'event_id': event, 'cursor': first['pagination']['next_cursor']},
+                                   error=True)['code'], 'peer_body_modified')
+
+    def test_read_cursors_reject_paths_and_invalid_types_before_identity_lookup(self):
+        for name, identity in (('read_message', {'event_id': 'a' * 64}),
+                               ('consultation_result', {'job_id': 'dorothy-consult-' + 'a' * 48})):
+            self.policy['enable_consultation'] = True
+            for cursor in (None, True, 1, '', '../output.txt', 'a' * 64 + ':0',
+                           'a' * 64 + ':01', 'a' * 64 + ':-1', 'a' * 64 + ':10000000'):
+                with self.subTest(name=name, cursor=cursor):
+                    self.assertEqual(self.call(name, identity | {'cursor': cursor}, error=True)['code'],
+                                     'result_cursor_invalid')
+            self.assertEqual(self.call(name, identity | {'cursor': 'a' * 64 + ':1', 'path': '/private/output.txt'},
+                                       error=True)['code'], 'invalid_fields')
+        ipc.capture.assert_not_called()
+        self.jobs.result.assert_not_called()
 
     def test_source_policy_mismatch_and_transport_errors_do_not_leak_details(self):
         self.current = self.atlas
@@ -535,12 +573,104 @@ class CommunicationTests(unittest.TestCase):
         self.job_records[job]['cleanup']['worker_process'] = 'absent'
         self.assertEqual(self.call('consultation_result', {'job_id': job})['text'], '只读咨询结论。')
 
-    def test_large_consultation_answer_has_explicit_bounded_error(self):
+    def test_large_escaped_consultation_answer_stays_inline(self):
         self.policy['enable_consultation'] = True
         job = self.call('consult_hermes', {'question': '问题'})['job_id']
         self.completed(job)
         self.jobs.result.return_value = {'response': '"\\\t' * 140000}
-        self.assertEqual(self.call('consultation_result', {'job_id': job}, error=True)['code'], 'result_too_large')
+        result = self.call('consultation_result', {'job_id': job})
+        self.assertTrue(result['pagination']['next_cursor'])
+        self.assertTrue(('"\\\t' * 140000).startswith(result['text']))
+        self.assertLessEqual(len((json.dumps(communication.mcp_result(result), ensure_ascii=False) + '\n').encode()), 4096)
+
+    def test_long_consultation_is_read_in_full_without_native_output_files(self):
+        self.policy['enable_consultation'] = True
+        job = self.call('consult_hermes', {'question': '问题', 'mode': 'research'})['job_id']
+        self.completed(job)
+        answer = ('独立研究正文 😀\n引号 " 与反斜线 \\ 以及制表符\t。\n' * 300) + '最后一段。'
+        self.jobs.result.return_value = {'response': answer}
+        arguments, pieces, cursors = {'job_id': job}, [], set()
+        while True:
+            result = self.call('consultation_result', arguments)
+            self.assertIn('pagination', result)
+            self.assertLessEqual(len((json.dumps(communication.mcp_result(result), ensure_ascii=False) + '\n').encode()), 4096)
+            page = result['pagination']
+            self.assertEqual(page['offset'], sum(map(len, pieces)))
+            self.assertEqual(page['total_chars'], len(answer))
+            self.assertEqual(page['text_sha256'], communication.digest(answer.encode()))
+            self.assertTrue(result['text'])
+            pieces.append(result['text'])
+            cursor = page['next_cursor']
+            if cursor is None:
+                break
+            self.assertNotIn(cursor, cursors)
+            cursors.add(cursor)
+            arguments = {'job_id': job, 'cursor': cursor}
+        self.assertGreater(len(pieces), 1)
+        self.assertEqual(''.join(pieces), answer)
+        self.jobs.submit.assert_called_once()
+
+    def test_short_results_preserve_their_original_shape(self):
+        event = self.incoming()
+        self.assertEqual(self.call('read_message', {'event_id': event}), {
+            'event_id': event, 'sender': 'atlas', 'recipient': 'dorothy', 'reply_to': None,
+            'text': '请核对这段资料。', 'body_sha256': communication.digest('请核对这段资料。'.encode())})
+        self.policy['enable_consultation'] = True
+        job = self.call('consult_hermes', {'question': '问题'})['job_id']
+        self.completed(job)
+        self.assertEqual(self.call('consultation_result', {'job_id': job}), {
+            'job_id': job, 'status': 'completed', 'text': '只读咨询结论。', 'processes_released': True})
+
+    def test_consultation_cursor_cannot_select_another_job_or_changed_answer(self):
+        self.policy['enable_consultation'] = True
+        self.jobs.result.return_value = {'response': '完整正文。' * 1000}
+        first_job = self.call('consult_hermes', {'question': '问题一'})['job_id']
+        second_job = self.call('consult_hermes', {'question': '问题二'})['job_id']
+        self.completed(first_job)
+        self.completed(second_job)
+        first = self.call('consultation_result', {'job_id': first_job})
+        cursor = first['pagination']['next_cursor']
+        self.assertEqual(self.call('consultation_result', {'job_id': second_job, 'cursor': cursor},
+                                   error=True)['code'], 'result_cursor_mismatch')
+        self.jobs.result.return_value = {'response': '更改正文。' * 1000}
+        self.assertEqual(self.call('consultation_result', {'job_id': first_job, 'cursor': cursor},
+                                   error=True)['code'], 'result_cursor_mismatch')
+        self.jobs.result.return_value = {'response': '完整正文。' * 1000}
+        out_of_range = cursor.split(':')[0] + ':9999999'
+        self.assertEqual(self.call('consultation_result', {'job_id': first_job, 'cursor': out_of_range},
+                                   error=True)['code'], 'result_cursor_invalid')
+
+    def test_consultation_later_pages_still_require_ownership_request_and_release(self):
+        self.policy['enable_consultation'] = True
+        job = self.call('consult_hermes', {'question': '问题'})['job_id']
+        self.completed(job)
+        self.jobs.result.return_value = {'response': '完整正文。' * 1000}
+        first = self.call('consultation_result', {'job_id': job})
+        arguments = {'job_id': job, 'cursor': first['pagination']['next_cursor']}
+        self.current = self.other
+        self.policy.pop('source_cwd')
+        self.jobs.result.reset_mock()
+        self.assertEqual(self.call('consultation_result', arguments, error=True)['code'], 'consultation_not_owned')
+        self.jobs.result.assert_not_called()
+        self.current = self.source
+        self.job_records[job]['cleanup']['worker_process'] = 'exists_unverified'
+        self.assertEqual(self.call('consultation_result', arguments)['status'], 'finishing')
+        self.jobs.result.assert_not_called()
+        self.job_records[job]['cleanup']['worker_process'] = 'absent'
+        self.assertTrue(self.call('consultation_result', arguments)['text'])
+        path = self.dsh / 'jobs' / job / 'request.json'
+        request = json.loads(path.read_text())
+        request['tool_policy'] = 'default'
+        ipc.write_state(path, request)
+        self.assertEqual(self.call('consultation_result', arguments, error=True)['code'], 'consultation_request_mismatch')
+
+    def test_read_pagination_is_advertised_only_on_the_two_read_tools(self):
+        self.policy['enable_consultation'] = True
+        for tool in self.backend.tools():
+            specification = tool['inputSchema']
+            self.assertEqual('cursor' in specification['properties'], tool['name'] in ('read_message', 'consultation_result'))
+            self.assertFalse(specification['additionalProperties'])
+            self.assertNotIn('cursor', specification['required'])
 
     def real_completed_job(self, mode='text'):
         """Native job/receipt/run shape; no worker, transport or model is started."""

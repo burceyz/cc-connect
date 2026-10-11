@@ -181,7 +181,8 @@ MCP result object with `content: [{"type":"text","text":"<JSON result>"}]`
 and `isError: false` or `true`. Validation failures use an error result with a
 fixed code and exit 0; raw exceptions and private paths are not returned.
 Complete stdout is capped at 512 KiB, including both JSON layers and escaping.
-Larger results return `result_too_large` without a partial or truncated body.
+Text reads use smaller inline pages as described below; other oversized results
+return `result_too_large` without a partial or truncated body.
 Process-launch errors and transport failures remain host responsibilities.
 The optional MCP `_meta` object is accepted and ignored. In particular, native
 conversation/artifact metadata cannot select a sender, path, or operation scope;
@@ -192,17 +193,34 @@ The fixed tool names are:
 - `list_contacts()`
 - `send_message(contact, text)`
 - `reply_message(event_id, text)`
-- `read_message(event_id)`
+- `read_message(event_id, cursor?)`
 - `message_status(event_id)`
 - `ack_message(event_id)`
 - `consult_hermes(question, material_ids?, mode?)`, only when enabled
-- `consultation_result(job_id)`, only when enabled
+- `consultation_result(job_id, cursor?)`, only when enabled
 
 Each schema rejects additional fields. Message/question text is limited to
 64 KiB of UTF-8. Reads return only events the actual current session sent or
 received. Acknowledgement requires the current recipient. Message results omit
 socket, filesystem and raw target fields. Received text is returned as data;
 an acknowledgement is not a claim that any requested work is complete.
+
+`read_message` and completed `consultation_result` keep the original result shape
+for short text. Long text is returned in pages of at most 4 KiB, counting both
+JSON layers, UTF-8 and escaping. Each page includes `pagination` with `offset`
+(a Unicode character offset), `total_chars`, `text_sha256` for the complete body,
+and `next_cursor`. Call the same tool with the same event/job ID and the exact
+cursor to continue; concatenate each page's `text` in order until `next_cursor`
+is `null`. A completed job can still have unread pages. Omitting the cursor
+starts at the beginning and never reruns a consultation or resends a message.
+
+Every page repeats ownership, original-record and integrity checks; consultation
+pages also require the accepted request, tool-policy proof and released
+processes. Cursors bind the complete result and event/job metadata and reject
+changed content or a different result. They are read positions, not file paths
+or capabilities. This keeps research results and long incoming material out of
+the native client's inaccessible `output.txt` spill files. No cache directory
+or additional file-read permission is granted.
 
 The host's operation scope and the arguments determine the stable operation
 key. Retries reuse the original event and pinned recipient. Unknown delivery
