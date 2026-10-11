@@ -76,6 +76,7 @@ func TestAppServerSession_HandleRateLimitsUpdatedCachesUsage(t *testing.T) {
 
 func TestAppServerSession_HandleThreadTokenUsageUpdatedCachesContextUsage(t *testing.T) {
 	s := &appServerSession{}
+	s.threadID.Store("thread-1")
 	raw, err := json.Marshal(appServerThreadTokenUsageNotification{
 		ThreadID: "thread-1",
 		TurnID:   "turn-1",
@@ -137,6 +138,7 @@ func TestAppServerSession_FailedTurnEmitsError(t *testing.T) {
 		currentTurn: "turn-1",
 		pendingMsgs: []string{"partial reasoning"},
 	}
+	s.threadID.Store("thread-1")
 
 	raw, err := json.Marshal(map[string]any{
 		"threadId": "thread-1",
@@ -505,17 +507,17 @@ func waitForWrittenJSONLine(t *testing.T, w *lockedWriteCloser) string {
 
 func TestAppServerListenURL(t *testing.T) {
 	cases := map[string]string{
-		"":                       "",
-		"  ":                     "",
-		"stdio://":               "",
-		"stdio":                  "",
-		"ws://127.0.0.1:3845":    "ws://127.0.0.1:3845",
-		"ws://localhost:9000":    "ws://localhost:9000",
-		"ws://127.0.0.1:3845 ":   "ws://127.0.0.1:3845",
-		" stdio ":                 "",
-		" stdio:// ":               "",
-		"STDIO":                    "",
-		"STDIO://":                 "",
+		"":                     "",
+		"  ":                   "",
+		"stdio://":             "",
+		"stdio":                "",
+		"ws://127.0.0.1:3845":  "ws://127.0.0.1:3845",
+		"ws://localhost:9000":  "ws://localhost:9000",
+		"ws://127.0.0.1:3845 ": "ws://127.0.0.1:3845",
+		" stdio ":              "",
+		" stdio:// ":           "",
+		"STDIO":                "",
+		"STDIO://":             "",
 	}
 	for in, want := range cases {
 		if got := appServerListenURL(in); got != want {

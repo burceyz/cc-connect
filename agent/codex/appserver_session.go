@@ -1121,6 +1121,19 @@ func (s *appServerSession) handleResponse(resp rpcResponseEnvelope) {
 }
 
 func (s *appServerSession) handleNotification(method string, paramsRaw json.RawMessage) {
+	// One app-server connection also carries notifications from subagent
+	// threads. Only this session's thread may change its output or lifecycle;
+	// a child's idle/completed event must not finish the parent's turn.
+	var scope struct {
+		ThreadID string `json:"threadId"`
+	}
+	if err := json.Unmarshal(paramsRaw, &scope); err != nil {
+		return
+	}
+	if scope.ThreadID != "" && scope.ThreadID != s.CurrentSessionID() {
+		return
+	}
+
 	switch method {
 	case "turn/started":
 		var notif turnNotification
