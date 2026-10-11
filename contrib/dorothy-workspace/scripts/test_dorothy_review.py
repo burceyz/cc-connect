@@ -832,6 +832,111 @@ class DorothyReviewTests(unittest.TestCase):
         self.respond()
         self.assertFalse(self.check()['allow_publish'])
 
+    def test_noncritical_no_action_risk_requires_actual_author_acceptance(self):
+        finding = {'id': 'F1', 'kind': 'risk', 'judgment': 'unresolved',
+                   'disposition': 'no_action', 'critical': False,
+                   'claim': '内部工具执行顺序不在本次纯文本验收范围。',
+                   'evidence': ['request.txt', 'host-evidence.json']}
+        self.check()
+        self.change_report(lambda report: report.update(findings=[finding]))
+        self.assertEqual(self.refresh()['reasons'], ['hermes_review_ready'])
+        self.assertEqual(self.check()['reasons'], ['dorothy_response_missing'])
+        self.respond()
+        path = self.dest / 'response.json'
+        response = review.read_json(path)
+        response['responses'][0]['resolution'] = 'pending'
+        path.write_bytes(review.json_bytes(response))
+        self.assertEqual(self.check()['reasons'], ['dorothy_findings_unresolved'])
+        response['responses'][0]['resolution'] = 'verified'
+        response['preserve_candidate'] = True
+        path.write_bytes(review.json_bytes(response))
+        directory, revision = self.current()
+        original_report = (directory / 'hermes-response.txt').read_bytes()
+        result = self.bind(op='finalize', revision=revision['revision'])
+        self.assertTrue(result['allow_publish'])
+        self.assertEqual(Path(result['candidate_path']).read_text(), self.candidate)
+        self.assertEqual((directory / 'hermes-response.txt').read_bytes(), original_report)
+        self.assertEqual(len(self.submissions), 1)
+
+    def test_no_action_cannot_close_defects_or_critical_or_actionable_risks(self):
+        finding = {'id': 'F1', 'kind': 'risk', 'judgment': 'unresolved',
+                   'disposition': 'no_action', 'critical': False,
+                   'claim': '验收依据待核验。', 'evidence': ['candidate.txt']}
+        for change in ({'critical': True}, {'kind': 'defect'},
+                       {'disposition': 'needs_change'}, {'disposition': 'unverified'},
+                       {'disposition': 'verified_closed'}):
+            with self.subTest(change=change):
+                self.assertFalse(self.gate.closed(finding | change))
+
+    def test_noncritical_risk_cannot_silently_downgrade_prior_blocker(self):
+        finding = {'id': 'F1', 'kind': 'risk', 'judgment': 'unresolved',
+                   'disposition': 'unverified', 'critical': True,
+                   'claim': '关键验收前提缺少证据。', 'evidence': ['candidate.txt']}
+        self.check()
+        self.change_report(lambda report: report.update(verdict='unresolved', findings=[finding]))
+        self.check()
+        old = self.current()[1]
+        self.manifest['acceptance'].append('核对关键验收前提')
+        self.write_manifest()
+        self.check()
+        followup = {k: v for k, v in finding.items() if k != 'id'}
+        followup.update(finding_id=old['revision'] + '/F1', critical=False, disposition='no_action')
+        self.change_report(lambda report: report.update(followup=[followup]))
+        self.assertEqual(self.refresh()['reasons'], ['hermes_changes_or_unresolved'])
+        self.assertEqual(self.check()['reasons'], ['hermes_changes_or_unresolved'])
+        self.respond()
+        self.assertFalse(self.check()['allow_publish'])
+        self.manifest['acceptance'].append('仍须携带尚未解决的原关键发现')
+        self.write_manifest()
+        self.check()
+        self.assertEqual(self.current()[1]['prior_findings'][0]['finding_id'], followup['finding_id'])
+
+    def test_preference_cannot_silently_downgrade_prior_defect(self):
+        finding = {'id': 'F1', 'kind': 'defect', 'judgment': 'confirmed',
+                   'disposition': 'needs_change', 'critical': False,
+                   'claim': '交付文件包含错误结果。', 'evidence': ['candidate.txt']}
+        self.check()
+        self.change_report(lambda report: report.update(verdict='changes_required', findings=[finding]))
+        self.check()
+        old = self.current()[1]
+        self.manifest['acceptance'].append('核对错误结果的修复')
+        self.write_manifest()
+        self.check()
+        followup = {k: v for k, v in finding.items() if k != 'id'}
+        followup.update(finding_id=old['revision'] + '/F1', kind='preference', disposition='no_action')
+        self.change_report(lambda report: report.update(followup=[followup]))
+        self.assertEqual(self.check()['reasons'], ['hermes_changes_or_unresolved'])
+        self.respond()
+        self.assertFalse(self.check()['allow_publish'])
+        self.manifest['acceptance'].append('仍须回应已确认的历史错误')
+        self.write_manifest()
+        self.check()
+        self.assertEqual(self.current()[1]['prior_findings'][0]['finding_id'], followup['finding_id'])
+
+    def test_prior_blockers_require_verified_closure_or_refutation(self):
+        base = {'kind': 'risk', 'judgment': 'unresolved', 'critical': True,
+                'disposition': 'unverified'}
+        for previous in (base, base | {'kind': 'defect', 'critical': False},
+                         base | {'critical': False, 'disposition': 'needs_change'},
+                         base | {'critical': False}):
+            with self.subTest(previous=previous):
+                for kind in ('risk', 'preference'):
+                    for judgment in ('confirmed', 'unresolved'):
+                        proposed = {'kind': kind, 'critical': False,
+                                    'disposition': 'no_action', 'judgment': judgment}
+                        self.assertFalse(self.gate.closed(proposed, previous))
+                repaired = base | {'judgment': 'confirmed', 'disposition': 'verified_closed'}
+                self.assertTrue(self.gate.closed(repaired, previous))
+                refuted = base | {'judgment': 'not_confirmed', 'disposition': 'no_action'}
+                self.assertTrue(self.gate.closed(refuted, previous))
+                self.assertFalse(self.gate.closed(repaired | {'judgment': 'unresolved'}, previous))
+
+    def test_optional_preference_may_remain_unresolved_without_blocking(self):
+        finding = {'kind': 'preference', 'judgment': 'unresolved',
+                   'disposition': 'no_action', 'critical': False}
+        self.assertTrue(self.gate.closed(finding))
+        self.assertFalse(self.gate.closed(finding | {'critical': True}))
+
     def test_changed_manifest_and_candidate_need_new_review(self):
         self.initial_review()
         self.respond()
@@ -871,6 +976,7 @@ class DorothyReviewTests(unittest.TestCase):
         self.manifest['acceptance'].append('补充证明依据')
         self.write_manifest()
         self.check()
+        self.assertEqual(self.refresh()['reasons'], ['prior_findings_not_verified'])
         self.assertEqual(self.check()['reasons'], ['prior_findings_not_verified'])
 
     def test_revision_change_collects_unread_previous_findings(self):

@@ -517,6 +517,7 @@ class Gate:
                 'test_evidence': [{'path': '测试证据绝对路径', 'sha256': 'SHA-256', 'description': '验证范围及结果'}]
             }, ensure_ascii=False),
             '纯答案须明确 mode=answer_only、artifacts=[]；无文件测试证据时 test_evidence=[]。不自动推定纯答案。',
+            'acceptance 只写用户交付的验收条件；内部 manifest 写入顺序、未来复核回执和发布状态由宿主另行核验，不额外变成用户答案的验收前提。',
             '引用原文、规则或代码时，使用 references=[{"path":"工作区内源文件绝对路径"}] 提供依据；程序负责计算哈希并冻结副本。references 不是交付制品，也不是测试证据。',
             '宿主自动冻结工作区 AGENTS.md、agent/dorothy-collaboration.md 和有限运行证据；这些材料可支持成员称呼、协作规则及本次配置/观察值，不证明模型能力或未发生的审查。',
             '只在当前 manifest 路径写清单。首次候选或修改候选时，清单写入后给出候选正文；已有候选无需修改时，按下方 preserve_candidate 契约回应即可。',
@@ -646,9 +647,10 @@ class Gate:
             reason = jobs.safe_code(exc)
         else:
             if report:
-                reason = ('hermes_changes_or_unresolved' if report['verdict'] != 'pass' or
-                          any(not self.closed(f) for f in report['findings'] + report['followup'])
-                          else 'hermes_review_ready')
+                reason = 'hermes_review_ready' if self.review_ready(report, revision) else 'hermes_changes_or_unresolved'
+                required = {f['finding_id'] for f in revision['prior_findings']}
+                if reason == 'hermes_review_ready' and not required.issubset({f['finding_id'] for f in report['followup']}):
+                    reason = 'prior_findings_not_verified'
         self.describe_task(dest, task)
         self.reply['instructions'] = self.instructions(dest, task, note=reason)
         return self.outcome('pending_review', reason)
@@ -716,7 +718,9 @@ class Gate:
                                            'claim': '上一轮报告或原生参与证据未通过核验，需要本轮独立重审并回应其可见内容。',
                                            'evidence': ['previous-review.json']})
                 else:
-                    closed = {f['finding_id'] for f in report['followup'] if self.closed(f)}
+                    prior = {f['finding_id']: f for f in prior_findings}
+                    closed = {f['finding_id'] for f in report['followup']
+                              if self.closed(f, prior.get(f['finding_id']))}
                     prior_findings = [f for f in prior_findings if f['finding_id'] not in closed]
                     for finding in report['findings']:
                         if not self.closed(finding):
@@ -761,6 +765,8 @@ class Gate:
             '共同规则原文用于核对成员称呼、模型选择和协作要求；运行字段只支持本次配置/观察值，不外推真实性能、供应商内部路由或未来任务。缺字段按未验证列明，不要求读取配置或凭据。',
             '审查当前候选是否满足用户实际要求。未来 Hermes 回执、未来发布状态不是候选的前置证据，不以缺少本轮尚未完成的审查回执构造循环门槛。',
             '只在违反具体要求或关键事实缺证时提出阻塞发现；普通范围限制放 limitations，偏好不得升级为必改缺陷。',
+            '若单列不影响验收的剩余风险或可选偏好，须明确 kind=risk/preference、critical=false、disposition=no_action，并以 claim/evidence 说明为何无需处置；可保留 confirmed/unresolved 判定，不得谎称已经证伪或修复。Dorothy 仍须逐项实际回应。',
+            '未决缺陷、关键风险、needs_change/unverified 或未完成的修复必须阻断；历史关键发现、事实缺陷和已要求处置的条目，须经 verified_closed 或 not_confirmed+no_action 证据关闭，不能仅降低 critical、改称普通风险/偏好或改成 no_action。',
             '至少调用两个实际子 Agent，以不同视角独立先判；使用同步返回等待结果，不可派发后提前 final。',
             '每次 subagent 显式 run_in_background=false，description 必须互异；子任务 prompt 必须含上方材料目录完整路径和 revision。',
             '向每个子 Agent 传递本任务全部材料边界、固定版本、只读限制和 review-protocol.md 适用条款。',
@@ -993,12 +999,26 @@ class Gate:
         return report
 
     @staticmethod
-    def closed(finding):
+    def closed(finding, previous=None):
+        # Review judgment and release disposition are separate: an explicitly
+        # accepted, noncritical risk need not be declared disproved or repaired.
+        # The author must still respond, and prior blockers cannot be relabeled.
+        prior_blocker = previous and (previous['critical'] or previous['kind'] == 'defect' or
+                                      previous['disposition'] in ('needs_change', 'unverified'))
+        if (finding['kind'] in ('risk', 'preference') and not finding['critical'] and
+                finding['disposition'] == 'no_action' and not prior_blocker):
+            return True
         if finding['judgment'] == 'unresolved':
             return False
         if finding['disposition'] == 'verified_closed':
             return True
-        return finding['disposition'] == 'no_action' and (finding['kind'] == 'preference' or finding['judgment'] == 'not_confirmed')
+        return finding['disposition'] == 'no_action' and finding['judgment'] == 'not_confirmed'
+
+    def review_ready(self, report, revision):
+        prior = {f['finding_id']: f for f in revision['prior_findings']}
+        return (report['verdict'] == 'pass' and
+                all(self.closed(f) for f in report['findings']) and
+                all(self.closed(f, prior.get(f['finding_id'])) for f in report['followup']))
 
     def author_response(self, dest, revision, report):
         path = dest / 'response.json'
@@ -1119,7 +1139,7 @@ class Gate:
             {'path': str(revision_dir / 'native-evidence.json'), 'sha256': sha(read_bytes(revision_dir / 'native-evidence.json'))},
         ]
         self.reply['instructions'] = self.instructions(dest, task)
-        if report['verdict'] != 'pass' or any(not self.closed(f) for f in report['findings'] + report['followup']):
+        if not self.review_ready(report, revision):
             return self.outcome('blocked', 'hermes_changes_or_unresolved')
         required = {f['finding_id'] for f in revision['prior_findings']}
         if not required.issubset({f['finding_id'] for f in report['followup']}):
