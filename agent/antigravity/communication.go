@@ -138,6 +138,11 @@ func (as *antigravitySession) initializeCommunication() error {
 		return err
 	}
 	as.communicationBridge = bridge
+	nativeDir, err := filepath.EvalSymlinks(filepath.Join(options.runtimeDir, "antigravity-cli"))
+	if err != nil {
+		return fmt.Errorf("antigravity: resolve native cache directory: %w", err)
+	}
+	as.permissionBridge.webCache = &agyCommunicationWebCache{rootDir: filepath.Join(nativeDir, "brain")}
 	configRoot := filepath.Join(as.invocationBridge.rootDir, "agy-config")
 	configDir := filepath.Join(configRoot, "config")
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
@@ -178,7 +183,10 @@ func (as *antigravitySession) initializeCommunication() error {
 	if err := writeAgyCommunicationJSON(filepath.Join(configDir, "mcp_config.json"), mcp); err != nil {
 		return err
 	}
-	allowed := []string{"read_url(*)"}
+	// The pre-tool hook additionally requires a completed web-tool event and
+	// the unchanged body from this conversation before allowing any cache read.
+	// Native read_file directory rules are recursive; embedded globs are literal.
+	allowed := []string{"read_url(*)", "read_file(" + filepath.Join(nativeDir, "brain") + ")"}
 	for _, operation := range []string{"list_contacts", "send_message", "reply_message", "read_message", "message_status", "ack_message", "consult_hermes", "consultation_result"} {
 		allowed = append(allowed, "mcp(cc_communication/"+operation+")",
 			"read_file("+filepath.Join(options.runtimeDir, "antigravity-cli", "mcp", "cc_communication", operation+".json")+")")
@@ -309,7 +317,9 @@ func (as *antigravitySession) communicationEnv() []string {
 func appendAgyCommunicationInstructions(prompt string) string {
 	return prompt + "\n\n[Host communication policy]\n" +
 		"This is a communication session. Answer ordinary questions directly; do not run a mandatory review or reopen old review tasks. " +
-		"Use native search_web, read_url_content, and view_content_chunk for web research, and cc_communication MCP tools for messages and consultation. Do not run shell commands, edit project files, change permissions/configuration, or spawn operation agents. " +
+		"Use native search_web and read_url_content for web research, and cc_communication MCP tools for messages and consultation. " +
+		"When read_url_content saves the article to a content.md cache, use view_file on that exact returned file to read the body. The host permits only unchanged web content registered from successful tools in this conversation; after a host restart, fetch the URL again before reading its cache. " +
+		"Do not read other files, run shell commands, edit project files, change permissions/configuration, or spawn operation agents. " +
 		"For an IPC notice use read_message with its event ID to read the verified body, and reply_message to answer its original sender. " +
 		"Check message_status after uncertain delivery; do not create replacement sends. Use consult_hermes only when this question needs independent judgment or the user requested it. " +
 		"Consultation is optional for ordinary replies. A correct report of a defect can be delivered while the reviewed artifact remains unapproved."

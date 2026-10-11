@@ -250,6 +250,9 @@ func (s *agyStream) reviewCandidate() (string, error) {
 }
 
 func (s *agyStream) handleTool(step agyStreamStep) {
+	if s.session.communication != nil && s.session.permissionBridge != nil {
+		s.session.permissionBridge.webCache.record(step)
+	}
 	if s.tools == nil {
 		s.tools = make(map[int]bool)
 	}

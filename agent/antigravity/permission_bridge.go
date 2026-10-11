@@ -42,6 +42,7 @@ type agyPermissionBridge struct {
 	events        chan<- core.Event
 	communication bool
 	schemaDir     string
+	webCache      *agyCommunicationWebCache
 
 	nextID    atomic.Uint64
 	pendingMu sync.Mutex
@@ -362,7 +363,8 @@ func (b *agyPermissionBridge) handleConnection(conn net.Conn) {
 		decision := "deny"
 		reason := "This session supports web research and communication tools. Project operations require a separately configured task."
 		if isAgyCommunicationTool(input.ToolCall.Name, input.ToolCall.Args) ||
-			(input.ToolCall.Name == "view_file" && isAgyCommunicationSchemaRead(input.ToolCall.Args, b.schemaDir)) {
+			(input.ToolCall.Name == "view_file" && isAgyCommunicationSchemaRead(input.ToolCall.Args, b.schemaDir)) ||
+			b.webCache.permits(input) {
 			decision, reason = "allow", ""
 		}
 		b.writeResponse(conn, antigravityhook.BridgeResponse{Decision: decision, Reason: reason})

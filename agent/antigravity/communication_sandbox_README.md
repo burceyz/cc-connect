@@ -36,14 +36,28 @@ themselves cannot be removed, renamed, or have their permissions changed.
 
 Use a host-created read-only CLI overlay containing `config/hooks.json` and
 `config/mcp_config.json`. Its `antigravity-cli` entry may point to this agent's
-dedicated mutable runtime. Include that runtime's `settings.json` path in
-`ReadOnlyPaths`, including when it is a symlink to a host-owned file. Do not
+dedicated mutable runtime. Native `settings.json` must remain writable because
+the CLI normalizes it; the immutable hooks enforce the fixed tool policy even
+if native settings are changed to allow everything. Do not
 mirror the user's global `.gemini` tree, conversation stores, plugins, or rules.
 
 The host still enforces the communication tool allowlist. Seatbelt is not a
 replacement for binding a bridge request to the owning conversation and token.
 The caller remains responsible for child-process lifecycle and final transport
 and authentication verification.
+
+The native CLI returns a cache path from `read_url_content`. A successful tool
+event registers only `brain/<current-conversation>/.system_generated/steps/<tool-step>/content.md`.
+The permission bridge allows `view_file` only when the request matches that
+conversation and the registered body hash. Unregistered files, other sessions,
+changed bodies, and symlink escapes remain denied. Registration is held by the
+host session; fetch the URL again after a host restart. MCP schema reads use a
+separate exact list of the eight communication operations.
+
+The native `read_file` rule names the dedicated `brain` directory. The
+[CLI permissions documentation](https://antigravity.google/docs/permissions?tab=cli)
+defines directory rules as recursive; embedded path globs are not supported.
+The host hook narrows that native directory rule to the registered body files.
 
 ## Explicit system exceptions
 
@@ -79,7 +93,7 @@ tool-name representation must be verified against an actual invocation instead
 of inferred from the resource syntax.
 
 The installed CLI's `NewCLITokenStorage` uses
-`<gemini_dir>/antigravity-oauth-token`. The binary also contains the older
+`<gemini_dir>/antigravity-cli/antigravity-oauth-token`. The binary also contains the older
 `jetski-standalone-oauth-token` name, which is not the CLI's current lookup.
 The host stages the explicitly configured credential under the current name
 in the dedicated runtime, preserving refreshed credentials across sessions.
