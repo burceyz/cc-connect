@@ -36,10 +36,110 @@ MAX_PROFILE_PATCHES = {DEFAULT_PROFILE: 'opencode-go-max.patch.yml',
 # Friendly workspace profile names need not match the native provider route.
 PROFILE_PROVIDERS = {DEFAULT_PROFILE: DEFAULT_PROFILE, 'happy2': 'happy2', 'happy1': 'happy'}
 MAX_LINE = 16 * 1024 * 1024
+TOOL_POLICIES = ('default', 'none')
+POLICY_VERSION = 1
+POLICY_PLUGIN = Path(__file__).resolve().with_name('consultation-policy.mjs')
+POLICY_OVERLAY = Path(__file__).resolve().with_name('consultation-policy.patch.yml')
+POLICY_HASH_FIELDS = ('model_config_sha256', 'tool_policy_plugin_sha256',
+                      'tool_policy_overlay_sha256')
 
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def resolve_tool_policy(tool_policy=None):
+    if tool_policy is None:
+        return 'default'
+    if not isinstance(tool_policy, str) or tool_policy not in TOOL_POLICIES:
+        raise ValueError('unknown_tool_policy')
+    return tool_policy
+
+
+def tool_policy_record(record):
+    """Validate a receipt's policy binding without reading today's deployment."""
+    policy = resolve_tool_policy(record.get('tool_policy'))
+    result = {'tool_policy': policy}
+    if policy == 'none':
+        if type(record.get('tool_policy_version')) is not int or record['tool_policy_version'] != POLICY_VERSION:
+            raise ValueError('tool_policy_invalid')
+        result['tool_policy_version'] = POLICY_VERSION
+        for field in POLICY_HASH_FIELDS:
+            value = record.get(field)
+            if not isinstance(value, str) or not re.fullmatch('[a-f0-9]{64}', value):
+                raise ValueError('tool_policy_invalid')
+            result[field] = value
+        expected = digest(json.dumps(result, sort_keys=True, separators=(',', ':')).encode())
+        if record.get('config_sha256') != expected:
+            raise ValueError('config_changed')
+    return result
+
+
+def validate_tool_policy(record, expected):
+    """Bind request, receipt and run; missing legacy fields mean default only."""
+    if tool_policy_record(record) != tool_policy_record(expected):
+        raise ValueError('tool_policy_mismatch')
+
+
+def validate_tool_policy_attestation(record):
+    """A successful consultation must have the native plugin's request proof."""
+    if tool_policy_record(record)['tool_policy'] != 'none':
+        return
+    proof = record.get('tool_policy_attestation')
+    expected = {'policy': 'none', 'version': POLICY_VERSION, 'schema_count': 0,
+                'presentation': 'native', 'guard': 'deny_all',
+                'plugin_sha256': record['tool_policy_plugin_sha256'],
+                'overlay_sha256': record['tool_policy_overlay_sha256'],
+                'config_sha256': record['config_sha256'], 'session_id': record.get('session_id')}
+    if (not isinstance(proof, dict) or proof != expected or
+            type(proof.get('version')) is not int or type(proof.get('schema_count')) is not int):
+        raise ValueError('tool_policy_unverified')
+
+
+def execution_config(patch, tool_policy=None):
+    """Read fixed host artifacts once; callers later execute these exact bytes."""
+    policy = resolve_tool_policy(tool_policy)
+    artifacts = {'model': patch.read_bytes()}
+    record = {'tool_policy': policy, 'config_sha256': digest(artifacts['model'])}
+    if policy == 'none':
+        for label, path in [('plugin', POLICY_PLUGIN), ('overlay', POLICY_OVERLAY)]:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError('tool_policy_unavailable')
+            artifacts[label] = path.read_bytes()
+        record.update(tool_policy_version=POLICY_VERSION,
+                      model_config_sha256=record['config_sha256'],
+                      tool_policy_plugin_sha256=digest(artifacts['plugin']),
+                      tool_policy_overlay_sha256=digest(artifacts['overlay']))
+        bound = {key: value for key, value in record.items() if key != 'config_sha256'}
+        record['config_sha256'] = digest(json.dumps(bound, sort_keys=True, separators=(',', ':')).encode())
+    return record, artifacts
+
+
+def validate_consultation_model(tool_policy, profile, reasoning_effort):
+    if tool_policy == 'none' and (profile != DEFAULT_PROFILE or reasoning_effort != DEFAULT_REASONING_EFFORT):
+        raise ValueError('consultation_model_mismatch')
+
+
+def snapshot_tool_policy(dest, artifacts, record):
+    """Materialize the accepted plugin and overlay; never take a caller path."""
+    plugin = dest / 'consultation-policy.mjs'
+    overlay = dest / 'consultation-policy.patch.yml'
+    model = dest / 'model.patch.yml'
+    substitutions = {'__CONSULTATION_PLUGIN__': str(plugin),
+                     '__CONSULTATION_PLUGIN_SHA256__': record['tool_policy_plugin_sha256'],
+                     '__CONSULTATION_OVERLAY_SHA256__': record['tool_policy_overlay_sha256'],
+                     '__CONSULTATION_CONFIG_SHA256__': record['config_sha256']}
+    rendered = artifacts['overlay'].decode('utf-8')
+    for placeholder, value in substitutions.items():
+        token = json.dumps(placeholder)
+        if rendered.count(token) != 1:
+            raise ValueError('tool_policy_invalid')
+        rendered = rendered.replace(token, json.dumps(value))
+    plugin.write_bytes(artifacts['plugin'])
+    overlay.write_text(rendered, encoding='utf-8')
+    model.write_bytes(artifacts['model'])
+    record['tool_policy_runtime_overlay_sha256'] = digest(overlay.read_bytes())
+    return model, overlay
 
 
 def resolve_reasoning_effort(reasoning_effort=None):
@@ -142,11 +242,13 @@ def locked(runtime):
 
 class Projection:
     """Whitelist state. The CLI's text events may be truncated; ignore them."""
-    def __init__(self, expected_session=None):
+    def __init__(self, expected_session=None, expected_policy=None):
         self.session_id = None
         self.expected_session = expected_session
         self.final = None
         self.error = None
+        self.expected_policy = expected_policy
+        self.tool_policy_attestation = None
 
     def feed(self, line):
         try:
@@ -168,6 +270,21 @@ class Projection:
                 self.final = text
             elif kind == 'error':
                 self.error = 'dsh_error'
+            elif kind == 'tool_policy_violation':
+                self.error = 'tool_policy_violation'
+            elif kind == 'tool_policy':
+                expected = self.expected_policy or {}
+                required = {'policy': 'none', 'version': POLICY_VERSION,
+                            'schema_count': 0, 'presentation': 'native', 'guard': 'deny_all',
+                            'plugin_sha256': expected.get('tool_policy_plugin_sha256'),
+                            'overlay_sha256': expected.get('tool_policy_overlay_sha256'),
+                            'config_sha256': expected.get('config_sha256')}
+                if (expected.get('tool_policy') != 'none' or
+                        type(event.get('version')) is not int or type(event.get('schema_count')) is not int or
+                        any(event.get(key) != value for key, value in required.items()) or
+                        not isinstance(event.get('sessionId'), str)):
+                    raise ValueError()
+                self.tool_policy_attestation = required | {'session_id': event['sessionId']}
             # thinking, text, tool inputs/results and other metadata never persist.
         except (ValueError, TypeError, UnicodeError):
             self.error = 'invalid_event'
@@ -179,6 +296,9 @@ class Projection:
             return 'process_failed'
         if self.session_id is None or self.final is None:
             return 'incomplete'
+        if (self.expected_policy or {}).get('tool_policy') == 'none':
+            if not self.tool_policy_attestation or self.tool_policy_attestation['session_id'] != self.session_id:
+                return 'tool_policy_unverified'
         return 'completed'
 
 
@@ -243,6 +363,9 @@ def run_process(argv, task, cwd, env, timeout, projection, on_session, lock_fd, 
                                     break
                                 if line:
                                     projection.feed(line)
+                                    if projection.error == 'tool_policy_violation':
+                                        reason = 'tool_policy_violation'
+                                        break
                             if len(buffer) > MAX_LINE:
                                 reason = 'event_too_large'
                                 break
@@ -297,7 +420,7 @@ def load_run(path, runtime):
 
 def run(task_path, resume, timeout, runtime=RUNTIME, executable=None, allow_incomplete=False,
         on_created=None, cwd=None, profile=None, expected_config_hash=None,
-        instance_id=instances.AUTO, reasoning_effort=None):
+        instance_id=instances.AUTO, reasoning_effort=None, tool_policy=None):
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError('invalid_timeout')
     task = Path(task_path).read_bytes()
@@ -316,9 +439,13 @@ def run(task_path, resume, timeout, runtime=RUNTIME, executable=None, allow_inco
     initial_profile = prior.get('profile', DEFAULT_PROFILE) if prior and profile is None else profile
     initial_effort = (prior.get('reasoning_effort', DEFAULT_REASONING_EFFORT)
                       if prior and reasoning_effort is None else reasoning_effort)
-    _, initial_patch = resolve_profile(initial_profile, runtime, initial_effort)
-    initial_hash = digest(initial_patch.read_bytes())
-    if expected_config_hash is not None and expected_config_hash != initial_hash:
+    initial_policy = resolve_tool_policy(prior.get('tool_policy') if prior and tool_policy is None else tool_policy)
+    if prior and initial_policy != resolve_tool_policy(prior.get('tool_policy')):
+        raise ValueError('tool_policy_mismatch')
+    initial_profile, initial_patch = resolve_profile(initial_profile, runtime, initial_effort)
+    validate_consultation_model(initial_policy, initial_profile, resolve_reasoning_effort(initial_effort))
+    initial_config, _ = execution_config(initial_patch, initial_policy)
+    if expected_config_hash is not None and expected_config_hash != initial_config['config_sha256']:
         raise ValueError('config_changed')
     instance_id = instances.prepare(runtime, instance_id)
     instance_root = instances.root(runtime, instance_id)
@@ -345,13 +472,18 @@ def run(task_path, resume, timeout, runtime=RUNTIME, executable=None, allow_inco
                 raise ValueError('reasoning_effort_mismatch')
             reasoning_effort = resolve_reasoning_effort(reasoning_effort)
             profile, patch = resolve_profile(profile, runtime, reasoning_effort)
-            patch_hash = digest(patch.read_bytes())
+            prior_policy = resolve_tool_policy(prior.get('tool_policy'))
+            tool_policy = prior_policy if tool_policy is None else resolve_tool_policy(tool_policy)
+            if tool_policy != prior_policy:
+                raise ValueError('tool_policy_mismatch')
+            config, artifacts = execution_config(patch, tool_policy)
+            validate_tool_policy(prior, config)
             cwd = resolve_cwd(prior['cwd'], instance_root, require_exists=False)
             if requested_cwd is not None and resolve_cwd(requested_cwd, instance_root) != cwd:
                 raise ValueError('cwd_mismatch')
             if prior.get('status') != 'completed' and not allow_incomplete:
                 raise ValueError('incomplete_resume_requires_review')
-            if prior.get('config_sha256') != patch_hash:
+            if prior.get('config_sha256') != config['config_sha256']:
                 raise ValueError('config_changed')
             cwd = resolve_cwd(cwd, instance_root)
             sid = prior.get('session_id')
@@ -365,12 +497,15 @@ def run(task_path, resume, timeout, runtime=RUNTIME, executable=None, allow_inco
         else:
             reasoning_effort = resolve_reasoning_effort(reasoning_effort)
             profile, patch = resolve_profile(profile, runtime, reasoning_effort)
-            patch_hash = digest(patch.read_bytes())
+            tool_policy = resolve_tool_policy(tool_policy)
+            config, artifacts = execution_config(patch, tool_policy)
             cwd = resolve_cwd(cwd, instance_root)
         # An async worker fixes the accepted profile hash; re-check it under the
         # same lock that serializes launch so a change between the worker check
         # and the actual exec cannot slip past.
-        if expected_config_hash is not None and expected_config_hash != patch_hash:
+        validate_consultation_model(tool_policy, profile, reasoning_effort)
+        if (config['config_sha256'] != initial_config['config_sha256'] or
+                expected_config_hash is not None and expected_config_hash != config['config_sha256']):
             raise ValueError('config_changed')
         home = instance_root / 'home'
         home.mkdir(exist_ok=True, mode=0o700)
@@ -380,7 +515,7 @@ def run(task_path, resume, timeout, runtime=RUNTIME, executable=None, allow_inco
         record = {'status': 'running', 'started': now(), 'session_id': sid,
                   'cwd': str(cwd.resolve()), 'profile': profile, 'patch': patch.name,
                   'reasoning_effort': reasoning_effort,
-                  'config_sha256': patch_hash,
+                  **config,
                   'task_sha256': digest(task), 'source_before_seq': before_seq,
                   'resume_from': str(resume) if resume else None}
         # One logical task, including children and continuation turns, shares a
@@ -389,30 +524,41 @@ def run(task_path, resume, timeout, runtime=RUNTIME, executable=None, allow_inco
                                       if prior else dest.name)
         if instance_id is not None:
             record['instance_id'] = instance_id
+        launch_patch, policy_overlay = patch, None
+        if tool_policy == 'none':
+            launch_patch, policy_overlay = snapshot_tool_policy(dest, artifacts, record)
         write_json(dest / 'result.json', record)
         print(json.dumps({'run_dir': str(dest), 'status': 'running'}), flush=True)
         if on_created:
             on_created(dest)
-        projection = Projection(sid)
+        projection = Projection(sid, config)
         def on_session(value):
             record['session_id'] = value
             write_json(dest / 'result.json', record)
         def on_start(pid):
             record['child_pid'] = pid
             write_json(dest / 'result.json', record)
-        argv = [executable, 'headless', '--patch', str(patch), '--json']
+        argv = [executable, 'headless', '--patch', str(launch_patch)]
+        if policy_overlay is not None:
+            argv.extend(['--patch', str(policy_overlay)])
+        argv.append('--json')
         if sid:
             argv.extend(['--session-id', sid])
         env = execution_env(executable)
         env['DSH_HOME'] = str(home)
         env['DSH_RESEARCH_RUN_ID'] = record['research_task_id']
         env['DSH_RESEARCH_PROFILE'] = profile
+        if tool_policy == 'none':
+            env['DSH_TOOLS_MODE'] = 'native'
+            env['DSH_TELEMETRY_DISABLED'] = '1'
         try:
             status, code = run_process(argv, task, cwd, env, timeout, projection, on_session,
                                        lock_fds, on_start)
         except OSError:
             status, code = 'launch_failed', None
         record.update(status=status, returncode=code, ended=now())
+        if projection.tool_policy_attestation is not None:
+            record['tool_policy_attestation'] = projection.tool_policy_attestation
         if status == 'completed':
             (dest / 'response.md').write_text(projection.final, encoding='utf-8')
             record['response_sha256'] = digest(projection.final.encode())
@@ -536,6 +682,8 @@ def main():
     call.add_argument('--profile', help='Fixed subscription: opencode-go (default), happy2 or happy1')
     call.add_argument('--reasoning-effort', choices=REASONING_EFFORTS,
                       help='Task reasoning effort: high by default; inherit on resume')
+    call.add_argument('--tool-policy', choices=TOOL_POLICIES,
+                      help='none: Go/High text consultation with no model tools; inherit on resume')
     export = sub.add_parser('export')
     export.add_argument('--run', required=True)
     args = parser.parse_args()
@@ -568,7 +716,8 @@ def main():
                 raise ValueError('resume_required')
             _, status = run(args.task, args.resume, args.timeout,
                             allow_incomplete=args.resume_incomplete, cwd=args.cwd,
-                            profile=args.profile, reasoning_effort=args.reasoning_effort)
+                            profile=args.profile, reasoning_effort=args.reasoning_effort,
+                            tool_policy=args.tool_policy)
             return 0 if status == 'completed' else 1
         export_run(args.run)
         return 0
