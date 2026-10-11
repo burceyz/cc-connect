@@ -5,18 +5,23 @@ recovery repair together with the Antigravity adapter. These are exact source
 copies for the existing `cc-dsh-collaboration` workspace integration, not a
 standalone review service or a default CC Connect installation.
 
-Install the four files under `scripts/` into the existing workspace's
+Install the files under `scripts/` into the existing workspace's
 `skills/cc-dsh-collaboration/scripts/` directory, keeping the surrounding
-`instances`, `jobs`, `ipc`, `peer_ipc`, and notification modules and the review
+`instances`, `jobs`, `peer_ipc`, and notification modules and the review
 protocol reference. The bridge retains that integration's fixed workspace and
 private runtime configuration. Credentials, provider configuration, conversation
 data, task receipts, and native logs are deliberately absent from this source
 distribution.
 
-The adapter and these scripts must be deployed together: the adapter now uses
+The adapter and review gate must be deployed together: the adapter now uses
 the gate's `bind`, `refresh`, and `finalize` operations. Back up the installed
 binary and scripts before switching a running service. Only the dedicated
 Dorothy service needs restarting.
+
+The callback-only repair in `ipc.py` works with the existing receiver. It does
+not require a service restart. New callback workers load the fixed client;
+existing workers require an explicit, ownership-checked recovery. See
+[callback recovery](IPC-RECOVERY.md) for receipt evidence and retry boundaries.
 
 Validate from the existing integration's script directory (or an isolated copy
 with its existing support modules):
