@@ -29,9 +29,14 @@ The adapter creates a host-managed hooks/MCP overlay and exposes only the
 `cc_communication` server. CLI 1.3.3 uses `call_mcp_tool` with a server and tool
 name; both are checked. Its lazy schema reads are limited to the eight known
 tool JSON files in the dedicated native cache, including canonical-path and
-symlink checks. `search_web`, `read_url_content`, and `view_content_chunk` remain
-available; web reads reject file URLs, embedded credentials, and literal local
-or private control endpoints.
+symlink checks. `search_web` and `read_url_content` remain available; web reads
+reject file URLs, embedded credentials, and literal local or private control
+endpoints. CLI 1.3.3 returns a `content.md` cache path from `read_url_content`.
+Use `view_file` on that exact path to read the body. The host registers only
+successful web-tool outputs from the current conversation, checks the body hash
+on every read, and rejects other files or symlink escapes. Fetch the URL again
+after a host restart. A cache can still contain truncated source content; check
+the actual body before claiming that a page has been fully read.
 
 The initial OAuth file is copied only when absent to
 `<communication_runtime_dir>/antigravity-cli/antigravity-oauth-token`. Native
