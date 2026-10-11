@@ -390,7 +390,7 @@ def main():
     p.add_argument('--profile', choices=bridge.PROFILE_PATCHES)
     p.add_argument('--reasoning-effort', choices=bridge.REASONING_EFFORTS)
     p.add_argument('--tool-policy', choices=bridge.TOOL_POLICIES,
-                   help='none: Go/High text consultation with no model tools')
+                   help='none: Go/High text only; research: Go/High public search and fetch')
     p.add_argument('--delivery', choices=ipc.DELIVERIES,
                    help='notify (default) or return to the originating CC Connect conversation')
     for name in ['status', 'result']:

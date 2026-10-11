@@ -61,10 +61,11 @@ It does not expose a general HTTP, socket, shell, file, contact-registration,
 or target-rebinding interface. The host must deny those native model tools;
 this program is not an operating-system sandbox by itself.
 
-Install `communication.py` and the companion `ipc.py` in the existing integration's
-scripts directory. The installation also needs the consultation implementation
-of `jobs.submit(..., tool_policy='none')` when consultation is enabled. That
-implementation, rather than a prompt alone, enforces the zero-tool policy.
+Install the companion `communication.py`, `ipc.py`, `bridge.py`, `jobs.py`, and
+both consultation/research policy `.mjs` and `.patch.yml` files in the existing
+integration's scripts directory. Consultation uses the fixed `none` or `research`
+tool policy supported by `jobs.submit`; the host chooses from these modes,
+never from a caller-supplied policy path. The native guard enforces each policy.
 Enabling consultation requires the policy-verification helpers and the
 `tool_policy` submission parameter; an older integration fails closed.
 
@@ -128,8 +129,36 @@ Optional material IDs map to objects containing `path` and `sha256`. Paths must
 point to controlled text copies under `work_dir/materials/`; the backend checks
 their original bytes before freezing them. The model can supply only material
 IDs. A consultation embeds the question and complete selected text in a data
-section, uses Go / High with `tool_policy='none'`, and requests no subagents.
-Operational or code-implementation requests are directed to Atlas.
+section and uses Go / High. Its optional `mode` selects `text` (the default,
+`tool_policy='none'`) or `research` (`tool_policy='research'`). Explicit `text`
+preserves legacy operation IDs and task bytes; old records without a mode remain
+text consultations. Neither mode permits subagents or repository operations.
+
+Research exposes only `mcp__duckduckgo__search`, native `web_fetch`, and any
+available four fixed `mcp__research_status__status_*` tools. Search and fetch
+must be present; a missing status server does not prevent research. All other
+MCP, file, shell, runtime-loader, attachment and automatic workspace readers are
+disabled. The host checks the exact tool definitions and assembled schemas,
+including scope-local shadows and later changes, and installs a monotonic
+execution guard. A changed tool generation fails closed; it cannot widen a
+running consultation. The native proof binds the actual tool names to the
+accepted model/plugin/overlay hashes and session before a result can complete.
+
+The fetch interface accepts ordinary public HTTP(S) domain URLs, without
+credentials, IP literals, local hostnames or alternate ports. The native HTTP
+backend also bounds responses and validates redirects. Its configured proxy
+performs domain resolution on the proxy path; direct requests validate and pin
+public DNS results. Research does not disable those checks or change the normal
+Hermes profiles. Search snippets, retrieved pages and supplied text are data,
+and the task asks Hermes to distinguish them, cite sources and keep disagreements.
+
+Dorothy can request an independent search, compare the returned evidence with
+her own, and send the resulting material to the original Atlas requester or an
+appropriate configured contact. Atlas selects the authorized destination and,
+where the existing repository workflow delegates ingestion, passes the material
+to Hermes. The research interface exposes no repository selector, arbitrary
+job launcher or filesystem access. A request for research does not itself
+authorize writing a repository.
 
 ## Request and result
 
@@ -166,7 +195,7 @@ The fixed tool names are:
 - `read_message(event_id)`
 - `message_status(event_id)`
 - `ack_message(event_id)`
-- `consult_hermes(question, material_ids?)`, only when enabled
+- `consult_hermes(question, material_ids?, mode?)`, only when enabled
 - `consultation_result(job_id)`, only when enabled
 
 Each schema rejects additional fields. Message/question text is limited to
@@ -182,7 +211,7 @@ the number or target to obtain a fresh POST. Identical pre-send partial records
 may be recovered by the existing peer implementation. Source, body and input
 hash checks remain in force.
 
-Consultations use one fixed job per source/scope/question/material-ID set.
+Consultations use one fixed job per source/scope/question/material-ID set/mode.
 Capacity exhaustion returns `busy`, without a queue or automatic retry. A
 repeated busy operation remains busy; a new user operation has a new scope.
 Unknown submissions are queried under the original job ID and never resubmitted.
@@ -197,10 +226,14 @@ Run deterministic validation in an isolated integration containing its existing
 support modules:
 
 ```text
-python3 -B -m unittest test_communication test_ipc
+python3 -B -m unittest test_communication test_consultation test_ipc
 ```
 
 The communication tests use real temporary peer outboxes and mock transport,
 watchers and model-job submission, plus bounded concurrent identity checks.
 The IPC tests include local fixture sockets
 and fresh subprocess imports; they do not call the real host or a model.
+The consultation tests also exercise the installed DSH registry, schema assembly,
+and headless startup with an offline stop before the model/network boundary.
+Deployments must additionally verify a real research request, its native search
+and page-reading events, the original-session callback and released processes.

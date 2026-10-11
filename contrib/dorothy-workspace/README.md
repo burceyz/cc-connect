@@ -24,9 +24,11 @@ global hooks into that runtime.
 
 Back up the installed binary, selected scripts and private configuration before
 switching the dedicated Dorothy service. Preserve the existing support modules
-and unrelated running jobs. Consultation sets `tool_policy='none'` only for that
-explicit request; ordinary Hermes tasks and global provider settings keep their
-existing capabilities.
+and unrelated running jobs. Consultation uses `tool_policy='none'` for text and
+`tool_policy='research'` for optional public search and page reading. Each policy
+has separate frozen host artifacts; ordinary Hermes tasks and global provider
+settings keep their existing capabilities. Dorothy hands material to Atlas for
+authorized repository ingestion; consultation never grants repository access.
 
 The callback-only repair in `ipc.py` works with the existing receiver. It does
 not require a service restart. New callback workers load the fixed client;
@@ -37,7 +39,7 @@ Validate from the existing integration's script directory (or an isolated copy
 with its existing support modules):
 
 ```sh
-python3 -B -m unittest test_bridge test_dorothy_review test_ipc test_peer_ipc test_communication
+python3 -B -m unittest test_bridge test_dorothy_review test_ipc test_peer_ipc test_communication test_consultation
 ```
 
 These tests exercise protocol and recovery behavior with external boundaries

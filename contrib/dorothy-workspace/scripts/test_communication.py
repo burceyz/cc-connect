@@ -446,6 +446,51 @@ class CommunicationTests(unittest.TestCase):
         self.call('consult_hermes', {'question': '问题', 'path': '/private/secret'}, error=True)
         self.jobs.submit.assert_not_called()
 
+    def test_research_mode_is_bound_to_its_own_request_and_callback(self):
+        self.policy['enable_consultation'] = True
+        arguments = {'question': '独立搜索公开资料，核对原文并列出来源。', 'mode': 'research'}
+        first = self.call('consult_hermes', arguments)
+        self.assertEqual(first['status'], 'accepted')
+        call = self.jobs.submit.call_args
+        self.assertEqual((call.kwargs['profile'], call.kwargs['reasoning_effort'],
+                          call.kwargs['tool_policy']), ('opencode-go', 'high', 'research'))
+        self.assertEqual(call.kwargs['callback_target'], self.source)
+        task = call.args[0].read_text()
+        self.assertIn('独立搜索', task)
+        self.assertIn('来源', task)
+        self.assertIn('需要转交 Atlas', task)
+        self.assertNotIn('本次不开放工具', task)
+        self.assertEqual(self.call('consult_hermes', arguments)['job_id'], first['job_id'])
+        self.jobs.submit.assert_called_once()
+        self.completed(first['job_id'])
+        self.assertTrue(self.call('consultation_result', {'job_id': first['job_id']})['processes_released'])
+        path = self.dsh / 'jobs' / first['job_id'] / 'request.json'
+        request = json.loads(path.read_text())
+        request['tool_policy'] = 'none'
+        ipc.write_state(path, request)
+        self.assertEqual(self.call('consultation_result', {'job_id': first['job_id']}, error=True)['code'],
+                         'consultation_request_mismatch')
+
+    def test_explicit_text_mode_preserves_existing_id_and_research_is_distinct(self):
+        self.policy['enable_consultation'] = True
+        original = self.call('consult_hermes', {'question': '问题'})
+        explicit = self.call('consult_hermes', {'question': '问题', 'mode': 'text'})
+        self.assertEqual(explicit['job_id'], original['job_id'])
+        self.jobs.submit.assert_called_once()
+        research = self.call('consult_hermes', {'question': '问题', 'mode': 'research'})
+        self.assertNotEqual(research['job_id'], original['job_id'])
+
+    def test_consultation_mode_never_accepts_arbitrary_policy_or_execution_parameters(self):
+        self.policy['enable_consultation'] = True
+        for mode in ['default', 'shell', '/tmp/policy', None, [], True]:
+            with self.subTest(mode=mode):
+                self.assertEqual(self.call('consult_hermes', {'question': '问题', 'mode': mode}, error=True)['code'],
+                                 'consultation_mode_invalid')
+        for key in ['cwd', 'tool_policy', 'profile', 'command', 'repository']:
+            with self.subTest(key=key):
+                self.call('consult_hermes', {'question': '问题', 'mode': 'research', key: '/private/data'}, error=True)
+        self.jobs.submit.assert_not_called()
+
     def test_busy_consultation_never_queues_or_retries_its_operation(self):
         self.policy['enable_consultation'] = True
         self.capacity.return_value = 'capacity_busy'
@@ -497,13 +542,13 @@ class CommunicationTests(unittest.TestCase):
         self.jobs.result.return_value = {'response': '"\\\t' * 140000}
         self.assertEqual(self.call('consultation_result', {'job_id': job}, error=True)['code'], 'result_too_large')
 
-    def real_completed_job(self):
+    def real_completed_job(self, mode='text'):
         """Native job/receipt/run shape; no worker, transport or model is started."""
         self.policy['enable_consultation'] = True
-        job_id = self.call('consult_hermes', {'question': '问题'})['job_id']
+        job_id = self.call('consult_hermes', {'question': '问题', 'mode': mode})['job_id']
         directory = self.dsh / 'jobs' / job_id
         request = json.loads((directory / 'request.json').read_text())
-        policy = {'tool_policy': 'none', 'tool_policy_version': 1,
+        policy = {'tool_policy': communication.CONSULTATION_MODES[mode], 'tool_policy_version': 1,
                   'model_config_sha256': communication.digest(b'fixture model'),
                   'tool_policy_plugin_sha256': communication.digest(b'fixture plugin'),
                   'tool_policy_overlay_sha256': communication.digest(b'fixture overlay')}
@@ -528,6 +573,9 @@ class CommunicationTests(unittest.TestCase):
             'policy': 'none', 'version': 1, 'schema_count': 0, 'presentation': 'native', 'guard': 'deny_all',
             'plugin_sha256': policy['tool_policy_plugin_sha256'], 'overlay_sha256': policy['tool_policy_overlay_sha256'],
             'config_sha256': policy['config_sha256'], 'session_id': run['session_id']}
+        if mode == 'research':
+            run['tool_policy_attestation'].update(policy='research', schema_count=2,
+                tools=['mcp__duckduckgo__search', 'web_fetch'], guard='allow_research_only')
         record = {**request, 'job_id': job_id, 'status': 'completed', 'callback': ipc.PROTOCOL,
                   'run_dir': str(run_dir), 'worker_pid': 2147483647}
         ipc.write_state(run_dir / 'result.json', run)
@@ -551,6 +599,17 @@ class CommunicationTests(unittest.TestCase):
         self.assertEqual(result, {'job_id': job_id, 'status': 'completed',
                                  'text': '实际 jobs.result 校验过的咨询结论。', 'processes_released': True})
         self.jobs.result.assert_not_called()
+
+    def test_research_callback_uses_owned_tool_result_instead_of_host_file_paths(self):
+        job_id, directory, request, record, _, _ = self.real_completed_job('research')
+        callback = ipc.build_input(directory, request, record)
+        self.assertEqual(callback['target'], self.source['target'])
+        self.assertIn('consultation_result', callback['prompt'])
+        self.assertNotIn(str(self.root), callback['prompt'])
+        with patch.object(jobs, 'pid_probe', return_value='absent'):
+            result = self.call('consultation_result', {'job_id': job_id})
+        self.assertTrue(result['processes_released'])
+        self.assertEqual(result['text'], '实际 jobs.result 校验过的咨询结论。')
 
     @unittest.skipUnless(callable(getattr(bridge, 'tool_policy_record', None)), 'requires companion zero-tool integration')
     def test_real_result_rejects_unproven_policy_and_modified_answer(self):

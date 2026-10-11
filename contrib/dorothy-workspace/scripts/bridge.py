@@ -36,10 +36,16 @@ MAX_PROFILE_PATCHES = {DEFAULT_PROFILE: 'opencode-go-max.patch.yml',
 # Friendly workspace profile names need not match the native provider route.
 PROFILE_PROVIDERS = {DEFAULT_PROFILE: DEFAULT_PROFILE, 'happy2': 'happy2', 'happy1': 'happy'}
 MAX_LINE = 16 * 1024 * 1024
-TOOL_POLICIES = ('default', 'none')
+TOOL_POLICIES = ('default', 'none', 'research')
 POLICY_VERSION = 1
 POLICY_PLUGIN = Path(__file__).resolve().with_name('consultation-policy.mjs')
 POLICY_OVERLAY = Path(__file__).resolve().with_name('consultation-policy.patch.yml')
+RESEARCH_PLUGIN = Path(__file__).resolve().with_name('research-policy.mjs')
+RESEARCH_OVERLAY = Path(__file__).resolve().with_name('research-policy.patch.yml')
+RESEARCH_REQUIRED_TOOLS = ('mcp__duckduckgo__search', 'web_fetch')
+RESEARCH_ALLOWED_TOOLS = RESEARCH_REQUIRED_TOOLS + tuple(
+    'mcp__research_status__' + name for name in
+    ('status_read', 'status_report', 'status_claim_probe', 'status_complete_probe'))
 POLICY_HASH_FIELDS = ('model_config_sha256', 'tool_policy_plugin_sha256',
                       'tool_policy_overlay_sha256')
 
@@ -60,7 +66,7 @@ def tool_policy_record(record):
     """Validate a receipt's policy binding without reading today's deployment."""
     policy = resolve_tool_policy(record.get('tool_policy'))
     result = {'tool_policy': policy}
-    if policy == 'none':
+    if policy != 'default':
         if type(record.get('tool_policy_version')) is not int or record['tool_policy_version'] != POLICY_VERSION:
             raise ValueError('tool_policy_invalid')
         result['tool_policy_version'] = POLICY_VERSION
@@ -81,16 +87,33 @@ def validate_tool_policy(record, expected):
         raise ValueError('tool_policy_mismatch')
 
 
-def validate_tool_policy_attestation(record):
-    """A successful consultation must have the native plugin's request proof."""
-    if tool_policy_record(record)['tool_policy'] != 'none':
-        return
-    proof = record.get('tool_policy_attestation')
-    expected = {'policy': 'none', 'version': POLICY_VERSION, 'schema_count': 0,
+def attestation_fields(record, tools=None):
+    """The fixed host policies define which native tool surfaces may be proved."""
+    policy = resolve_tool_policy(record.get('tool_policy'))
+    if policy not in ('none', 'research'):
+        raise ValueError('tool_policy_unverified')
+    expected = {'policy': policy, 'version': POLICY_VERSION, 'schema_count': 0,
                 'presentation': 'native', 'guard': 'deny_all',
                 'plugin_sha256': record['tool_policy_plugin_sha256'],
                 'overlay_sha256': record['tool_policy_overlay_sha256'],
-                'config_sha256': record['config_sha256'], 'session_id': record.get('session_id')}
+                'config_sha256': record['config_sha256']}
+    if policy == 'research':
+        if (not isinstance(tools, list) or any(not isinstance(name, str) for name in tools) or
+                tools != sorted(set(tools)) or not set(RESEARCH_REQUIRED_TOOLS).issubset(tools) or
+                set(tools) - set(RESEARCH_ALLOWED_TOOLS)):
+            raise ValueError('tool_policy_unverified')
+        expected.update(schema_count=len(tools), guard='allow_research_only', tools=tools)
+    return expected
+
+
+def validate_tool_policy_attestation(record):
+    """A successful consultation must have the native plugin's request proof."""
+    if tool_policy_record(record)['tool_policy'] == 'default':
+        return
+    proof = record.get('tool_policy_attestation')
+    if not isinstance(proof, dict):
+        raise ValueError('tool_policy_unverified')
+    expected = attestation_fields(record, proof.get('tools')) | {'session_id': record.get('session_id')}
     if (not isinstance(proof, dict) or proof != expected or
             type(proof.get('version')) is not int or type(proof.get('schema_count')) is not int):
         raise ValueError('tool_policy_unverified')
@@ -101,8 +124,10 @@ def execution_config(patch, tool_policy=None):
     policy = resolve_tool_policy(tool_policy)
     artifacts = {'model': patch.read_bytes()}
     record = {'tool_policy': policy, 'config_sha256': digest(artifacts['model'])}
-    if policy == 'none':
-        for label, path in [('plugin', POLICY_PLUGIN), ('overlay', POLICY_OVERLAY)]:
+    if policy != 'default':
+        plugin, overlay = ((POLICY_PLUGIN, POLICY_OVERLAY) if policy == 'none' else
+                           (RESEARCH_PLUGIN, RESEARCH_OVERLAY))
+        for label, path in [('plugin', plugin), ('overlay', overlay)]:
             if path.is_symlink() or not path.is_file():
                 raise ValueError('tool_policy_unavailable')
             artifacts[label] = path.read_bytes()
@@ -116,7 +141,7 @@ def execution_config(patch, tool_policy=None):
 
 
 def validate_consultation_model(tool_policy, profile, reasoning_effort):
-    if tool_policy == 'none' and (profile != DEFAULT_PROFILE or reasoning_effort != DEFAULT_REASONING_EFFORT):
+    if tool_policy in ('none', 'research') and (profile != DEFAULT_PROFILE or reasoning_effort != DEFAULT_REASONING_EFFORT):
         raise ValueError('consultation_model_mismatch')
 
 
@@ -274,13 +299,8 @@ class Projection:
                 self.error = 'tool_policy_violation'
             elif kind == 'tool_policy':
                 expected = self.expected_policy or {}
-                required = {'policy': 'none', 'version': POLICY_VERSION,
-                            'schema_count': 0, 'presentation': 'native', 'guard': 'deny_all',
-                            'plugin_sha256': expected.get('tool_policy_plugin_sha256'),
-                            'overlay_sha256': expected.get('tool_policy_overlay_sha256'),
-                            'config_sha256': expected.get('config_sha256')}
-                if (expected.get('tool_policy') != 'none' or
-                        type(event.get('version')) is not int or type(event.get('schema_count')) is not int or
+                required = attestation_fields(expected, event.get('tools'))
+                if (type(event.get('version')) is not int or type(event.get('schema_count')) is not int or
                         any(event.get(key) != value for key, value in required.items()) or
                         not isinstance(event.get('sessionId'), str)):
                     raise ValueError()
@@ -296,7 +316,7 @@ class Projection:
             return 'process_failed'
         if self.session_id is None or self.final is None:
             return 'incomplete'
-        if (self.expected_policy or {}).get('tool_policy') == 'none':
+        if (self.expected_policy or {}).get('tool_policy') in ('none', 'research'):
             if not self.tool_policy_attestation or self.tool_policy_attestation['session_id'] != self.session_id:
                 return 'tool_policy_unverified'
         return 'completed'
@@ -525,7 +545,7 @@ def run(task_path, resume, timeout, runtime=RUNTIME, executable=None, allow_inco
         if instance_id is not None:
             record['instance_id'] = instance_id
         launch_patch, policy_overlay = patch, None
-        if tool_policy == 'none':
+        if tool_policy != 'default':
             launch_patch, policy_overlay = snapshot_tool_policy(dest, artifacts, record)
         write_json(dest / 'result.json', record)
         print(json.dumps({'run_dir': str(dest), 'status': 'running'}), flush=True)
@@ -548,7 +568,7 @@ def run(task_path, resume, timeout, runtime=RUNTIME, executable=None, allow_inco
         env['DSH_HOME'] = str(home)
         env['DSH_RESEARCH_RUN_ID'] = record['research_task_id']
         env['DSH_RESEARCH_PROFILE'] = profile
-        if tool_policy == 'none':
+        if tool_policy != 'default':
             env['DSH_TOOLS_MODE'] = 'native'
             env['DSH_TELEMETRY_DISABLED'] = '1'
         try:
@@ -683,7 +703,7 @@ def main():
     call.add_argument('--reasoning-effort', choices=REASONING_EFFORTS,
                       help='Task reasoning effort: high by default; inherit on resume')
     call.add_argument('--tool-policy', choices=TOOL_POLICIES,
-                      help='none: Go/High text consultation with no model tools; inherit on resume')
+                      help='none: Go/High text only; research: Go/High public search and fetch; inherit on resume')
     export = sub.add_parser('export')
     export.add_argument('--run', required=True)
     args = parser.parse_args()

@@ -301,7 +301,7 @@ def build_input(dest, request, record):
     seed = json.dumps({'job_dir': str(dest.resolve()), 'task_sha256': request['task_sha256'],
                        'target': binding['target']}, sort_keys=True).encode('utf-8')
     event = bridge.digest(seed)
-    if request.get('tool_policy') == 'none' and re.fullmatch(r'dorothy-consult-[0-9a-f]{48}', dest.name):
+    if request.get('tool_policy') in ('none', 'research') and re.fullmatch(r'dorothy-consult-[0-9a-f]{48}', dest.name):
         prompt = '\n'.join([
             '【Hermes（DSH）按需咨询回传｜本机程序生成的结束事件】',
             '任务编号：' + dest.name, '执行状态：' + record['status'], '事件编号：' + event,

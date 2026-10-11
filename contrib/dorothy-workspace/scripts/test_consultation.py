@@ -278,18 +278,113 @@ class ConsultationTests(unittest.TestCase):
         self.assertFalse((self.runtime / 'runs').exists())
 
     def test_cli_propagates_tool_policy(self):
-        with patch.object(bridge, 'run', return_value=(None, 'completed')) as call, \
-                patch.object(sys, 'argv', ['bridge.py', 'run', '--task', str(self.task), '--tool-policy', 'none']):
-            self.assertEqual(bridge.main(), 0)
-        self.assertEqual(call.call_args.kwargs['tool_policy'], 'none')
-        with patch.object(jobs, 'submit', return_value={}) as call, redirect_stdout(io.StringIO()), \
-                patch.object(sys, 'argv', ['jobs.py', 'submit', '--task', str(self.task), '--tool-policy', 'none']):
-            self.assertEqual(jobs.main(), 0)
-        self.assertEqual(call.call_args.kwargs['tool_policy'], 'none')
+        for policy in ('none', 'research'):
+            with self.subTest(policy=policy):
+                with patch.object(bridge, 'run', return_value=(None, 'completed')) as call, \
+                        patch.object(sys, 'argv', ['bridge.py', 'run', '--task', str(self.task), '--tool-policy', policy]):
+                    self.assertEqual(bridge.main(), 0)
+                self.assertEqual(call.call_args.kwargs['tool_policy'], policy)
+                with patch.object(jobs, 'submit', return_value={}) as call, redirect_stdout(io.StringIO()), \
+                        patch.object(sys, 'argv', ['jobs.py', 'submit', '--task', str(self.task), '--tool-policy', policy]):
+                    self.assertEqual(jobs.main(), 0)
+                self.assertEqual(call.call_args.kwargs['tool_policy'], policy)
+
+    def test_research_policy_uses_separate_frozen_artifacts_and_verified_tools(self):
+        self.enable_research_fake()
+        dest, status, record = self.run_policy('research')
+        self.assertEqual(status, 'completed')
+        bridge.validate_tool_policy_attestation(record)
+        self.assertEqual((dest / 'consultation-policy.mjs').read_bytes(), bridge.RESEARCH_PLUGIN.read_bytes())
+        self.assertNotEqual(record['tool_policy_plugin_sha256'], bridge.digest(bridge.POLICY_PLUGIN.read_bytes()))
+        proof = record['tool_policy_attestation']
+        names = ['mcp__duckduckgo__search', 'web_fetch']
+        self.assertEqual(proof['tools'], names)
+        for bad in [[], ['web_fetch'], ['mcp__duckduckgo__search', 'shell'], names + names,
+                    names + ['mcp__duckduckgo__fetch_content']]:
+            with self.subTest(tools=bad):
+                forged = record | {'tool_policy_attestation': proof | {'tools': bad, 'schema_count': len(bad)}}
+                with self.assertRaisesRegex(ValueError, 'tool_policy_unverified'):
+                    bridge.validate_tool_policy_attestation(forged)
+        with self.assertRaisesRegex(ValueError, 'tool_policy_mismatch'):
+            self.run_policy('none', dest)
+
+    def enable_research_fake(self):
+        names = ['mcp__duckduckgo__search', 'web_fetch']
+        self.fake.write_text('#!' + sys.executable + '\n' + FAKE.replace(
+            "if record.get('tool_policy') == 'none':", "if record.get('tool_policy') == 'research':").replace(
+            "'policy': 'none'", "'policy': 'research'").replace(
+            "'schema_count': 0", "'schema_count': 2, 'tools': " + repr(names)).replace(
+            "'guard': 'deny_all'", "'guard': 'allow_research_only'"))
+    def test_async_research_reuse_and_result_keep_the_accepted_policy(self):
+        self.enable_research_fake()
+        accepted = self.submit(tool_policy='research')
+        self.assertEqual(self.finished()['status'], 'completed')
+        self.assertEqual(accepted['tool_policy'], 'research')
+        self.assertTrue(self.submit()['reused'])
+        with self.assertRaisesRegex(ValueError, 'job_id_conflict'):
+            self.submit(tool_policy='none')
+        result = jobs.result('consult', self.runtime)
+        run_path = Path(result['run_dir']) / 'result.json'
+        record = json.loads(run_path.read_text())
+        record['tool_policy_attestation']['tools'] = ['mcp__duckduckgo__search', 'shell']
+        bridge.write_json(run_path, record)
+        with self.assertRaisesRegex(ValueError, 'tool_policy_unverified'):
+            jobs.result('consult', self.runtime)
+
+    def test_research_resume_inherits_and_binds_both_policy_artifacts(self):
+        self.enable_research_fake()
+        plugin = self.root / 'research.mjs'
+        overlay = self.root / 'research.yml'
+        shutil.copyfile(bridge.RESEARCH_PLUGIN, plugin)
+        shutil.copyfile(bridge.RESEARCH_OVERLAY, overlay)
+        with patch.object(bridge, 'RESEARCH_PLUGIN', plugin), patch.object(bridge, 'RESEARCH_OVERLAY', overlay):
+            dest, _, record = self.run_policy('research')
+            rows = [{'id': record['session_id'], 'cwd': record['cwd'], 'seq': 0}]
+            with patch.object(bridge, 'session_rows', return_value=(None, rows)):
+                _, status, resumed = self.run_policy(None, dest)
+            self.assertEqual(status, 'completed')
+            self.assertEqual(resumed['tool_policy'], 'research')
+            for artifact in (plugin, overlay):
+                before = artifact.read_bytes()
+                artifact.write_bytes(before + b'\n')
+                with self.assertRaisesRegex(ValueError, 'tool_policy_mismatch|config_changed'):
+                    self.run_policy(None, dest)
+                artifact.write_bytes(before)
+    def test_research_requires_native_proof_and_fixed_model_before_success(self):
+        _, status, record = self.run_policy('research')
+        self.assertEqual(status, 'tool_policy_unverified')
+        self.assertNotIn('response_sha256', record)
+        for kwargs in [{'profile': 'happy2'}, {'reasoning_effort': 'max'}]:
+            with self.subTest(kwargs=kwargs):
+                for name in ['happy2-high.patch.yml', 'opencode-go-max.patch.yml']:
+                    (self.runtime / name).write_text('fixture')
+                with self.assertRaisesRegex(ValueError, 'consultation_model_mismatch'):
+                    self.run_policy('research', **kwargs)
 
 
 class NativeConsultationTests(unittest.TestCase):
+    def test_native_research_tool_scope_and_arguments(self):
+        try:
+            executable = bridge.binary()
+        except ValueError:
+            self.skipTest('DSH is not installed')
+        root = Path(executable).resolve().parent.parent
+        node = shutil.which('node', path=bridge.execution_env(executable)['PATH'])
+        self.assertIsNotNone(node)
+        result = subprocess.run([node, str(Path(__file__).with_name('test_research_policy.mjs')), str(root)],
+                                cwd=Path(__file__).parent, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout.splitlines()[-1]),
+                         {'fixture': 'native_research', 'allowed_tool_bodies': 3,
+                          'rejected_tool_bodies': 0, 'network_requests': 0})
+
     def test_native_headless_boot_stops_before_the_model_boundary(self):
+        self.native_headless_boot('none')
+
+    def test_native_research_headless_boot_stops_before_the_model_boundary(self):
+        self.native_headless_boot('research')
+
+    def native_headless_boot(self, tool_policy):
         try:
             executable = bridge.binary()
         except ValueError:
@@ -314,14 +409,19 @@ class NativeConsultationTests(unittest.TestCase):
                 {'insert': [{'id': name, 'name': '@deepseek-ai/dsh-mcp-client'} for name in
                     ['mcp-research-status', 'mcp-context7', 'mcp-deepwiki', 'mcp-tavily', 'mcp-duckduckgo']]},
             ]))
-            config, artifacts = bridge.execution_config(model, 'none')
+            config, artifacts = bridge.execution_config(model, tool_policy)
             launch_model, overlay = bridge.snapshot_tool_policy(root, artifacts, config)
             fixture = root / 'stop.patch.yml'
-            fixture.write_text(json.dumps([
+            entries = [
                 {'id': 'headless-runner', 'inject': ['headlessStartup', 'consultationPolicy',
                                                     'consultationFixtureStop']},
                 {'insert': [{'id': 'consultation-offline-stop', 'name': str(stopper)}]},
-            ]))
+            ]
+            if tool_policy == 'research':
+                entries += [{'id': name, 'disabled': True} for name in ['mcp-research-status', 'mcp-duckduckgo']]
+                entries += [{'insert': [{'id': 'research-fixture-tools',
+                    'name': str(Path(__file__).with_name('test_research_tools.mjs').resolve())}]}]
+            fixture.write_text(json.dumps(entries))
             # Block all network at Node startup, then terminate in the request
             # waterfall after policy proof and before provider preparation.
             env.update(DSH_HOME=str(root / 'home'), DSH_TELEMETRY_DISABLED='1', DSH_TOOLS_MODE='ptc')
@@ -334,9 +434,10 @@ class NativeConsultationTests(unittest.TestCase):
             proofs = [event for event in events if event.get('type') == 'tool_policy']
             self.assertEqual(len(proofs), 1, result.stderr + result.stdout)
             self.assertEqual(proofs[0]['config_sha256'], config['config_sha256'])
+            self.assertEqual(proofs[0]['policy'], tool_policy)
             stops = [event for event in events if event.get('type') == 'offline_fixture_stop']
             self.assertEqual(stops, [{'type': 'offline_fixture_stop', 'provider': 'opencode-go',
-                'model': 'deepseek-v4.1-flash', 'reasoning_effort': 'high', 'schema_count': 0,
+                'model': 'deepseek-v4.1-flash', 'reasoning_effort': 'high', 'schema_count': 2 if tool_policy == 'research' else 0,
                 'network_attempts': 0}])
 
     def test_native_overlay_composes_and_disables_automatic_readers_and_mcp(self):
