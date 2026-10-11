@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -106,6 +107,8 @@ func TestAgyReviewRecoveryGateHelper(t *testing.T) {
 		}
 		response.Revision, response.CandidateSHA256 = fixture.Revision, fixture.CandidateSHA256
 		response.ManifestSHA256, response.CandidatePath = fixture.ManifestSHA256, fixture.CandidatePath
+		response.Instructions = "TEST: read task " + taskID + " revision " + fixture.Revision +
+			"; preserve the frozen candidate after review."
 	}
 	switch request.Op {
 	case "begin":
@@ -396,5 +399,102 @@ func TestAgyReviewRecovery_UnknownSubmissionNeverResubmitsOrRepairs(t *testing.T
 	}
 	if counts["begin"] != 2 || counts["bind"] != 2 || counts["check"] != 1 || counts["finalize"] != 1 {
 		t.Fatalf("unknown submission caused automatic retry/resubmission: %v", counts)
+	}
+}
+
+func TestAgyReviewRecovery_QueueInputRequiresCollectedReport(t *testing.T) {
+	for _, scenario := range []string{"missing_report", "regular_report"} {
+		t.Run(scenario, func(t *testing.T) {
+			session, dir := testCLI(t, "normal")
+			enableRecoveryReview(t, session, dir, "pending")
+			task, err := session.beginReview(context.Background(), "original task", "", "stream-session")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The live invocation still holds the earlier task state while the
+			// gate has frozen the candidate and acquired a review revision.
+			original := *task
+			original.instructions = "STALE LIVE INSTRUCTIONS"
+			err = session.checkReview(context.Background(), task, "stream-session", testAgyCandidate)
+			var pending *agyReviewPending
+			if !errors.As(err, &pending) || task.revision == "" {
+				t.Fatalf("fixture did not create a pending fixed revision: %+v, %v", task, err)
+			}
+			run := testAgyRun(t, "stream-session")
+			run.reviewTask = &original
+			session.chatID.Store("stream-session")
+			session.startMu.Lock()
+			session.activeRun = run
+			session.startMu.Unlock()
+			reportPath := filepath.Join(task.taskDir, "revisions", task.revision, "hermes-response.txt")
+			if scenario == "regular_report" {
+				if err := os.WriteFile(reportPath, []byte("Transport fixture only; no actual model review.\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := os.Lstat(reportPath); !os.IsNotExist(err) {
+				t.Fatalf("missing-report fixture unexpectedly has a report: %v", err)
+			}
+			before := len(recoveryRequests(t, dir))
+			recorder := &agyProgressRecorder{}
+			eventID, prompt := strings.Repeat("9", 64), "Fixed review callback: inspect the saved report."
+			err = session.QueueInput("stream-session", eventID, prompt, recorder.report)
+			if scenario == "missing_report" {
+				if !errors.Is(err, core.ErrNoActiveInput) || len(recorder.snapshot()) != 0 {
+					t.Fatalf("uncollected callback took ownership or did not defer: %v, %+v", err, recorder.snapshot())
+				}
+				run.mu.Lock()
+				unchanged := run.reviewTask == &original && len(run.inputs) == 0 && len(run.order) == 0
+				run.mu.Unlock()
+				if !unchanged {
+					t.Fatal("uncollected callback changed the active task or retained the event")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				run.mu.Lock()
+				updated := run.reviewTask
+				run.mu.Unlock()
+				if updated == &original || updated.taskID != task.taskID || updated.revision != task.revision ||
+					updated.candidateSHA != task.candidateSHA || updated.manifestSHA != task.manifestSHA {
+					t.Fatalf("collected callback did not install its fixed revision: %+v", updated)
+				}
+				if progress := recorder.snapshot(); len(progress) != 1 || progress[0].Phase != core.LiveInputPhaseQueued {
+					t.Fatalf("callback was not queued once: %+v", progress)
+				}
+			}
+			output, err := run.claim(invocationInput("stream-session", 7), "post")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "missing_report" {
+				if len(output.InjectSteps) != 0 || len(recorder.snapshot()) != 0 {
+					t.Fatalf("uncollected report was claimable: %+v", output)
+				}
+			} else {
+				if len(output.InjectSteps) != 1 || output.TerminationBehavior != "force_continue" {
+					t.Fatalf("collected callback was not injected: %+v", output)
+				}
+				message := output.InjectSteps[0].UserMessage
+				if !strings.HasPrefix(message, prompt) || !strings.Contains(message, task.taskID) ||
+					!strings.Contains(message, task.revision) || strings.Contains(message, original.instructions) ||
+					strings.Contains(message, testAgyCandidate) {
+					t.Fatalf("injection lost revision instructions or exposed the candidate: %q", message)
+				}
+				if progress := recorder.snapshot(); len(progress) != 2 || progress[1].Phase != core.LiveInputPhaseClaimed {
+					t.Fatalf("claim invented delivery or was recorded twice: %+v", progress)
+				}
+			}
+			requests := recoveryRequests(t, dir)[before:]
+			if len(requests) != 1 || requests[0].Op != "begin" || !requests[0].Continuation ||
+				requests[0].EventID != eventID || requests[0].ConversationID != "stream-session" {
+				t.Fatalf("hot callback path performed refresh/finalize or lost its fixed route: %+v", requests)
+			}
+			select {
+			case event := <-session.Events():
+				t.Fatalf("queue/claim published a candidate or completed a review: %+v", event)
+			default:
+			}
+		})
 	}
 }
