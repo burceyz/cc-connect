@@ -1064,6 +1064,53 @@ class DorothyReviewTests(unittest.TestCase):
         self.assertEqual(self.refresh()['reasons'], ['prior_findings_not_verified'])
         self.assertEqual(self.check()['reasons'], ['prior_findings_not_verified'])
 
+    def test_one_qualified_followup_cannot_close_same_short_id_in_two_revisions(self):
+        finding = {'id': 'F1', 'kind': 'defect', 'judgment': 'confirmed', 'disposition': 'needs_change',
+                   'critical': True, 'claim': '不同修订中各自尚未解决的发现', 'evidence': ['candidate.txt']}
+        self.check()
+        self.change_report(lambda report: report.update(verdict='changes_required', findings=[finding]))
+        self.check()
+        first = self.current()[1]['revision']
+        self.manifest['acceptance'].append('第二轮新增独立发现')
+        self.write_manifest()
+        self.check()
+        self.change_report(lambda report: report.update(verdict='changes_required', findings=[finding]))
+        self.check()
+        second = self.current()[1]['revision']
+        self.manifest['acceptance'].append('第三轮只关闭第二轮发现')
+        self.write_manifest()
+        self.check()
+        self.assertEqual({f['finding_id'] for f in self.current()[1]['prior_findings']},
+                         {first + '/F1', second + '/F1'})
+        followup = {k: v for k, v in finding.items() if k != 'id'}
+        followup.update(finding_id=second + '/F1', disposition='verified_closed', critical=False)
+        self.change_report(lambda report: report.update(followup=[followup]))
+        self.refresh()
+        self.respond()
+        result = self.check()
+        self.assertFalse(result['allow_publish'])
+        self.assertEqual(result['reasons'], ['prior_findings_not_verified'])
+        self.assertEqual(self.refresh()['reasons'], ['prior_findings_not_verified'])
+
+    def test_short_followup_does_not_replace_full_prior_finding_identity(self):
+        finding = {'id': 'F1', 'kind': 'defect', 'judgment': 'confirmed', 'disposition': 'needs_change',
+                   'critical': True, 'claim': '必须按原修订身份回应', 'evidence': ['candidate.txt']}
+        self.check()
+        self.change_report(lambda report: report.update(verdict='changes_required', findings=[finding]))
+        self.check()
+        self.manifest['acceptance'].append('回应原修订发现')
+        self.write_manifest()
+        self.check()
+        followup = {k: v for k, v in finding.items() if k != 'id'}
+        followup.update(finding_id='F1', disposition='verified_closed', critical=False)
+        self.change_report(lambda report: report.update(followup=[followup]))
+        self.refresh()
+        self.respond()
+        result = self.check()
+        self.assertFalse(result['allow_publish'])
+        self.assertEqual(result['reasons'], ['prior_findings_not_verified'])
+        self.assertEqual(self.refresh()['reasons'], ['prior_findings_not_verified'])
+
     def test_revision_change_collects_unread_previous_findings(self):
         finding = {'id': 'F1', 'kind': 'defect', 'judgment': 'confirmed', 'disposition': 'needs_change',
                    'critical': True, 'claim': '上一轮尚未取件的关键发现', 'evidence': ['candidate.txt']}
