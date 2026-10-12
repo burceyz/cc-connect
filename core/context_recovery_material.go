@@ -75,39 +75,6 @@ func buildRecoveryMaterial(ctx context.Context, session *Session, source any, in
 	return m
 }
 
-// recoveryWriteFile has no direct-write fallback: an interrupted write must
-// never expose half a ledger or discard the once-only attempt reservation.
-func recoveryWriteFile(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".recovery-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if err = f.Chmod(mode); err == nil {
-		_, err = f.Write(data)
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if err := os.Rename(f.Name(), path); err != nil {
-		return err
-	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
 func saveRecoveryMaterial(m *contextRecoveryMaterial) error {
 	if m == nil || m.Record == nil || !filepath.IsAbs(m.Record.ArtifactDir) {
 		return errors.New("recovery material directory must be absolute")
@@ -124,7 +91,7 @@ func saveRecoveryMaterial(m *contextRecoveryMaterial) error {
 	if err != nil {
 		return err
 	}
-	return recoveryWriteFile(filepath.Join(m.Record.ArtifactDir, "visible-material.json"), b, 0o600)
+	return durableWriteFile(filepath.Join(m.Record.ArtifactDir, "visible-material.json"), b, 0o600)
 }
 
 func privateRecoveryMaterialDir(path string) error {

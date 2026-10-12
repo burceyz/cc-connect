@@ -5,6 +5,32 @@ import (
 	"path/filepath"
 )
 
+// durableWriteFile syncs a temporary file in the destination directory, then
+// uses the platform's durable replacement operation. It never falls back to
+// overwriting the destination in place. The caller creates the directory.
+func durableWriteFile(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".cc-snapshot-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if err = f.Chmod(mode); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return durableReplaceFile(f.Name(), path)
+}
+
 // AtomicWriteFile writes data to a file atomically when possible by first
 // writing to a temporary file in the system temp directory, syncing, then
 // renaming over the target.  On the same filesystem the rename is fully

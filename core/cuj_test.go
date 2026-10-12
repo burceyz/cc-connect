@@ -117,6 +117,36 @@ func TestCUJ_A9_ContextRecoveryPreservesTaskAndLatestScope(t *testing.T) {
 	recoveryAwait(t, "preserved history", func() bool {
 		return strings.Contains(strings.Join(f.p.getSent(), "\n"), "change scope: do not publish")
 	})
+
+	t.Run("ordinary_error_does_not_drop_next_task", func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		releaseSend := func() { once.Do(func() { close(release) }) }
+		t.Cleanup(releaseSend)
+		f.fresh.mu.Lock()
+		f.fresh.onSend = func(n int, _ string) error {
+			if n == 2 {
+				close(started)
+				<-release
+				f.fresh.events <- Event{Type: EventError, Error: errors.New("ordinary task failed")}
+			} else {
+				f.fresh.events <- Event{Type: EventResult, Content: "next local task completed", Done: true}
+			}
+			return nil
+		}
+		f.fresh.mu.Unlock()
+		f.e.ReceiveMessage(f.p, f.message("ordinary", "prepare another local task"))
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("ordinary task did not start after recovery")
+		}
+		f.e.ReceiveMessage(f.p, f.message("queued-next", "then do the next local task"))
+		releaseSend()
+		recoveryAwait(t, "next task still delivered after ordinary error", func() bool {
+			return strings.Contains(strings.Join(f.p.getSent(), "\n"), "next local task completed") && !f.session.Busy()
+		})
+	})
 }
 
 func TestCUJ_A10_StopDuringContextRecoveryRemainsStopped(t *testing.T) {

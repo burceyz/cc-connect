@@ -305,7 +305,7 @@ func TestRecoveryMaterial_AtomicWriteFailureDoesNotLeavePartialFile(t *testing.T
 	if err := os.Mkdir(target, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := recoveryWriteFile(target, []byte("sensitive replacement"), 0o600); err == nil {
+	if err := durableWriteFile(target, []byte("sensitive replacement"), 0o600); err == nil {
 		t.Fatal("write should fail when the existing target is a directory")
 	}
 	entries, err := os.ReadDir(dir)

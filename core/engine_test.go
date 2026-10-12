@@ -5313,7 +5313,7 @@ func TestCmdDir_SwitchesByHistoryIndex(t *testing.T) {
 
 	dataDir := t.TempDir() // separate data dir for history
 	agent := &stubWorkDirAgent{workDir: dir1}
-	e := NewEngine("test", agent, []Platform{p}, dataDir, LangEnglish)
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(dataDir, "sessions.json"), LangEnglish)
 	e.SetDirHistory(NewDirHistory(dataDir))
 
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
@@ -5364,7 +5364,7 @@ func TestCmdDir_DisplaysCorrectIndices(t *testing.T) {
 
 	dataDir := t.TempDir()
 	agent := &stubWorkDirAgent{workDir: dir1}
-	e := NewEngine("test", agent, []Platform{p}, dataDir, LangEnglish)
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(dataDir, "sessions.json"), LangEnglish)
 	e.SetDirHistory(NewDirHistory(dataDir))
 
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
@@ -5405,7 +5405,7 @@ func TestCmdDir_ExpandsTilde(t *testing.T) {
 
 	p := &stubPlatformEngine{n: "plain"}
 	agent := &stubWorkDirAgent{workDir: homeDir}
-	e := NewEngine("test", agent, []Platform{p}, t.TempDir(), LangEnglish)
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 
 	tests := []struct {

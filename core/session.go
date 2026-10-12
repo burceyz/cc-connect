@@ -398,6 +398,7 @@ type SessionManager struct {
 	userMeta      map[string]*UserMeta // sessionKey → display info
 	counter       int64
 	storePath     string // empty = no persistence
+	loadErr       error  // immutable after construction; unreadable storage cannot be overwritten
 
 	// legacyData is true when sessions were loaded from a snapshot that
 	// predates PastAgentSessionIDs tracking. In this state, many sessions
@@ -416,9 +417,19 @@ func NewSessionManager(storePath string) *SessionManager {
 		storePath:     storePath,
 	}
 	if storePath != "" {
-		sm.load()
+		if err := sm.load(); err != nil {
+			sm.loadErr = fmt.Errorf("load session snapshot %q: %w", storePath, err)
+			slog.Error("session: storage unavailable", "error", sm.loadErr)
+		}
 	}
 	return sm
+}
+
+// LoadError reports an unreadable existing snapshot. Execution entry points
+// must reject this manager until the file is reconciled and the manager is
+// reopened. All save paths preserve the original file in the meantime.
+func (sm *SessionManager) LoadError() error {
+	return sm.loadErr
 }
 
 // StorePath returns the file path used for session persistence.
@@ -770,16 +781,19 @@ func (sm *SessionManager) Save() {
 func (sm *SessionManager) SaveWithError() error {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	return sm.saveLockedWithError(true)
+	return sm.saveLockedWithError()
 }
 
 func (sm *SessionManager) saveLocked() {
-	if err := sm.saveLockedWithError(false); err != nil {
+	if err := sm.saveLockedWithError(); err != nil {
 		slog.Error("session: failed to save", "path", sm.storePath, "error", err)
 	}
 }
 
-func (sm *SessionManager) saveLockedWithError(durable bool) error {
+func (sm *SessionManager) saveLockedWithError() error {
+	if sm.loadErr != nil {
+		return sm.loadErr
+	}
 	sm.saveMu.Lock()
 	defer sm.saveMu.Unlock()
 	if sm.storePath == "" {
@@ -848,28 +862,31 @@ func (sm *SessionManager) saveLockedWithError(durable bool) error {
 	if err := os.MkdirAll(filepath.Dir(sm.storePath), 0o755); err != nil {
 		return fmt.Errorf("create session directory: %w", err)
 	}
-	write := AtomicWriteFile
-	if durable {
-		write = recoveryWriteFile
-	}
-	if err := write(sm.storePath, data, 0o644); err != nil {
+	if err := durableWriteFile(sm.storePath, data, 0o644); err != nil {
 		return fmt.Errorf("write session snapshot: %w", err)
 	}
 	return nil
 }
 
-func (sm *SessionManager) load() {
+func (sm *SessionManager) load() error {
 	data, err := os.ReadFile(sm.storePath)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Error("session: failed to read", "path", sm.storePath, "error", err)
+		if os.IsNotExist(err) {
+			return nil
 		}
-		return
+		return err
 	}
 	var snap sessionSnapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
-		slog.Error("session: failed to unmarshal", "path", sm.storePath, "error", err)
-		return
+		return err
+	}
+	if snap.Sessions == nil {
+		return fmt.Errorf("snapshot has no sessions object")
+	}
+	for id, session := range snap.Sessions {
+		if session == nil {
+			return fmt.Errorf("snapshot contains a null session %q", id)
+		}
 	}
 	sm.sessions = snap.Sessions
 	sm.activeSession = snap.ActiveSession
@@ -917,6 +934,7 @@ func (sm *SessionManager) load() {
 	}
 
 	slog.Info("session: loaded from disk", "path", sm.storePath, "sessions", len(sm.sessions))
+	return nil
 }
 
 // InvalidateForAgent clears AgentSessionID on all sessions whose AgentType

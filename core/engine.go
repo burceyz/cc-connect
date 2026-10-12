@@ -563,8 +563,7 @@ type interactiveState struct {
 	recoveryCancel        context.CancelFunc
 	recoveryInputs        []*recoverySteeredInput
 	recoveryInputsDropped int
-	recoveryTurnID        string
-	recoveryCallbacks     []func(*ContextRecoveryRecord)
+	recoveryTurn          *contextRecoveryTurn
 	recoveryInputFailure  *recoveryInputFailure
 	recoveryFailureReady  chan struct{}
 	// busySession is the core.Session whose busy lock guards the in-flight
@@ -1680,6 +1679,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 
 	if useNewSession {
 		msg.SessionKey = runSessionKey
+		msg.sideSession = true
 		session := sessions.NewSideSession(runSessionKey, "cron-"+job.ID)
 		lockGen, locked := session.TryLock()
 		if !locked {
@@ -1891,6 +1891,7 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 
 	if useNewSession {
 		msg.SessionKey = runSessionKey
+		msg.sideSession = true
 		session := sessions.NewSideSession(runSessionKey, "timer-"+job.ID)
 		lockGen, locked := session.TryLock()
 		if !locked {
@@ -2378,6 +2379,9 @@ func (e *Engine) ExecuteHeartbeat(sessionKey, prompt string, silent bool) error 
 }
 
 func (e *Engine) Start() error {
+	if err := e.sessions.LoadError(); err != nil {
+		return err
+	}
 	var startErrs []error
 	readyCount := 0
 	pendingCount := 0
@@ -3153,6 +3157,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		agent = wsAgent
 		interactiveKey = resolvedWorkspace + ":" + msg.SessionKey
 	}
+	if err := e.checkSessionStore(p, msg, sessions); err != nil {
+		return
+	}
 
 	if len(msg.Images) == 0 && strings.HasPrefix(content, "/") {
 		if e.handleCommand(p, msg, content) {
@@ -3448,8 +3455,11 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		e.logStaleUserMessageDropped("reject_before_queue", msg, interactiveKey, snap)
 		return true
 	}
-	if len(state.pendingMessages) >= e.maxQueuedMessages {
-		depth := len(state.pendingMessages)
+	depth := len(state.pendingMessages)
+	if state.recovering && state.recoveryTurn != nil {
+		depth += len(state.recoveryTurn.queued)
+	}
+	if depth >= e.maxQueuedMessages {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
 		return true // handled: queue-full reply sent
 	}
@@ -3983,6 +3993,9 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			session.Unlock(lockGen)
 		}
 	}()
+	if err := e.checkSessionStore(p, msg, sessions); err != nil {
+		return err
+	}
 
 	if e.ctx.Err() != nil {
 		if msg.OnAgentInput != nil {
@@ -4016,19 +4029,9 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 
 	// Update reply context for this turn
 	state.mu.Lock()
-	if state.currentMessageID != msg.MessageID {
-		state.lastRecallProbeMessageID = ""
-		state.lastRecallProbeAt = time.Time{}
-		state.recallProbeInFlight = false
-	}
-	state.platform = p
-	state.replyCtx = msg.ReplyCtx
-	state.currentMessageID = msg.MessageID
-	state.currentTurnUserMessageTimeMs = msg.UserMessageTimeMs
-	state.currentInvocation = e.recoveryInvocationForMessage(msg)
-	state.currentTurnStartedAt = turnStart
+	state.beginTurnLocked(p, msg.ReplyCtx, e.recoveryInvocationForMessage(msg), turnStart, msg.FromVoice, msg.UserMessageTimeMs)
 	state.logicalSessionKey = msg.SessionKey
-	state.sideSession = strings.HasSuffix(interactiveKey, "#cron:"+session.ID) || strings.HasSuffix(interactiveKey, "#timer:"+session.ID)
+	state.sideSession = msg.sideSession
 	state.mu.Unlock()
 	stopRecallMonitor := e.startMessageRecallMonitor(interactiveKey)
 	defer stopRecallMonitor()
@@ -4054,7 +4057,11 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			}
 		} else {
 			e.notifyDroppedQueuedMessages(state, startErr)
-			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
+			if record := session.GetContextRecovery(); errors.Is(startErr, errContextRecoveryReview) && record != nil {
+				e.reply(p, msg.ReplyCtx, e.contextRecoveryReviewMessage(record, sessions.StorePath()))
+			} else {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
+			}
 			return startErr
 		}
 	}
@@ -4141,7 +4148,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
 	stopTyping = nil // ownership transferred; prevent defer from double-stopping
-	if turnErr != nil && session.GetContextRecovery() != nil {
+	if turnErr != nil && state.attemptedRecoveryThisTurn() {
 		// A failed recovery must not leak queued work into a rejected or
 		// partially initialized context through the normal drain path.
 		e.notifyDroppedQueuedMessages(state, turnErr)
@@ -4173,6 +4180,19 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		unlocked = true
 	}
 	return turnErr
+}
+
+// A load failure is different from an empty first start. Keep the original
+// snapshot and reject every execution entry, including direct cron/IPC calls.
+func (e *Engine) checkSessionStore(p Platform, msg *Message, sessions *SessionManager) error {
+	err := sessions.LoadError()
+	if err != nil {
+		if msg.OnAgentInput != nil {
+			msg.OnAgentInput(err)
+		}
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgSessionStoreUnavailable, err))
+	}
+	return err
 }
 
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
@@ -4335,7 +4355,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	defer e.interactiveMu.Unlock()
 
 	state, ok := e.interactiveStates[sessionKey]
-	if record := session.GetContextRecovery(); record != nil && recoveryNeedsReview(record) {
+	if inputErr := sessionInputError(session, sessions); inputErr != nil {
 		agent := e.agent
 		if agentOverride != nil {
 			agent = agentOverride
@@ -4345,7 +4365,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			e.interactiveStates[sessionKey] = state
 		}
 		state.mu.Lock()
-		state.startupError = errors.New("context_recovery_interrupted_review_required")
+		state.startupError = inputErr
 		state.mu.Unlock()
 		return state
 	}
@@ -6454,6 +6474,24 @@ func (e *Engine) consumeInteractiveEvents(state *interactiveState, session *Sess
 				slog.Warn("slow final reply send", "platform", p.Name(), "elapsed", elapsed, "response_len", len(fullResponse))
 			}
 			turnErr = nil
+			state.completeRecoveryDelivery()
+			// Join the delivery receipt before advancing the invocation. A late
+			// failed recovery save must fence queued work too, even when the
+			// model result already proved that this turn completed.
+			if pendingSend != nil {
+				err := <-pendingSend
+				pendingSend = nil
+				if errors.Is(err, errContextRecoveryPersistence) {
+					return err
+				}
+				if err != nil {
+					slog.Debug("async send error after EventResult", "error", err)
+				}
+			}
+			if err := sessionInputError(session, sessions); err != nil {
+				e.notifyRejectedQueuedInput(state, session, sessions, err)
+				return err
+			}
 
 			// TTS: async voice reply if enabled (skipped for silent replies)
 			if !isSilent && e.tts != nil && e.tts.Enabled && e.tts.TTS != nil {
@@ -6473,11 +6511,6 @@ func (e *Engine) consumeInteractiveEvents(state *interactiveState, session *Sess
 			if triggerAutoCompress {
 				compressor, ok := e.agent.(ContextCompressor)
 				if ok && compressor.CompressCommand() != "" {
-					if pendingSend != nil {
-						if err := <-pendingSend; err != nil {
-							slog.Debug("async send error before compress", "error", err)
-						}
-					}
 					state.mu.Lock()
 					state.lastAutoCompressAt = time.Now()
 					tokenEst := state.lastAutoCompressTokens
@@ -6515,13 +6548,7 @@ func (e *Engine) consumeInteractiveEvents(state *interactiveState, session *Sess
 				queued := state.pendingMessages[0]
 				state.pendingMessages = state.pendingMessages[1:]
 				remainingQueue := len(state.pendingMessages)
-				state.platform = queued.platform
-				state.replyCtx = queued.replyCtx
-				state.currentMessageID = queued.messageID
-				state.fromVoice = queued.fromVoice
-				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
-				state.currentInvocation = e.recoveryInvocationForQueued(queued)
-				state.currentTurnStartedAt = time.Now()
+				state.beginTurnLocked(queued.platform, queued.replyCtx, e.recoveryInvocationForQueued(queued), time.Now(), queued.fromVoice, queued.userMessageTimeMs)
 				state.mu.Unlock()
 
 				// Stop the previous turn's typing indicator
@@ -6540,12 +6567,6 @@ func (e *Engine) consumeInteractiveEvents(state *interactiveState, session *Sess
 				// EventResult and Send(), the only buffered events would be
 				// stale leftovers (e.g. a deferred EventError from cmd.Wait()).
 				drainEvents(state.agentSession.Events())
-
-				if pendingSend != nil {
-					if err := <-pendingSend; err != nil {
-						slog.Debug("async send error before queued turn", "error", err)
-					}
-				}
 
 				queuedPrompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
 				session.AddHistory("user", queued.content)
@@ -6644,12 +6665,6 @@ func (e *Engine) consumeInteractiveEvents(state *interactiveState, session *Sess
 				continue
 			}
 			state.mu.Unlock()
-
-			if pendingSend != nil {
-				if err := <-pendingSend; err != nil {
-					slog.Debug("async send error after EventResult", "error", err)
-				}
-			}
 
 			// Add a "done" reaction after the final answer when supported. Skip
 			// silent turns and rich card mode (the card itself shows done status).
@@ -6839,12 +6854,15 @@ func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen in
 // the event loop exits abnormally (EventError, channel closed) and queued
 // messages can no longer be delivered to the agent.
 func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason error) {
+	e.notifyQueuedMessages(state, e.i18n.Tf(MsgError, reason))
+}
+
+func (e *Engine) notifyQueuedMessages(state *interactiveState, text string) {
 	state.mu.Lock()
-	remaining := state.pendingMessages
-	state.pendingMessages = nil
+	remaining := state.takeQueuedMessagesLocked()
 	state.mu.Unlock()
 	for _, q := range remaining {
-		e.send(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), reason))
+		e.send(q.platform, q.replyCtx, text)
 	}
 }
 
@@ -6854,6 +6872,10 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 // Returns true if the session was unlocked by this call.
 func (e *Engine) drainPendingMessages(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, lockGen uint64) bool {
 	for {
+		if err := sessionInputError(session, sessions); err != nil {
+			e.notifyRejectedQueuedInput(state, session, sessions, err)
+			return false
+		}
 		state.mu.Lock()
 		if failure := state.takeRecoveryInputFailureLocked(); failure != nil {
 			state.mu.Unlock()
@@ -6886,13 +6908,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 		queued := state.pendingMessages[0]
 		state.pendingMessages = state.pendingMessages[1:]
-		state.platform = queued.platform
-		state.replyCtx = queued.replyCtx
-		state.currentMessageID = queued.messageID
-		state.fromVoice = queued.fromVoice
-		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
-		state.currentInvocation = e.recoveryInvocationForQueued(queued)
-		state.currentTurnStartedAt = time.Now()
+		state.beginTurnLocked(queued.platform, queued.replyCtx, e.recoveryInvocationForQueued(queued), time.Now(), queued.fromVoice, queued.userMessageTimeMs)
 		state.mu.Unlock()
 
 		e.i18n.DetectAndSet(queued.content)
@@ -6931,7 +6947,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 
 		slog.Info("processing queued message", "session", sessionKey)
-		if err := e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen); err != nil && session.GetContextRecovery() != nil {
+		if err := e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen); err != nil && state.attemptedRecoveryThisTurn() {
 			e.notifyDroppedQueuedMessages(state, err)
 			return false
 		}
@@ -10868,7 +10884,7 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("session cancelled"))
 		} else {
 			state.mu.Lock()
-			state.pendingMessages = nil
+			state.takeQueuedMessagesLocked()
 			state.mu.Unlock()
 		}
 
@@ -10913,7 +10929,7 @@ normalCleanup:
 		e.notifyDroppedQueuedMessages(state, fmt.Errorf("session reset"))
 	} else {
 		state.mu.Lock()
-		state.pendingMessages = nil
+		state.takeQueuedMessagesLocked()
 		state.mu.Unlock()
 	}
 	e.closeAgentSessionAsync(sessionKey, agentSession, closePlatform, closeReplyCtx)
@@ -16509,6 +16525,9 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	if err != nil {
 		return "", err
 	}
+	if err := sessions.LoadError(); err != nil {
+		return "", err
+	}
 	session := sessions.GetOrCreateActive(relaySessionKey)
 
 	if inj, ok := agent.(SessionEnvInjector); ok {
@@ -17040,6 +17059,9 @@ func (e *Engine) commandContext(p Platform, msg *Message) (Agent, *SessionManage
 // the resolved workspace path for callers that need to forward it to
 // processInteractiveMessageWith (idle reaper bookkeeping, reply footer, etc).
 func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *SessionManager, string, string, error) {
+	if err := e.sessions.LoadError(); err != nil {
+		return nil, nil, "", "", err
+	}
 	if !e.multiWorkspace {
 		return e.agent, e.sessions, msg.SessionKey, "", nil
 	}
@@ -17057,6 +17079,9 @@ func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *
 	}
 	agent, sessions, interactiveKey, effectiveDir, err := e.workspaceContext(workspace, msg.SessionKey)
 	if err != nil {
+		return nil, nil, "", "", err
+	}
+	if err := sessions.LoadError(); err != nil {
 		return nil, nil, "", "", err
 	}
 	return agent, sessions, interactiveKey, effectiveDir, nil

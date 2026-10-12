@@ -422,6 +422,7 @@ type Message struct {
 	OnAccepted             func()                       // called once when the engine accepts this message for an agent turn
 	OnAgentInput           func(error)                  // optional receipt after AgentSession.Send; not a task-completion callback
 	Origin                 InvocationOrigin             // host-supplied source of this specific invocation
+	sideSession            bool                         // host scheduler created a separate session; origin alone does not imply this
 	OnContextRecovery      func(*ContextRecoveryRecord) // separate from input delivery and acknowledgement
 	ExpectedAgentSessionID string                       // optional exact backend session fence for local IPC
 	ChannelKey             string                       // platform-provided channel identifier for workspace binding (optional)

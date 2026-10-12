@@ -17,12 +17,12 @@ import (
 // sessionFileData mirrors the unexported sessionSnapshot in core/session.go
 // for JSON deserialization of session files.
 type sessionFileData struct {
-	Sessions      map[string]*sessionData    `json:"sessions"`
-	ActiveSession map[string]string          `json:"active_session"`
-	UserSessions  map[string][]string        `json:"user_sessions"`
-	Counter       int64                      `json:"counter"`
-	SessionNames  map[string]string          `json:"session_names,omitempty"`
-	UserMeta      map[string]*userMetaData   `json:"user_meta,omitempty"`
+	Sessions      map[string]*sessionData  `json:"sessions"`
+	ActiveSession map[string]string        `json:"active_session"`
+	UserSessions  map[string][]string      `json:"user_sessions"`
+	Counter       int64                    `json:"counter"`
+	SessionNames  map[string]string        `json:"session_names,omitempty"`
+	UserMeta      map[string]*userMetaData `json:"user_meta,omitempty"`
 }
 
 type userMetaData struct {
@@ -355,6 +355,10 @@ func runSessionsPrune(dataDir, project string, mergeHistory bool) {
 
 		filePath := filepath.Join(sessionsDir, entry.Name())
 		sm := core.NewSessionManager(filePath)
+		if err := sm.LoadError(); err != nil {
+			fmt.Fprintf(os.Stderr, "Project %s: %v\n", projectName, err)
+			continue
+		}
 
 		result := sm.PruneDuplicateSessions(mergeHistory)
 		if len(result.RemovedSessions) > 0 {

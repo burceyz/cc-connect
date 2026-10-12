@@ -206,6 +206,12 @@ const (
 	MsgSessionResumeUnsafe       MsgKey = "session_resume_unsafe"
 	MsgContextRecovering         MsgKey = "context_recovering"
 	MsgContextRecoveryFailed     MsgKey = "context_recovery_failed"
+	MsgRecoveryReviewRequired    MsgKey = "context_recovery_review_required"
+	MsgRecoveryReviewExecutor    MsgKey = "context_recovery_review_executor"
+	MsgRecoveryReviewPersistence MsgKey = "context_recovery_review_persistence"
+	MsgRecoveryReviewInput       MsgKey = "context_recovery_review_input"
+	MsgRecoveryReviewIncomplete  MsgKey = "context_recovery_review_incomplete"
+	MsgSessionStoreUnavailable   MsgKey = "session_store_unavailable"
 	MsgSessionCancelled          MsgKey = "session_cancelled"
 	MsgNoExecution               MsgKey = "no_execution"
 	MsgPreviousProcessing        MsgKey = "previous_processing"
@@ -791,6 +797,48 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "自動接續已停止（%v）。繼續前需要核對已儲存的恢復記錄和實際進度。",
 		LangJapanese:           "自動引き継ぎを停止しました（%v）。続行前に保存済みの復元記録と実際の進捗を確認してください。",
 		LangSpanish:            "La continuación automática se detuvo (%v). Revise el registro de recuperación guardado y el progreso real antes de continuar.",
+	},
+	MsgRecoveryReviewRequired: {
+		LangEnglish:            "Automatic continuation needs review: %s\nRecovery ID: %s\nSession snapshot: %s\nMaterial directory (if created): %s\nCheck the original executor, delivery receipts and actual progress. After reconciliation, use /new to start an explicit new task with the verified remaining work.",
+		LangChinese:            "自动接续正在等待核对：%s\n恢复编号：%s\n会话快照：%s\n材料目录（如已生成）：%s\n请核对原执行器、输入回执和实际进度。核对后可用 /new 开启新任务，并提供已确认的剩余工作。",
+		LangTraditionalChinese: "自動接續正在等待核對：%s\n恢復編號：%s\n會話快照：%s\n材料目錄（如已產生）：%s\n請核對原執行器、輸入回執和實際進度。核對後可用 /new 開啟新任務，並提供已確認的剩餘工作。",
+		LangJapanese:           "自動引き継ぎの確認が必要です：%s\n復元 ID：%s\nセッションスナップショット：%s\n資料ディレクトリ（作成済みの場合）：%s\n元の実行プロセス、入力の受領記録、実際の進捗を確認してください。確認後、/new で新しいタスクを開始し、確認済みの残作業を伝えてください。",
+		LangSpanish:            "La continuación automática requiere revisión: %s\nID de recuperación: %s\nInstantánea de sesiones: %s\nDirectorio de materiales (si se creó): %s\nRevise el ejecutor original, los recibos de entrega y el progreso real. Después, use /new para iniciar una nueva tarea con el trabajo pendiente verificado.",
+	},
+	MsgRecoveryReviewExecutor: {
+		LangEnglish:            "the original executor has not been confirmed stopped",
+		LangChinese:            "原执行器尚未确认停止",
+		LangTraditionalChinese: "原執行器尚未確認停止",
+		LangJapanese:           "元の実行プロセスの停止が確認できていません",
+		LangSpanish:            "no se ha confirmado la detención del ejecutor original",
+	},
+	MsgRecoveryReviewPersistence: {
+		LangEnglish:            "a recovery receipt could not be saved reliably",
+		LangChinese:            "恢复回执未能可靠保存",
+		LangTraditionalChinese: "恢復回執未能可靠儲存",
+		LangJapanese:           "復元の受領記録を確実に保存できませんでした",
+		LangSpanish:            "no se pudo guardar de forma fiable un recibo de recuperación",
+	},
+	MsgRecoveryReviewInput: {
+		LangEnglish:            "delivery of the recovery input is uncertain",
+		LangChinese:            "恢复输入的发送结果尚不确定",
+		LangTraditionalChinese: "恢復輸入的傳送結果尚不確定",
+		LangJapanese:           "復元入力が届いたか確認できていません",
+		LangSpanish:            "la entrega de la entrada de recuperación es incierta",
+	},
+	MsgRecoveryReviewIncomplete: {
+		LangEnglish:            "the previous recovery did not record a confirmed outcome",
+		LangChinese:            "上次恢复尚未留下可确认的结束结果",
+		LangTraditionalChinese: "上次恢復尚未留下可確認的結束結果",
+		LangJapanese:           "前回の復元結果が確定した記録がありません",
+		LangSpanish:            "la recuperación anterior no registró un resultado confirmado",
+	},
+	MsgSessionStoreUnavailable: {
+		LangEnglish:            "Session storage is unavailable (%v). The original file is preserved. Reconcile or restore the snapshot, then restart the service before continuing.",
+		LangChinese:            "会话存储不可用（%v），原文件已保留。请核对或还原快照，再重启服务后继续。",
+		LangTraditionalChinese: "會話儲存不可用（%v），原檔案已保留。請核對或還原快照，再重新啟動服務後繼續。",
+		LangJapanese:           "セッション保存先を読み込めません（%v）。元のファイルは保持されています。スナップショットを確認または復元し、サービスを再起動してから続行してください。",
+		LangSpanish:            "El almacenamiento de sesiones no está disponible (%v). Se conserva el archivo original. Revise o restaure la instantánea y reinicie el servicio antes de continuar.",
 	},
 	MsgSessionCancelled: {
 		LangEnglish:            "Session cancelled. Ready for new instructions.",
