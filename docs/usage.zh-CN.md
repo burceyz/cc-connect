@@ -111,6 +111,8 @@ cmd = ["/path with spaces/codex", "--profile", "work"]
 
 此功能通过现有 Codex 适配器运行应用内置 CLI。桌面专有工具和共享会话写锁有独立的适配要求，参见 [桌面后端讨论 #651](https://github.com/chenhg5/cc-connect/issues/651) 和 [会话写锁冲突 #1909](https://github.com/chenhg5/cc-connect/issues/1909)。
 
+针对明确识别的 `invalid_encrypted_content`，可选的 `context_recovery` 支持根据可见记录和原输入重建一次上下文。要求 `backend = "app_server"`，默认 `false`。任务继承、回执与次数限制见[本地上下文恢复](context-recovery.zh-CN.md)。
+
 ### Cursor Agent 模式
 
 | 模式 | 配置值 | 行为 |

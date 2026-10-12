@@ -113,6 +113,8 @@ cmd = ["/path with spaces/codex", "--profile", "work"]
 
 This runs the bundled CLI using the existing Codex adapter. Desktop-only tools and shared-thread locking have separate requirements; see [Desktop backend discussion #651](https://github.com/chenhg5/cc-connect/issues/651) and [thread writer conflict #1909](https://github.com/chenhg5/cc-connect/issues/1909).
 
+For an explicitly classified `invalid_encrypted_content` failure, the optional `context_recovery` setting can rebuild the context once using visible records and the original input. It requires `backend = "app_server"` and defaults to `false`. See [local context recovery](context-recovery.md) for task continuity, receipts and recovery limits.
+
 ### Cursor Agent Modes
 
 | Mode | Config Value | Behavior |

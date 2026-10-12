@@ -552,7 +552,19 @@ type queuedMessage struct {
 
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
-	agentSession AgentSession
+	agentSession          AgentSession
+	startupError          error
+	currentInvocation     *recoveryInvocation
+	currentTurnStartedAt  time.Time
+	logicalSessionKey     string
+	sideSession           bool
+	recovering            bool
+	recoveryInputPending  bool
+	recoveryCancel        context.CancelFunc
+	recoveryInputs        []*recoverySteeredInput
+	recoveryInputsDropped int
+	recoveryTurnID        string
+	recoveryCallbacks     []func(*ContextRecoveryRecord)
 	// busySession is the core.Session whose busy lock guards the in-flight
 	// turn. Set by getOrCreateInteractiveStateWith so /stop can release the
 	// lock after tearing the turn down (#1830).
@@ -755,6 +767,9 @@ func (s *interactiveState) markStopped() {
 		return
 	}
 	s.stopped = true
+	if s.recoveryCancel != nil {
+		s.recoveryCancel()
+	}
 	if s.stopCh == nil {
 		s.stopCh = make(chan struct{})
 	}
@@ -1607,6 +1622,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		Content:      content,
 		ReplyCtx:     replyCtx,
 		ModeOverride: job.Mode,
+		Origin:       InvocationOrigin{Kind: "cron", ID: job.ID + ":" + time.Now().UTC().Format(time.RFC3339Nano), JobID: job.ID, TriggeredAt: time.Now().UTC()},
 	}
 
 	// Resolve workspace-specific agent and sessions for multi-workspace mode.
@@ -1672,8 +1688,11 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 			iKey = workspaceDir + ":" + iKey
 		}
 		prevHistLen := session.HistoryLen()
-		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey, lockGen)
+		turnErr := e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey, lockGen)
 		e.cleanupInteractiveState(iKey)
+		if turnErr != nil {
+			return fmt.Errorf("cron job %q turn failed: %w", job.ID, turnErr)
+		}
 		// Empty-response detection via session history delta: processInteractiveMessageWith
 		// always adds a "user" entry (prevHistLen+1), then an "assistant" entry on success
 		// (prevHistLen+2). This approach correctly detects empty responses across all
@@ -1696,7 +1715,9 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		iKey = workspaceDir + ":" + sessionKey
 	}
 	prevHistLen := session.HistoryLen()
-	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey, lockGen)
+	if err := e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey, lockGen); err != nil {
+		return fmt.Errorf("cron job %q turn failed: %w", job.ID, err)
+	}
 	// Same empty-response detection as the useNewSession path above.
 	if !job.Mute && session.HistoryLen() < prevHistLen+2 {
 		return fmt.Errorf("cron job %q produced an empty response", job.ID)
@@ -1814,6 +1835,7 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 		Content:      content,
 		ReplyCtx:     replyCtx,
 		ModeOverride: job.Mode,
+		Origin:       InvocationOrigin{Kind: "timer", ID: job.ID + ":" + job.ScheduledAt.UTC().Format(time.RFC3339Nano), JobID: job.ID, ScheduledAt: job.ScheduledAt, TriggeredAt: time.Now().UTC()},
 	}
 
 	agent := e.agent
@@ -1876,9 +1898,9 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 		if workspaceDir != "" {
 			iKey = workspaceDir + ":" + iKey
 		}
-		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey, lockGen)
+		turnErr := e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey, lockGen)
 		e.cleanupInteractiveState(iKey)
-		return nil
+		return turnErr
 	}
 
 	session := sessions.GetOrCreateActive(sessionKey)
@@ -1891,8 +1913,7 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 	if workspaceDir != "" {
 		iKey = workspaceDir + ":" + sessionKey
 	}
-	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey, lockGen)
-	return nil
+	return e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey, lockGen)
 }
 
 func timerRunTitle(job *TimerJob) string {
@@ -3398,7 +3419,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 
 	// Allow queueing when agentSession is nil (session is starting up,
 	// issue #565). Only reject if the session was established and died.
-	if state.agentSession != nil && !state.agentSession.Alive() {
+	if state.stopped || (!state.recovering && state.agentSession != nil && !state.agentSession.Alive()) {
 		return false
 	}
 
@@ -3920,8 +3941,8 @@ func isDenyResponse(s string) bool {
 // Interactive agent processing
 // ──────────────────────────────────────────────────────────────
 
-func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Session, lockGen uint64) {
-	e.processInteractiveMessageWith(p, msg, session, e.agent, e.sessions, msg.SessionKey, "", "", lockGen)
+func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Session, lockGen uint64) error {
+	return e.processInteractiveMessageWith(p, msg, session, e.agent, e.sessions, msg.SessionKey, "", "", lockGen)
 }
 
 // processInteractiveMessageWith is the core interactive processing loop.
@@ -3930,7 +3951,7 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY in the agent env; otherwise interactiveKey is used.
 // lockGen is the generation returned by the TryLock that acquired this turn's
 // busy lock; it must be passed to every session.Unlock of this turn (custom 2026-09-12).
-func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string, lockGen uint64) {
+func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string, lockGen uint64) (turnErr error) {
 	// session.Unlock() is NOT deferred here — it is called explicitly in
 	// the drain loop below while holding state.mu to close the race window
 	// between "queue is empty" and "session unlocked". A deferred fallback
@@ -3946,7 +3967,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		if msg.OnAgentInput != nil {
 			msg.OnAgentInput(e.ctx.Err())
 		}
-		return
+		return e.ctx.Err()
 	}
 
 	turnStart := time.Now()
@@ -3983,16 +4004,38 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.replyCtx = msg.ReplyCtx
 	state.currentMessageID = msg.MessageID
 	state.currentTurnUserMessageTimeMs = msg.UserMessageTimeMs
+	state.currentInvocation = invocationForMessage(msg)
+	state.currentTurnStartedAt = turnStart
+	state.logicalSessionKey = msg.SessionKey
+	state.sideSession = strings.HasSuffix(interactiveKey, "#cron:"+session.ID) || strings.HasSuffix(interactiveKey, "#timer:"+session.ID)
 	state.mu.Unlock()
 	stopRecallMonitor := e.startMessageRecallMonitor(interactiveKey)
 	defer stopRecallMonitor()
+	if msg.ModeOverride != "" {
+		defer restoreInvocationMode(state, agent)()
+	}
 
-	if state.agentSession == nil {
-		if msg.OnAgentInput != nil {
-			msg.OnAgentInput(fmt.Errorf("agent session failed to start"))
+	var recoverySend <-chan error
+	if state.agentSession == nil || state.startupError != nil {
+		startErr := state.startupError
+		if startErr == nil {
+			startErr = fmt.Errorf("agent session failed to start")
 		}
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
-		return
+		if msg.OnAgentInput != nil {
+			msg.OnAgentInput(startErr)
+		}
+		if isContextRecoveryError(startErr) {
+			var err error
+			recoverySend, err = e.prepareContextRecovery(state, session, sessions, interactiveKey, lockGen, startErr)
+			if err != nil {
+				e.notifyDroppedQueuedMessages(state, err)
+				return err
+			}
+		} else {
+			e.notifyDroppedQueuedMessages(state, startErr)
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
+			return startErr
+		}
 	}
 	e.cancelAgentSessionIdleClose(state)
 
@@ -4003,20 +4046,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 
 	// Apply per-message permission mode override (e.g. cron jobs with mode = "bypassPermissions").
-	// Defer restores only when SetLiveMode succeeds for the override.
-	if msg.ModeOverride != "" {
+	// The deferred restoration follows a replacement executor after recovery.
+	if msg.ModeOverride != "" && recoverySend == nil {
 		if switcher, ok := state.agentSession.(LiveModeSwitcher); ok {
-			if switcher.SetLiveMode(msg.ModeOverride) {
-				defer func() {
-					defaultMode := "default"
-					if ma, ok := e.agent.(interface{ GetMode() string }); ok {
-						if m := ma.GetMode(); m != "" {
-							defaultMode = m
-						}
-					}
-					switcher.SetLiveMode(defaultMode)
-				}()
-			}
+			switcher.SetLiveMode(msg.ModeOverride)
 		}
 	}
 
@@ -4059,30 +4092,40 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	// Run Send concurrently with processInteractiveEvents. Some agents block inside
 	// Send until the prompt turn finishes (e.g. ACP session/prompt); they may emit
 	// EventPermissionRequest while blocked — the event loop must run in parallel.
-	sendDone := make(chan error, 1)
-	go func() {
-		finishInput := func(err error) {
-			if msg.OnAgentInput != nil {
-				msg.OnAgentInput(err)
+	sendDone := recoverySend
+	if sendDone == nil {
+		initialSend := make(chan error, 1)
+		sendDone = initialSend
+		go func() {
+			finishInput := func(err error) {
+				if msg.OnAgentInput != nil {
+					msg.OnAgentInput(err)
+				}
+				initialSend <- err
 			}
-			sendDone <- err
-		}
-		if as == nil {
-			finishInput(fmt.Errorf("agent session became nil"))
-			return
-		}
-		if msg.ExpectedAgentSessionID != "" && as.CurrentSessionID() != msg.ExpectedAgentSessionID {
-			finishInput(fmt.Errorf("ipc target session changed before input"))
-			return
-		}
-		finishInput(as.Send(promptContent, msg.MessageID, msg.Images, msg.Files))
-	}()
+			if as == nil {
+				finishInput(fmt.Errorf("agent session became nil"))
+				return
+			}
+			if msg.ExpectedAgentSessionID != "" && as.CurrentSessionID() != msg.ExpectedAgentSessionID {
+				finishInput(fmt.Errorf("ipc target session changed before input"))
+				return
+			}
+			finishInput(as.Send(promptContent, msg.MessageID, msg.Images, msg.Files))
+		}()
+	}
 
-	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
+	turnErr = e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
 	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
 	stopTyping = nil // ownership transferred; prevent defer from double-stopping
+	if turnErr != nil && session.GetContextRecovery() != nil {
+		// A failed recovery must not leak queued work into a rejected or
+		// partially initialized context through the normal drain path.
+		e.notifyDroppedQueuedMessages(state, turnErr)
+		return turnErr
+	}
 
 	// Start unsolicited reader and arm the idle close timer BEFORE draining
 	// queued messages. drainPendingMessages releases the session lock, and
@@ -4108,6 +4151,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if e.drainPendingMessages(state, session, sessions, interactiveKey, lockGen) {
 		unlocked = true
 	}
+	return turnErr
 }
 
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
@@ -4270,7 +4314,21 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	defer e.interactiveMu.Unlock()
 
 	state, ok := e.interactiveStates[sessionKey]
-	if ok && state.agentSession != nil && state.agentSession.Alive() {
+	if record := session.GetContextRecovery(); record != nil && recoveryNeedsReview(record) {
+		agent := e.agent
+		if agentOverride != nil {
+			agent = agentOverride
+		}
+		if state == nil {
+			state = &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, busySession: session, eventsNeedResync: true}
+			e.interactiveStates[sessionKey] = state
+		}
+		state.mu.Lock()
+		state.startupError = errors.New("context_recovery_interrupted_review_required")
+		state.mu.Unlock()
+		return state
+	}
+	if ok && state.agentSession != nil && !state.isStopped() && state.agentSession.Alive() {
 		// Verify the running agent session matches the current active session.
 		// After /new or /switch the active session changes, but the old agent
 		// process may still be alive. Reusing it would send messages to the
@@ -4402,7 +4460,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		// If resume/continue failed, try a fresh session as fallback.
-		if startSessionID != "" {
+		if startSessionID != "" && !isContextRecoveryError(err) {
 			slog.Error("session resume failed, falling back to fresh session",
 				"session_key", sessionKey, "failed_session_id", startSessionID,
 				"error", err, "elapsed", startElapsed)
@@ -4426,7 +4484,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 				Platform:   p.Name(),
 				Error:      fmt.Sprintf("failed to start session: %v", err),
 			})
-			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true, busySession: session}
+			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true, busySession: session, startupError: err}
 			adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
 			state = newState
 			e.interactiveStates[sessionKey] = state
@@ -5191,7 +5249,8 @@ var agentErrorHandlers = []agentErrorHandler{
 	{"Session not found", MsgSessionNotFound},
 }
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) {
+func (e *Engine) consumeInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) (turnErr error) {
+	turnErr = errors.New("agent_turn_incomplete")
 	if msgID != "" {
 		state.mu.Lock()
 		state.currentMessageID = msgID
@@ -5284,8 +5343,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	// Max turn time: absolute wall-clock cap that does NOT reset on events.
 	// Prevents long-running tool calls from blocking the session forever (#1091).
 	var turnDeadlineCh <-chan time.Time
+	var turnDeadlineTimer *time.Timer
 	if e.maxTurnTime > 0 {
-		turnDeadlineTimer := time.NewTimer(e.maxTurnTime)
+		turnDeadlineTimer = time.NewTimer(time.Until(turnStart.Add(e.maxTurnTime)))
 		defer turnDeadlineTimer.Stop()
 		turnDeadlineCh = turnDeadlineTimer.C
 	}
@@ -5299,7 +5359,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		select {
 		case <-stopCh:
 			sp.discard()
-			return
+			return context.Canceled
 		case event, ok = <-events:
 			if !ok {
 				goto channelClosed
@@ -5307,11 +5367,16 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		case err := <-pendingSend:
 			pendingSend = nil
 			if err != nil {
+				turnErr = err
 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
 				sp.discard()
 				if stopTyping != nil {
 					stopTyping()
 					stopTyping = nil
+				}
+				if isContextRecoveryError(err) {
+					cp.Finalize(ProgressCardStateFailed)
+					return err
 				}
 				e.notifyDroppedQueuedMessages(state, err)
 				if state.agentSession == nil || !state.agentSession.Alive() {
@@ -5388,7 +5453,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.mu.Lock()
 			state.eventsNeedResync = true
 			state.mu.Unlock()
-			return
+			return e.ctx.Err()
 		}
 
 		if state.isStopped() {
@@ -6114,6 +6179,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// decision; only the outbound platform text gets rewritten/suppressed.
 			session.AddHistory("assistant", baseResponse)
 			sessions.Save()
+			// This is a model completion receipt. Platform delivery below may
+			// fail independently; it must not rewrite that fact as model failure.
+			if err := e.finishContextRecoveryTurn(state, session, sessions, "model_turn_completed", ""); err != nil {
+				return err
+			}
+			turnErr = errors.New("agent_response_delivery_failed")
 
 			isSilent := isSilentReply(baseResponse)
 			if !isSilent {
@@ -6350,6 +6421,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if elapsed := time.Since(replyStart); elapsed >= slowPlatformSend {
 				slog.Warn("slow final reply send", "platform", p.Name(), "elapsed", elapsed, "response_len", len(fullResponse))
 			}
+			turnErr = nil
 
 			// TTS: async voice reply if enabled (skipped for silent replies)
 			if !isSilent && e.tts != nil && e.tts.Enabled && e.tts.TTS != nil {
@@ -6416,6 +6488,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.currentMessageID = queued.messageID
 				state.fromVoice = queued.fromVoice
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
+				state.currentInvocation = invocationForQueued(queued)
+				state.currentTurnStartedAt = time.Now()
 				state.mu.Unlock()
 
 				// Stop the previous turn's typing indicator
@@ -6442,6 +6516,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 
 				queuedPrompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
+				session.AddHistory("user", queued.content)
+				sessions.Save()
 
 				state.mu.Lock()
 				as := state.agentSession // capture under lock to avoid race with cleanup
@@ -6467,6 +6543,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				segmentStart = 0
 				toolCount = 0
 				turnStart = time.Now()
+				turnErr = errors.New("agent_turn_incomplete")
+				if turnDeadlineTimer != nil {
+					turnDeadlineTimer.Reset(e.maxTurnTime)
+				}
 				firstEventLogged = false
 				waitStart = time.Now()
 				// Reassign the local replyCtx parameter to the queued message's
@@ -6515,11 +6595,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					e.send(queued.platform, queued.replyCtx, replyContent)
 				}
 
-				session.AddHistory("user", queued.content)
-				// Persist queued user message immediately (mirror of the
-				// initial AddHistory("user",...) save above).
-				sessions.Save()
-
 				if idleTimer != nil {
 					if !idleTimer.Stop() {
 						select {
@@ -6555,6 +6630,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			return
 
 		case EventError:
+			turnErr = event.Error
+			if turnErr == nil {
+				turnErr = errors.New("agent_turn_failed")
+			}
 			cp.Finalize(ProgressCardStateFailed)
 			sp.discard()
 			// A backend can create its resumable session before a turn fails
@@ -6577,6 +6656,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						slog.Debug("rich card: failed to update error card", "platform", p.Name(), "error", err)
 					}
 				}
+			}
+			if isContextRecoveryError(turnErr) {
+				return turnErr
 			}
 			if event.Error != nil {
 				errMsg := event.Error.Error()
@@ -6607,6 +6689,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	}
 
 channelClosed:
+	turnErr = errors.New("agent_process_exited")
 	// Channel closed - process exited unexpectedly
 	slog.Warn("agent process exited", "session_key", sessionKey)
 	state.mu.Lock()
@@ -6670,6 +6753,7 @@ channelClosed:
 			}
 		}
 	}
+	return turnErr
 }
 
 func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen int) []ToolStep {
@@ -6767,6 +6851,8 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.currentMessageID = queued.messageID
 		state.fromVoice = queued.fromVoice
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
+		state.currentInvocation = invocationForQueued(queued)
+		state.currentTurnStartedAt = time.Now()
 		state.mu.Unlock()
 
 		e.i18n.DetectAndSet(queued.content)
@@ -6780,10 +6866,15 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent session ended"))
 			return false
 		}
+		// The caller may already have armed idle handling before noticing
+		// this orphaned queued input. Foreground owns Events exclusively.
+		e.stopUnsolicitedReader(state)
+		e.cancelAgentSessionIdleClose(state)
 
 		drainEvents(as.Events())
 
 		session.AddHistory("user", queued.content)
+		sessions.Save()
 
 		sendDone := make(chan error, 1)
 		go func() {
@@ -6800,7 +6891,18 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 
 		slog.Info("processing queued message", "session", sessionKey)
-		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen)
+		if err := e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen); err != nil && session.GetContextRecovery() != nil {
+			e.notifyDroppedQueuedMessages(state, err)
+			return false
+		}
+		state.mu.Lock()
+		alive := state.agentSession != nil && state.agentSession.Alive() && !state.stopped && !state.eventsNeedResync
+		workspaceDir := state.workspaceDir
+		state.mu.Unlock()
+		if alive {
+			e.startUnsolicitedReader(state, session, sessions, sessionKey, workspaceDir)
+			e.scheduleAgentSessionIdleClose(sessionKey, state)
+		}
 	}
 }
 
@@ -6869,7 +6971,7 @@ func (e *Engine) cmdPs(p Platform, msg *Message, args []string) {
 	e.interactiveMu.Lock()
 	state, ok := e.interactiveStates[iKey]
 	e.interactiveMu.Unlock()
-	if !ok || state == nil || state.agentSession == nil || !state.agentSession.Alive() {
+	if !ok || state == nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsNoSession))
 		return
 	}
@@ -6878,11 +6980,33 @@ func (e *Engine) cmdPs(p Platform, msg *Message, args []string) {
 	// session lock and races with concurrent normal messages on the CLI's
 	// stdin, so reject instead.
 	_, sessions := e.sessionContextForKey(msg.SessionKey)
-	if session := sessions.GetOrCreateActive(msg.SessionKey); !session.Busy() {
+	session := sessions.GetOrCreateActive(msg.SessionKey)
+	if !session.Busy() {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsNoSession))
 		return
 	}
-	if err := state.agentSession.Send(text, "", nil, nil); err != nil {
+	state.mu.Lock()
+	if state.recovering || state.recoveryInputPending {
+		state.mu.Unlock()
+		supplement := *msg
+		supplement.Content = text
+		if !e.queueMessageForBusySession(p, &supplement, iKey) {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsNoSession))
+		}
+		return
+	}
+	as := state.agentSession
+	if state.stopped || as == nil || !as.Alive() {
+		state.mu.Unlock()
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsNoSession))
+		return
+	}
+	// A user correction remains authoritative even if the following Send
+	// races a context rejection. Preserve it before handing it to the agent.
+	session.AddHistory("user", text)
+	state.mu.Unlock()
+	sessions.Save()
+	if err := as.Send(text, "", nil, nil); err != nil {
 		slog.Error("ps: send failed", "error", err)
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSendFailed))
 		return
@@ -10681,12 +10805,13 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 	agentSession := state.agentSession
 	closePlatform := state.platform
 	closeReplyCtx := state.replyCtx
+	recovering := state.recovering || state.recoveryInputPending
 	state.mu.Unlock()
 
 	// If the agent session supports graceful turn cancellation (e.g. ACP),
 	// send a cancel notification and keep the session alive for the next
 	// user message, rather than killing the process and destroying state.
-	if canceller, ok := agentSession.(AgentSessionCanceller); ok && agentSession != nil {
+	if canceller, ok := agentSession.(AgentSessionCanceller); ok && agentSession != nil && !recovering {
 		// Keep the state in the map so the next message reuses this session.
 		// Don't markStopped — the session is still usable.
 		// Don't delete from interactiveStates — keep it alive.

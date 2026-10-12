@@ -1697,6 +1697,9 @@ app_secret = "your-feishu-app-secret"
 # [projects.agent.options]
 # work_dir = "/path/to/project"
 # mode = "suggest"  # "suggest" | "auto-edit" | "full-auto" | "yolo"
+# backend = "app_server"  # needed for local context recovery / 本地上下文恢复要求 app_server
+# context_recovery = false  # opt-in; one rebuild per continuation chain / 显式开启，同一承接链最多一次
+# See docs/context-recovery.md / 详见 docs/context-recovery.zh-CN.md。
 #
 # Mode options / 模式说明:
 # - "suggest":   ask permission for every tool call (default, safest) / 每次调用都需确认（默认，最安全）

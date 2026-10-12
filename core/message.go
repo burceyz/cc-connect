@@ -414,15 +414,17 @@ type Message struct {
 	UserName               string
 	ChatName               string // human-readable chat/group name (optional)
 	Content                string
-	Images                 []ImageAttachment   // attached images (if any)
-	Files                  []FileAttachment    // attached files (if any)
-	Audio                  *AudioAttachment    // voice message (if any)
-	Location               *LocationAttachment // geographical location (if any)
-	ExtraContent           string              // platform-enriched content (e.g. location text, reply quote) prepended for the agent
-	OnAccepted             func()              // called once when the engine accepts this message for an agent turn
-	OnAgentInput           func(error)         // optional receipt after AgentSession.Send; not a task-completion callback
-	ExpectedAgentSessionID string              // optional exact backend session fence for local IPC
-	ChannelKey             string              // platform-provided channel identifier for workspace binding (optional)
+	Images                 []ImageAttachment            // attached images (if any)
+	Files                  []FileAttachment             // attached files (if any)
+	Audio                  *AudioAttachment             // voice message (if any)
+	Location               *LocationAttachment          // geographical location (if any)
+	ExtraContent           string                       // platform-enriched content (e.g. location text, reply quote) prepended for the agent
+	OnAccepted             func()                       // called once when the engine accepts this message for an agent turn
+	OnAgentInput           func(error)                  // optional receipt after AgentSession.Send; not a task-completion callback
+	Origin                 InvocationOrigin             // host-supplied source of this specific invocation
+	OnContextRecovery      func(*ContextRecoveryRecord) // separate from input delivery and acknowledgement
+	ExpectedAgentSessionID string                       // optional exact backend session fence for local IPC
+	ChannelKey             string                       // platform-provided channel identifier for workspace binding (optional)
 	// LegacyChannelKey is the platform-provided channel identifier used by an
 	// older workspace-binding scope. When both keys are set, multi-workspace
 	// routing atomically migrates the legacy binding to ChannelKey.

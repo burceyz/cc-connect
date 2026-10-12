@@ -72,6 +72,97 @@ func TestCUJ_A8_ImmediateReceiptsDuringStartupAndQueue(t *testing.T) {
 	env.assertReceipts("first", "second")
 }
 
+// CUJ: a goal, a scope change and a short continuation survive rejection of
+// the native context, without requiring the model to write checkpoints.
+func TestCUJ_A9_ContextRecoveryPreservesTaskAndLatestScope(t *testing.T) {
+	f := newRecoveryFixture(t)
+	f.old.onSend = func(n int, _ string) error {
+		if n == 3 {
+			return recoveryTestFailure{}
+		}
+		answer := "goal received"
+		if n == 2 {
+			answer = "scope updated"
+		}
+		f.old.events <- Event{Type: EventResult, Content: answer, Done: true}
+		return nil
+	}
+	f.fresh.onSend = func(_ int, prompt string) error {
+		answer := "lost task evidence"
+		if strings.Contains(prompt, "compare both sources") && strings.Contains(prompt, "do not publish") && strings.Contains(prompt, "continue") {
+			answer = "continued the comparison and kept the result local"
+		}
+		f.fresh.events <- Event{Type: EventResult, Content: answer, Done: true}
+		return nil
+	}
+	for i, action := range []struct{ input, answer string }{
+		{"compare both sources and prepare a report", "goal received"},
+		{"change scope: do not publish; prepare a local draft", "scope updated"},
+		{"continue", "continued the comparison and kept the result local"},
+	} {
+		f.e.ReceiveMessage(f.p, f.message(fmt.Sprintf("cuj-%d", i), action.input))
+		recoveryAwait(t, action.answer, func() bool {
+			return strings.Contains(strings.Join(f.p.getSent(), "\n"), action.answer) && !f.session.Busy()
+		})
+		if i < 2 && f.a.historyReads.Load() != 0 {
+			t.Fatal("ordinary conversation required a recovery checkpoint")
+		}
+	}
+	visible := strings.Join(f.p.getSent(), "\n")
+	if !strings.Contains(visible, f.e.i18n.T(MsgContextRecovering)) || strings.Contains(visible, "lost task evidence") {
+		t.Fatal(visible)
+	}
+	// Fourth user action: verify the ordinary conversation remains available.
+	f.e.ReceiveMessage(f.p, f.message("history", "/history"))
+	recoveryAwait(t, "preserved history", func() bool {
+		return strings.Contains(strings.Join(f.p.getSent(), "\n"), "change scope: do not publish")
+	})
+}
+
+func TestCUJ_A10_StopDuringContextRecoveryRemainsStopped(t *testing.T) {
+	f := newRecoveryFixture(t)
+	started := make(chan struct{})
+	f.old.onSend = func(n int, _ string) error {
+		if n == 2 {
+			return recoveryTestFailure{}
+		}
+		f.old.events <- Event{Type: EventResult, Content: "task accepted", Done: true}
+		return nil
+	}
+	f.old.onFresh = func(ctx context.Context) (AgentSession, error) { close(started); <-ctx.Done(); return nil, ctx.Err() }
+	f.e.ReceiveMessage(f.p, f.message("goal", "prepare my report"))
+	recoveryAwait(t, "goal response", func() bool {
+		return strings.Contains(strings.Join(f.p.getSent(), "\n"), "task accepted") && !f.session.Busy()
+	})
+	continued := f.message("continue", "continue")
+	cancelledReceipt := make(chan struct{})
+	var receiptOnce sync.Once
+	continued.OnContextRecovery = func(record *ContextRecoveryRecord) {
+		if record.Phase == "cancelled" {
+			receiptOnce.Do(func() { close(cancelledReceipt) })
+		}
+	}
+	f.e.ReceiveMessage(f.p, continued)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery did not start")
+	}
+	f.e.ReceiveMessage(f.p, f.message("stop", "/stop"))
+	recoveryAwait(t, "visible stop acknowledgement", func() bool {
+		return strings.Contains(strings.Join(f.p.getSent(), "\n"), f.e.i18n.T(MsgExecutionStopped))
+	})
+	recoveryAwait(t, "cancelled recovery", func() bool { r := f.session.GetContextRecovery(); return r != nil && r.Phase == "cancelled" })
+	select {
+	case <-cancelledReceipt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled recovery was not persisted")
+	}
+	if len(f.fresh.sent()) != 0 {
+		t.Fatal("stopped task resumed")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Helper types: cujAgent + cujAgentSession give per-CUJ control over what the
 // agent "replies" for each user prompt, without bringing up a real LLM.

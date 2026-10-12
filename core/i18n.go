@@ -204,6 +204,8 @@ const (
 	MsgExecutionStopped          MsgKey = "execution_stopped"
 	MsgSessionCloseFailed        MsgKey = "session_close_failed"
 	MsgSessionResumeUnsafe       MsgKey = "session_resume_unsafe"
+	MsgContextRecovering         MsgKey = "context_recovering"
+	MsgContextRecoveryFailed     MsgKey = "context_recovery_failed"
 	MsgSessionCancelled          MsgKey = "session_cancelled"
 	MsgNoExecution               MsgKey = "no_execution"
 	MsgPreviousProcessing        MsgKey = "previous_processing"
@@ -775,6 +777,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⚠️ 上一個行程未能確認已停止，因此沒有續接原會話，已為你開啟全新會話（先前上下文未帶入）。這是為了避免兩個智能體同時操作同一個會話。",
 		LangJapanese:           "⚠️ 前のプロセスの停止を確認できなかったため、会話を再開せず新しいセッションを開始しました（以前の文脈は引き継がれません）。同じ会話を2つのエージェントが操作するのを防ぐためです。",
 		LangSpanish:            "⚠️ No se pudo confirmar que el proceso anterior se detuviera, así que no se reanudó esta conversación: se inició una sesión nueva (sin el contexto anterior). Así se evita que dos agentes actúen sobre la misma conversación.",
+	},
+	MsgContextRecovering: {
+		LangEnglish:            "The conversation context was rejected. Rebuilding it once from visible records and the original input to continue this task.",
+		LangChinese:            "会话上下文被拒绝，正在根据可见记录和原任务输入尝试一次恢复，继续当前任务。",
+		LangTraditionalChinese: "會話上下文被拒絕，正在根據可見記錄和原任務輸入嘗試一次恢復，繼續目前任務。",
+		LangJapanese:           "会話コンテキストが拒否されました。表示可能な記録と元の入力から一度だけ復元し、現在のタスクを引き継ぎます。",
+		LangSpanish:            "Se rechazó el contexto. Se intentará recuperarlo una vez a partir de los registros visibles y la entrada original para continuar esta tarea.",
+	},
+	MsgContextRecoveryFailed: {
+		LangEnglish:            "Automatic continuation stopped (%v). Check the saved recovery record and actual progress before continuing.",
+		LangChinese:            "自动接续已停止（%v）。继续前需要核对已保存的恢复记录和实际进度。",
+		LangTraditionalChinese: "自動接續已停止（%v）。繼續前需要核對已儲存的恢復記錄和實際進度。",
+		LangJapanese:           "自動引き継ぎを停止しました（%v）。続行前に保存済みの復元記録と実際の進捗を確認してください。",
+		LangSpanish:            "La continuación automática se detuvo (%v). Revise el registro de recuperación guardado y el progreso real antes de continuar.",
 	},
 	MsgSessionCancelled: {
 		LangEnglish:            "Session cancelled. Ready for new instructions.",

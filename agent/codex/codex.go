@@ -39,6 +39,7 @@ type Agent struct {
 	mode            string // "suggest" | "auto-edit" | "full-auto" | "yolo"
 	backend         string // "exec" | "app_server"
 	appServerURL    string
+	contextRecovery bool
 	codexHome       string
 	systemPrompt    string
 	appendPrompt    string
@@ -61,12 +62,16 @@ func New(opts map[string]any) (core.Agent, error) {
 	mode, _ := opts["mode"].(string)
 	backend, _ := opts["backend"].(string)
 	appServerURL, _ := opts["app_server_url"].(string)
+	contextRecovery, _ := opts["context_recovery"].(bool)
 	codexHome, _ := opts["codex_home"].(string)
 	systemPrompt, _ := opts["system_prompt"].(string)
 	appendPrompt, _ := opts["append_system_prompt"].(string)
 	mode = normalizeMode(mode)
 	backend = normalizeBackend(backend)
 	appServerURL = normalizeAppServerURL(appServerURL)
+	if contextRecovery && backend != "app_server" {
+		return nil, fmt.Errorf("codex: context_recovery requires backend=app_server")
+	}
 	if backend == "app_server" && appServerURL != "stdio://" {
 		return nil, fmt.Errorf("codex: app_server backend requires app_server_url=stdio; socket transports are not supported by this adapter")
 	}
@@ -104,6 +109,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		mode:            mode,
 		backend:         backend,
 		appServerURL:    appServerURL,
+		contextRecovery: contextRecovery,
 		codexHome:       strings.TrimSpace(codexHome),
 		systemPrompt:    strings.TrimSpace(systemPrompt),
 		appendPrompt:    strings.TrimSpace(appendPrompt),
@@ -494,6 +500,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	reasoningEffort := a.reasoningEffort
 	backend := a.backend
 	appServerURL := a.appServerURL
+	contextRecovery := a.contextRecovery
 	codexHome := a.codexHome
 	systemPrompt := a.systemPrompt
 	appendPrompt := a.appendPrompt
@@ -527,7 +534,13 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 
 	if backend == "app_server" {
-		return newAppServerSession(ctx, cliBin, cliExtraArgs, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
+		return newAppServerSession(ctx, appServerSessionOptions{
+			cliBin: cliBin, cliExtraArgs: cliExtraArgs, url: appServerURL,
+			workDir: workDir, model: model, effort: reasoningEffort, mode: mode,
+			baseURL: baseURL, modelProvider: provName, extraEnv: extraEnv,
+			codexHome: codexHome, promptPreamble: buildCodexPromptPreamble(systemPrompt, appendPrompt),
+			contextRecovery: contextRecovery,
+		}, sessionID)
 	}
 	if codexHome != "" {
 		extraEnv = append(extraEnv, "CODEX_HOME="+codexHome)
@@ -583,8 +596,9 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	defer a.mu.RUnlock()
 
 	opts := map[string]any{
-		"mode":    a.mode,
-		"backend": a.backend,
+		"mode":             a.mode,
+		"backend":          a.backend,
+		"context_recovery": a.contextRecovery,
 	}
 	if a.cmd != "" {
 		opts["cmd"] = append([]string{a.cmd}, a.cliExtraArgs...)

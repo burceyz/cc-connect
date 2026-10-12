@@ -44,15 +44,16 @@ type IPCInput struct {
 }
 
 type IPCReceipt struct {
-	Input          IPCInput `json:"input"`
-	SHA256         string   `json:"sha256"`
-	Status         string   `json:"status"`
-	Code           string   `json:"code,omitempty"`
-	Method         string   `json:"method,omitempty"`
-	TurnID         string   `json:"turn_id,omitempty"`
-	Boot           string   `json:"boot"`
-	UpdatedAt      string   `json:"updated_at"`
-	AcknowledgedAt string   `json:"acknowledged_at,omitempty"`
+	Input          IPCInput               `json:"input"`
+	SHA256         string                 `json:"sha256"`
+	Status         string                 `json:"status"`
+	Code           string                 `json:"code,omitempty"`
+	Method         string                 `json:"method,omitempty"`
+	TurnID         string                 `json:"turn_id,omitempty"`
+	Boot           string                 `json:"boot"`
+	UpdatedAt      string                 `json:"updated_at"`
+	AcknowledgedAt string                 `json:"acknowledged_at,omitempty"`
+	Recovery       *ContextRecoveryRecord `json:"context_recovery,omitempty"`
 }
 
 func (s *APIServer) initSessionIPC(dir string) error {
@@ -322,7 +323,9 @@ func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput) {
 		SessionKey: input.Target.SessionKey, Platform: platform.Name(),
 		MessageID: "ipc-" + input.EventID, UserID: "ipc", UserName: "ipc",
 		Content: input.Prompt, ReplyCtx: replyCtx,
+		Origin:                 InvocationOrigin{Kind: "ipc", ID: input.EventID, TriggeredAt: time.Now().UTC()},
 		ExpectedAgentSessionID: input.Target.AgentSessionID,
+		OnContextRecovery:      func(record *ContextRecoveryRecord) { s.recordIPCRecovery(input.EventID, record) },
 		OnAgentInput: func(err error) {
 			status, code := "delivered", ""
 			if err != nil {
@@ -339,24 +342,77 @@ func (s *APIServer) steerIPC(e *Engine, input IPCInput) {
 	e.interactiveMu.Lock()
 	state := e.interactiveStates[input.Target.SessionKey]
 	var as AgentSession
+	var evidence *recoverySteeredInput
 	if state != nil {
 		state.mu.Lock()
-		as = state.agentSession
+		if !state.recovering && !state.recoveryInputPending && !state.stopped {
+			as = state.agentSession
+			if _, ok := as.(LiveInputSteerer); ok && as.Alive() {
+				evidence = &recoverySteeredInput{Input: input, Status: "dispatching", AcceptedAt: time.Now().UTC(), done: make(chan struct{}),
+					onRecovery: func(record *ContextRecoveryRecord) { s.recordIPCRecovery(input.EventID, record) }}
+				// Original durable receipts remain complete in the IPC store.
+				if len(state.recoveryInputs) >= 128 {
+					state.recoveryInputs = state.recoveryInputs[1:]
+					state.recoveryInputsDropped++
+				}
+				state.recoveryInputs = append(state.recoveryInputs, evidence)
+			}
+		}
 		state.mu.Unlock()
 	}
 	e.interactiveMu.Unlock()
+	if evidence != nil {
+		defer func() {
+			state.mu.Lock()
+			if evidence.Status == "dispatching" {
+				evidence.Status = "not_sent"
+			}
+			close(evidence.done)
+			state.mu.Unlock()
+		}()
+	}
 	steerer, ok := as.(LiveInputSteerer)
 	if !ok || !as.Alive() {
 		s.finishIPC(input.EventID, "waiting", "", "", "session_busy_without_live_input")
 		return
 	}
 	turn, err := steerer.SteerInput(input.Target.AgentSessionID, input.Prompt)
+	status := "delivered"
 	if errors.Is(err, ErrNoActiveInput) {
+		status = "not_sent"
 		s.finishIPC(input.EventID, "waiting", "", "", "turn_not_ready")
 	} else if err != nil {
+		status = "unknown"
 		s.finishIPC(input.EventID, "unknown", "steer", "", "steer_unconfirmed")
 	} else {
 		s.finishIPC(input.EventID, "delivered", "steer", turn, "")
+	}
+	if evidence != nil {
+		state.mu.Lock()
+		evidence.Status, evidence.TurnID = status, turn
+		state.mu.Unlock()
+	}
+}
+
+// Recovery metadata never changes the pinned target, original input/hash,
+// delivery result or old-session acknowledgement of an IPC event.
+func (s *APIServer) recordIPCRecovery(id string, record *ContextRecoveryRecord) {
+	s.ipcMu.Lock()
+	defer s.ipcMu.Unlock()
+	receipt, err := s.ipcRead(id)
+	if err != nil {
+		slog.Error("ipc recovery receipt unavailable", "event_id", id)
+		return
+	}
+	if receipt.Input.Target.AgentSessionID != record.FromSessionID {
+		return
+	}
+	if receipt.Recovery != nil && receipt.Recovery.UpdatedAt.After(record.UpdatedAt) {
+		return
+	}
+	receipt.Recovery = cloneContextRecovery(record)
+	if err := s.ipcSave(receipt); err != nil {
+		slog.Error("ipc recovery receipt update failed", "event_id", id)
 	}
 }
 

@@ -1,0 +1,53 @@
+# Local context recovery
+
+`context_recovery` is an opt-in Codex `app_server` capability. It handles a structured terminal `invalid_encrypted_content` error from resume, input submission or a running turn. Ordinary assistant text, other HTTP 400 responses and retrying notifications do not trigger it. The default remains disabled:
+
+```toml
+[projects.agent.options]
+backend = "app_server"
+context_recovery = false
+```
+
+An operator can enable it for a separately approved rollout. Enabling it with `backend = "exec"` is a configuration error. Recovery requires a persistent session store and a local executor whose shutdown can be confirmed; it does not recover an externally owned WebSocket executor.
+
+## Continuing the task
+
+Normal conversations use their existing visible history and host input records. The model does not need to write periodic summaries, task tables or checkpoints. After a qualifying fault the host:
+
+1. Reserves the one allowed recovery attempt durably, tied to the logical host session.
+2. Confirms the old executor has exited and its transport readers have stopped.
+3. Exports visible native history and gathers the original input, host history, invocation source and known IPC input attempts.
+4. Starts a clean native context with the old executor's actual model, reasoning effort, cwd, permissions, preamble, executable and environment snapshot.
+5. Saves the exact old-to-new binding, includes queued user corrections and sends a continuation instruction once.
+
+Preparation is capped at 90 seconds and by the remaining original turn deadline. `/stop`, `/new` and `/switch` invalidate a pending recovery. A late startup result is closed rather than installed into a replaced conversation. `/ps` corrections are retained as user input and queued while recovery is preparing or its first input is pending.
+
+The continuation instruction tells the model that evidence can be incomplete. It must inspect relevant authorized instructions, artifacts and receipts, respect later user changes or cancellation, and continue the remaining work. Completed actions must not be repeated. Unknown outcomes require reconciliation before retrying the affected action; other independent work can continue. Existing background jobs are queried or awaited rather than dispatched again. No new access, upstream investigation or deployment is authorized by recovery.
+
+There is no deterministic business-state reconstruction: the host supplies evidence and execution facts, while the model checks task meaning against the actual workspace. Missing evidence is reported instead of replaced with a guessed completion state.
+
+## Materials and privacy
+
+The host writes a private `context-recovery/<recovery-id>/` directory beside the session store. `visible-material.json` holds filtered source evidence and the preparation snapshot; `continuation.txt` holds the exact recovery input. Directories use mode `0700`, files `0600`, and symlink material directories are rejected. Keep these runtime artifacts out of source control; they can contain ordinary conversation and tool data.
+
+Native export checks the exact session ID, canonical cwd, unique source file and non-subagent metadata. Only visible user/assistant messages and explicit tool input/output are exported. Analysis, reasoning, hidden summaries, encrypted content and raw system/developer payloads are excluded. The native source path is provenance only; the continuation directs the model to the filtered material rather than raw session logs.
+
+Native limits are 4 MiB per raw line, 256 KiB per visible item, and 16 MiB / 8192 visible items overall. Oversize lines do not stop later user corrections from being read. Opening and recent evidence are retained; omissions, incomplete reads, duplicate log representations and missing media are stated explicitly. The inline continuation is capped at 96 KiB, prioritizing the failed input and latest user updates. The bundle retains the available full exported evidence. Current in-memory attachments are supplied to the new turn; the JSON contains only their names, MIME types, sizes and counts.
+
+## Attempts and receipts
+
+`Session.context_recovery` is the current host-owned ledger. Its `id`, source/target native IDs, original input digest, `origin`, timestamps, `phase`, `input_status`, `turn_status` and `error_code` are persisted. A completed model turn is recorded as `model_turn_completed`, not as verified business completion. An explicit result is stronger evidence of input acceptance than a later lost Send response.
+
+The attempt is not reset by a native ID change, another user message, a process restart or a successful model response. Selecting a known ancestor native ID keeps the exact requested ID and inherits the same spent budget within the owning session key. `/new` creates an explicit new host session and a new budget. Without a separate application task ID, this host-session chain is the conservative task boundary.
+
+An interrupted preparation/send is never automatically replayed after restart. An unresolved shutdown or persistence failure blocks normal reuse as well. Review the saved materials, process state, binding and action receipts before selecting an appropriate context; creating a new session alone does not establish what business actions already happened.
+
+Timer and cron inputs carry their original occurrence metadata. Recovery stays in that invocation; it does not refire or reschedule a trigger. A failed prompt turn returns an error to the scheduler, including for muted jobs. A shell timer still runs its original shell command once; when that command injects IPC input, recovery records the input as IPC and retains its supplied task instructions.
+
+IPC adds a separate `context_recovery` receipt field. Original target, input/hash, delivery status and acknowledgement are unchanged. Current accepted input and uncertain steer attempts are visible evidence for continuation. Future events or ACKs addressed to the old native ID still fail their exact target check. Callback migration and a general IPC identity redesign are outside this feature.
+
+## Local validation
+
+Regression tests use fake agents, temporary stores and a fake app-server process, without real model requests. They cover startup/send/terminal rejection, current queued input, late corrections, stop/new/switch, close/write failures, persistent attempt budgets, ancestor selection, receipt ordering, timer outcomes, fixed IPC targets, history filtering and private material storage. CUJs `A9` and `A10` exercise task/scope/continue and stop-during-recovery through `ReceiveMessage`.
+
+Run ordinary repository tests with real-provider integration tests disabled in environments where CLIs or credentials are present. The feature has no installation or service-restart action.

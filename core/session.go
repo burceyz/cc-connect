@@ -55,6 +55,9 @@ type Session struct {
 	// ExplicitActivationTTL caps how long this exemption lasts so abandoned
 	// sessions cannot permanently occupy the active slot.
 	ExplicitActivatedAt time.Time `json:"explicit_activated_at,omitempty"`
+	// ContextRecovery is a host-owned, one-attempt continuation record. It is
+	// written only after a qualifying failure, never by periodic model work.
+	ContextRecovery *ContextRecoveryRecord `json:"context_recovery,omitempty"`
 
 	mu        sync.Mutex `json:"-"`
 	busy      bool       `json:"-"`
@@ -387,6 +390,7 @@ type sessionSnapshot struct {
 // It can persist state to a JSON file and reload on startup.
 type SessionManager struct {
 	mu            sync.RWMutex
+	saveMu        sync.Mutex
 	sessions      map[string]*Session
 	activeSession map[string]string
 	userSessions  map[string][]string
@@ -507,6 +511,30 @@ func (sm *SessionManager) SwitchSession(userKey, target string) (*Session, error
 func (sm *SessionManager) SwitchToAgentSession(userKey, agentSID, agentName, summary string) *Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	// Selecting an ancestor native ID is still the same continuation chain.
+	// Preserve the exact selected target while inheriting its spent budget;
+	// only an explicit NewSession starts a new logical task boundary.
+	var inheritedRecovery *ContextRecoveryRecord
+	for _, sid := range sm.userSessions[userKey] {
+		candidate := sm.sessions[sid]
+		if candidate == nil {
+			continue
+		}
+		candidate.mu.Lock()
+		known := candidate.AgentSessionID == agentSID
+		for _, past := range candidate.PastAgentSessionIDs {
+			if past == agentSID {
+				known = true
+				break
+			}
+		}
+		if known && candidate.ContextRecovery != nil {
+			if inheritedRecovery == nil || candidate.ContextRecovery.UpdatedAt.After(inheritedRecovery.UpdatedAt) {
+				inheritedRecovery = cloneContextRecovery(candidate.ContextRecovery)
+			}
+		}
+		candidate.mu.Unlock()
+	}
 
 	for _, sid := range sm.userSessions[userKey] {
 		s := sm.sessions[sid]
@@ -517,6 +545,11 @@ func (sm *SessionManager) SwitchToAgentSession(userKey, agentSID, agentName, sum
 		aid := s.AgentSessionID
 		s.mu.Unlock()
 		if aid == agentSID {
+			s.mu.Lock()
+			if s.ContextRecovery == nil {
+				s.ContextRecovery = cloneContextRecovery(inheritedRecovery)
+			}
+			s.mu.Unlock()
 			sm.activeSession[userKey] = s.ID
 			s.MarkExplicitlyActivated()
 			sm.saveLocked()
@@ -525,6 +558,7 @@ func (sm *SessionManager) SwitchToAgentSession(userKey, agentSID, agentName, sum
 	}
 
 	s := sm.createLocked(userKey, summary)
+	s.ContextRecovery = cloneContextRecovery(inheritedRecovery)
 	s.SetAgentInfo(agentSID, agentName, summary)
 	s.MarkExplicitlyActivated()
 	sm.saveLocked()
@@ -731,9 +765,25 @@ func (sm *SessionManager) Save() {
 	sm.saveLocked()
 }
 
+// SaveWithError is used before recovery side effects: a failed durable write
+// must prevent creating or sending input to another execution context.
+func (sm *SessionManager) SaveWithError() error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.saveLockedWithError(true)
+}
+
 func (sm *SessionManager) saveLocked() {
+	if err := sm.saveLockedWithError(false); err != nil {
+		slog.Error("session: failed to save", "path", sm.storePath, "error", err)
+	}
+}
+
+func (sm *SessionManager) saveLockedWithError(durable bool) error {
+	sm.saveMu.Lock()
+	defer sm.saveMu.Unlock()
 	if sm.storePath == "" {
-		return
+		return nil
 	}
 
 	// Build a deep-copy snapshot to avoid racing with concurrent Session mutations.
@@ -750,6 +800,7 @@ func (sm *SessionManager) saveLocked() {
 			Name:                s.Name,
 			AgentSessionID:      agentSID,
 			AgentType:           s.AgentType,
+			ActiveProvider:      s.ActiveProvider,
 			PastAgentSessionIDs: append([]string(nil), s.PastAgentSessionIDs...),
 			History:             append([]HistoryEntry(nil), s.History...),
 			CreatedAt:           s.CreatedAt,
@@ -759,6 +810,7 @@ func (sm *SessionManager) saveLocked() {
 			// restart; otherwise a /switch followed by a crash would lose the
 			// exemption and the next message after restart would be rotated.
 			ExplicitActivatedAt: s.ExplicitActivatedAt,
+			ContextRecovery:     cloneContextRecovery(s.ContextRecovery),
 		}
 		s.mu.Unlock()
 	}
@@ -791,16 +843,19 @@ func (sm *SessionManager) saveLocked() {
 	}
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		slog.Error("session: failed to marshal", "error", err)
-		return
+		return fmt.Errorf("marshal session snapshot: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(sm.storePath), 0o755); err != nil {
-		slog.Error("session: failed to create dir", "error", err)
-		return
+		return fmt.Errorf("create session directory: %w", err)
 	}
-	if err := AtomicWriteFile(sm.storePath, data, 0o644); err != nil {
-		slog.Error("session: failed to write", "path", sm.storePath, "error", err)
+	write := AtomicWriteFile
+	if durable {
+		write = recoveryWriteFile
 	}
+	if err := write(sm.storePath, data, 0o644); err != nil {
+		return fmt.Errorf("write session snapshot: %w", err)
+	}
+	return nil
 }
 
 func (sm *SessionManager) load() {

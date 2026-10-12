@@ -32,8 +32,9 @@ type rpcNotificationEnvelope struct {
 }
 
 type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data"`
 }
 
 type initResponse struct {
@@ -67,11 +68,9 @@ type turnStartResponse struct {
 type turnNotification struct {
 	ThreadID string `json:"threadId"`
 	Turn     struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-		Error  *struct {
-			Message string `json:"message"`
-		} `json:"error"`
+		ID     string              `json:"id"`
+		Status string              `json:"status"`
+		Error  *appServerTurnError `json:"error"`
 	} `json:"turn"`
 }
 
@@ -82,7 +81,10 @@ type itemNotification struct {
 }
 
 type errorNotification struct {
-	Message string `json:"message"`
+	Message   string              `json:"message"`
+	Error     *appServerTurnError `json:"error"`
+	WillRetry *bool               `json:"willRetry"`
+	TurnID    string              `json:"turnId"`
 }
 
 type appServerRateLimitsResponse struct {
@@ -140,29 +142,47 @@ type appServerRequestUserInputAnswer struct {
 	Answers []string `json:"answers"`
 }
 
+type appServerSessionOptions struct {
+	cliBin          string
+	cliExtraArgs    []string
+	url             string
+	workDir         string
+	model           string
+	effort          string
+	mode            string
+	baseURL         string
+	modelProvider   string
+	extraEnv        []string
+	codexHome       string
+	promptPreamble  string
+	contextRecovery bool
+	processEnv      []string
+}
+
 type appServerSession struct {
-	cliBin         string
-	cliExtraArgs   []string
-	url            string
-	workDir        string
-	model          string
-	effort         string
-	mode           string
-	baseURL        string
-	modelProvider  string
-	extraEnv       []string
-	codexHome      string
-	promptPreamble string
+	appServerSessionOptions
 
 	events chan core.Event
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	procMu  sync.Mutex
-	writeMu sync.Mutex
+	cmd                  *exec.Cmd
+	stdin                io.WriteCloser
+	procMu               sync.Mutex
+	writeMu              sync.Mutex
+	processDone          chan struct{}
+	processExitConfirmed bool
+	processWaitErr       error
+	stopOnce             sync.Once
+	stopErr              error
+	stopWaitOnce         sync.Once
+	stopWaitDone         chan struct{}
+	workerWaitOnce       sync.Once
+	workerWaitDone       chan struct{}
+	killProcess          func(*exec.Cmd) error // nil uses forceKillCmd
+	recoveryClosed       atomic.Bool
+	recoveryStarted      atomic.Bool
 
 	nextID atomic.Int64
 
@@ -181,6 +201,7 @@ type appServerSession struct {
 	stateMu      sync.Mutex
 	pendingMsgs  []string
 	currentTurn  string
+	finishedTurn string
 	preambleSent bool
 
 	runtimeMu sync.RWMutex
@@ -193,27 +214,20 @@ const (
 	appServerUsageRefreshTimeout = 1500 * time.Millisecond
 )
 
-func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []string, url, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string) (*appServerSession, error) {
+func newAppServerSession(ctx context.Context, opts appServerSessionOptions, resumeID string) (*appServerSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
+	opts.cliExtraArgs = append([]string(nil), opts.cliExtraArgs...)
+	opts.extraEnv = append([]string(nil), opts.extraEnv...)
+	opts.processEnv = append([]string(nil), opts.processEnv...)
+	opts.codexHome = strings.TrimSpace(opts.codexHome)
 	s := &appServerSession{
-		cliBin:           cliBin,
-		cliExtraArgs:     append([]string(nil), cliExtraArgs...),
-		url:              url,
-		workDir:          workDir,
-		model:            model,
-		effort:           effort,
-		mode:             mode,
-		baseURL:          baseURL,
-		modelProvider:    modelProvider,
-		extraEnv:         append([]string(nil), extraEnv...),
-		codexHome:        strings.TrimSpace(codexHome),
-		promptPreamble:   buildCodexPromptPreamble(systemPrompt, appendPrompt),
-		events:           make(chan core.Event, 128),
-		ctx:              sessionCtx,
-		cancel:           cancel,
-		pending:          make(map[int64]chan rpcResponseEnvelope),
-		pendingApprovals: make(map[string]chan core.PermissionResult),
-		preambleSent:     resumeID != "" && resumeID != core.ContinueSession,
+		appServerSessionOptions: opts,
+		events:                  make(chan core.Event, 128),
+		ctx:                     sessionCtx,
+		cancel:                  cancel,
+		pending:                 make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals:        make(map[string]chan core.PermissionResult),
+		preambleSent:            resumeID != "" && resumeID != core.ContinueSession,
 	}
 	s.alive.Store(true)
 
@@ -228,8 +242,7 @@ func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []stri
 	}
 
 	if err := s.ensureThread(resumeID); err != nil {
-		_ = s.Close()
-		return nil, err
+		return nil, s.closeFailedStartup(err, resumeID)
 	}
 	if err := s.refreshUsage(context.Background()); err != nil {
 		slog.Debug("codex app-server: initial rate limit fetch failed", "error", err)
@@ -271,15 +284,21 @@ func (s *appServerSession) connect() error {
 	if err != nil {
 		return fmt.Errorf("codex app-server resolve CLI: %w", err)
 	}
+	s.cliBin = bin // recovery must use the executable that actually ran
 	args = append(append([]string(nil), s.cliExtraArgs...), args...)
 	cmd := exec.CommandContext(s.ctx, bin, args...)
 	cmd.Dir = s.workDir
+	prepareCmdForKill(cmd)
 	env := append([]string(nil), s.extraEnv...)
 	if s.codexHome != "" {
 		env = append(env, "CODEX_HOME="+s.codexHome)
 	}
-	if len(env) > 0 {
-		cmd.Env = core.MergeEnv(os.Environ(), env)
+	if s.processEnv != nil {
+		// The old thread may have resumed into another cwd. Preserve its
+		// environment, with PWD following the actual directory of this process.
+		cmd.Env = core.MergeEnv(s.processEnv, []string{"PWD=" + s.workDir})
+	} else {
+		cmd.Env = core.MergeEnv(cmd.Environ(), env)
 	}
 
 	stdin, err := cmd.StdinPipe()
@@ -301,6 +320,8 @@ func (s *appServerSession) connect() error {
 	s.procMu.Lock()
 	s.cmd = cmd
 	s.stdin = stdin
+	s.processEnv = append([]string(nil), cmd.Env...)
+	s.processDone = make(chan struct{})
 	s.procMu.Unlock()
 
 	slog.Info("codex app-server session started", "transport", "stdio", "pid", cmd.Process.Pid, "work_dir", s.workDir)
@@ -525,8 +546,11 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	}
 
 	s.stateMu.Lock()
-	s.currentTurn = resp.Turn.ID
-	s.pendingMsgs = s.pendingMsgs[:0]
+	// A fast terminal notification can precede the turn/start response. Do
+	// not revive the completed turn or erase its buffered successor's state.
+	if s.finishedTurn != resp.Turn.ID && (s.currentTurn == "" || s.currentTurn == resp.Turn.ID) {
+		s.currentTurn = resp.Turn.ID
+	}
 	s.stateMu.Unlock()
 
 	return nil
@@ -959,34 +983,81 @@ func (s *appServerSession) Alive() bool {
 }
 
 func (s *appServerSession) Close() error {
-	s.alive.Store(false)
-	s.cancel()
-
-	s.procMu.Lock()
-	if s.stdin != nil {
-		_ = s.stdin.Close()
-		s.stdin = nil
+	ctx, cancel := context.WithTimeout(context.Background(), appServerCloseTimeout)
+	defer cancel()
+	if err := s.waitForStop(ctx); err != nil {
+		return err
 	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
-	s.procMu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
 	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-s.workersDone():
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("codex app-server: shutdown timed out: %w", ctx.Err())
 	}
+}
 
-	s.closeOnce.Do(func() {
-		close(s.events)
+func (s *appServerSession) waitForStop(ctx context.Context) error {
+	s.stopWaitOnce.Do(func() {
+		s.stopWaitDone = make(chan struct{})
+		s.workersDone() // close events eventually, even if this caller times out
+		go func() {
+			_ = s.stopProcess()
+			close(s.stopWaitDone)
+		}()
 	})
-	return nil
+	select {
+	case <-s.stopWaitDone:
+		return s.stopErr
+	case <-ctx.Done():
+		return fmt.Errorf("codex app-server: stopping executor: %w", ctx.Err())
+	}
+}
+
+func (s *appServerSession) stopProcess() error {
+	s.stopOnce.Do(func() {
+		s.alive.Store(false)
+		s.procMu.Lock()
+		stdin, cmd := s.stdin, s.cmd
+		s.stdin = nil
+		s.procMu.Unlock()
+		// Signal the owned process group before canceling CommandContext;
+		// cancellation can otherwise reap its leader before the group signal.
+		kill := s.killProcess
+		if kill == nil {
+			kill = forceKillCmd
+		}
+		if err := kill(cmd); err != nil {
+			s.stopErr = fmt.Errorf("codex app-server: terminate process: %w", err)
+		}
+		if s.cancel != nil {
+			s.cancel()
+		}
+		var closeErr error
+		if stdin != nil {
+			closeErr = stdin.Close()
+			if errors.Is(closeErr, os.ErrClosed) {
+				closeErr = nil
+			}
+		}
+		s.stopErr = errors.Join(s.stopErr, closeErr)
+	})
+	return s.stopErr
+}
+
+func (s *appServerSession) workersDone() <-chan struct{} {
+	s.workerWaitOnce.Do(func() {
+		s.workerWaitDone = make(chan struct{})
+		go func() {
+			s.wg.Wait()
+			s.closeOnce.Do(func() {
+				if s.events != nil {
+					close(s.events)
+				}
+			})
+			close(s.workerWaitDone)
+		}()
+	})
+	return s.workerWaitDone
 }
 
 func (s *appServerSession) readLoop(r io.Reader) {
@@ -1041,7 +1112,7 @@ func (s *appServerSession) readLoop(r io.Reader) {
 
 	err := scanner.Err()
 	if err != nil {
-		if s.ctx.Err() == nil && !errors.Is(err, io.EOF) {
+		if s.ctx.Err() == nil && s.alive.Load() && !errors.Is(err, io.EOF) {
 			slog.Warn("codex app-server read failed", "error", err)
 			if errors.Is(err, bufio.ErrTooLong) {
 				s.emitError(fmt.Errorf("codex app-server line exceeds max size (%d bytes): %w", maxLineSize, err))
@@ -1082,13 +1153,21 @@ func (s *appServerSession) waitLoop() {
 
 	s.procMu.Lock()
 	cmd := s.cmd
+	processDone := s.processDone
 	s.procMu.Unlock()
+	if processDone != nil {
+		defer close(processDone)
+	}
 	if cmd == nil {
 		return
 	}
 
 	err := cmd.Wait()
-	if s.ctx.Err() == nil && err != nil {
+	s.procMu.Lock()
+	s.processExitConfirmed = cmd.ProcessState != nil
+	s.processWaitErr = err
+	s.procMu.Unlock()
+	if s.ctx.Err() == nil && s.alive.Load() && err != nil {
 		slog.Warn("codex app-server exited unexpectedly", "error", err)
 		s.emitError(fmt.Errorf("codex app-server exited: %w", err))
 	}
@@ -1139,8 +1218,10 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 		var notif turnNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
 			s.stateMu.Lock()
-			s.currentTurn = notif.Turn.ID
-			s.pendingMsgs = s.pendingMsgs[:0]
+			if notif.Turn.ID != s.finishedTurn {
+				s.currentTurn = notif.Turn.ID
+				s.pendingMsgs = s.pendingMsgs[:0]
+			}
 			s.stateMu.Unlock()
 			s.storeContextUsage(nil)
 		}
@@ -1160,17 +1241,14 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 	case "turn/completed":
 		var notif turnNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			if strings.EqualFold(strings.TrimSpace(notif.Turn.Status), "failed") || notif.Turn.Error != nil {
-				errMsg := ""
-				if notif.Turn.Error != nil {
-					errMsg = strings.TrimSpace(notif.Turn.Error.Message)
-				}
-				if errMsg == "" {
-					errMsg = "turn failed (no details)"
-				}
-				s.failTurn(fmt.Errorf("%s", errMsg))
+			if notif.Turn.ID == "" {
+				return
+			}
+			failed := strings.EqualFold(strings.TrimSpace(notif.Turn.Status), "failed")
+			if failed || notif.Turn.Error != nil {
+				s.finishTurn(notif.Turn.ID, s.terminalFailure(notif.Turn.Error, failed))
 			} else {
-				s.completeTurn()
+				s.finishTurn(notif.Turn.ID, nil)
 			}
 		}
 
@@ -1200,8 +1278,17 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 
 	case "error":
 		var notif errorNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil && strings.TrimSpace(notif.Message) != "" {
-			s.emitError(fmt.Errorf("%s", notif.Message))
+		if err := json.Unmarshal(paramsRaw, &notif); err != nil {
+			return
+		}
+		if notif.WillRetry != nil && *notif.WillRetry {
+			return // the backend still owns this attempt; it is not terminal
+		}
+		if notif.WillRetry != nil && !*notif.WillRetry && notif.Error != nil && notif.TurnID != "" {
+			s.finishTurn(notif.TurnID, s.terminalFailure(notif.Error, true))
+		} else if strings.TrimSpace(notif.Message) != "" {
+			// Legacy unscoped notifications are not proof of a failed turn.
+			s.emitError(errors.New(notif.Message))
 		}
 	}
 }
@@ -1554,27 +1641,31 @@ func rpcIDToInt64(v any) (int64, bool) {
 }
 
 func (s *appServerSession) completeTurn() {
+	s.finishTurn("", nil)
+}
+
+func (s *appServerSession) finishTurn(expectedTurn string, err error) {
 	s.stateMu.Lock()
-	if s.currentTurn == "" {
+	if s.currentTurn == "" || (expectedTurn != "" && s.currentTurn != expectedTurn) {
 		s.stateMu.Unlock()
 		return
 	}
+	s.finishedTurn = s.currentTurn
 	s.currentTurn = ""
+	if err != nil {
+		s.pendingMsgs = s.pendingMsgs[:0]
+	}
 	s.stateMu.Unlock()
+	if err != nil {
+		s.emitError(err)
+		return
+	}
 	s.flushPendingAsText()
 	s.emit(core.Event{Type: core.EventResult, SessionID: s.CurrentSessionID(), Done: true})
 }
 
 func (s *appServerSession) failTurn(err error) {
-	s.stateMu.Lock()
-	if s.currentTurn == "" {
-		s.stateMu.Unlock()
-		return
-	}
-	s.currentTurn = ""
-	s.pendingMsgs = s.pendingMsgs[:0]
-	s.stateMu.Unlock()
-	s.emitError(err)
+	s.finishTurn("", err)
 }
 
 func (s *appServerSession) flushPendingAsThinking() {
@@ -1673,7 +1764,7 @@ func (s *appServerSession) requestWithTimeout(method string, params any, out any
 	select {
 	case resp := <-ch:
 		if resp.Error != nil {
-			return fmt.Errorf("%s", strings.TrimSpace(resp.Error.Message))
+			return s.rpcFailure(method, resp.Error)
 		}
 		if out != nil {
 			if err := json.Unmarshal(resp.Result, out); err != nil {
@@ -1732,20 +1823,9 @@ func (s *appServerSession) contextErr() error {
 }
 
 func (s *appServerSession) abortTransport() {
-	s.alive.Store(false)
-	if s.cancel != nil {
-		s.cancel()
+	if err := s.stopProcess(); err != nil {
+		slog.Warn("codex app-server: transport shutdown failed", "error", err)
 	}
-
-	s.procMu.Lock()
-	if s.stdin != nil {
-		_ = s.stdin.Close()
-		s.stdin = nil
-	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
-	s.procMu.Unlock()
 }
 
 func (s *appServerSession) notify(method string, params any) error {
