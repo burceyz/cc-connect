@@ -90,13 +90,19 @@ func TestForceKillCmd_KillsGrandchild(t *testing.T) {
 	}
 	_ = cmd.Wait()
 
-	// Verify the grandchild is gone by checking that signaling it with 0
-	// (no-op, just checks existence) returns ESRCH within a short window.
-	// We can't easily parse the PID without strconv import bloat in tests,
-	// so we rely on `pgrep` semantics: re-kill the group should be a no-op.
-	if err := forceKillCmd(cmd); err != nil {
-		t.Errorf("second forceKillCmd should be no-op, got %v", err)
+	// Wait reaps the direct child; the OS may still be reaping descendants.
+	// Probe group existence without sending another destructive signal. A
+	// successful second SIGKILL would not prove that the grandchild exited.
+	deadline = time.Now().Add(2 * time.Second)
+	var probeErr error
+	for time.Now().Before(deadline) {
+		probeErr = syscall.Kill(-cmd.Process.Pid, 0)
+		if probeErr == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("process group still exists after forceKillCmd: %v", probeErr)
 }
 
 func TestSignalProcessGroup_NoProcess(t *testing.T) {

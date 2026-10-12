@@ -133,14 +133,15 @@ func (sm *SessionManager) ownsRecoverySession(key string, session *Session, side
 // invocation contains only the current accepted input. It is ordinary runtime
 // bookkeeping; no task summary or model checkpoint is required on happy paths.
 type recoveryInvocation struct {
-	MessageID  string                       `json:"message_id,omitempty"`
-	Content    string                       `json:"content"`
-	Origin     InvocationOrigin             `json:"origin"`
-	AcceptedAt time.Time                    `json:"accepted_at"`
-	Mode       string                       `json:"mode_override,omitempty"`
-	Images     []ImageAttachment            `json:"-"`
-	Files      []FileAttachment             `json:"-"`
-	OnRecovery func(*ContextRecoveryRecord) `json:"-"`
+	MessageID     string                       `json:"message_id,omitempty"`
+	Content       string                       `json:"content"`
+	SenderContext string                       `json:"sender_context,omitempty"`
+	Origin        InvocationOrigin             `json:"origin"`
+	AcceptedAt    time.Time                    `json:"accepted_at"`
+	Mode          string                       `json:"mode_override,omitempty"`
+	Images        []ImageAttachment            `json:"-"`
+	Files         []FileAttachment             `json:"-"`
+	OnRecovery    func(*ContextRecoveryRecord) `json:"-"`
 }
 
 // recoverySteeredInput records an input attempt, not a completed task. The
@@ -173,4 +174,18 @@ func invocationForQueued(q queuedMessage) *recoveryInvocation {
 		Origin: InvocationOrigin{Kind: "user", ID: q.messageID}, AcceptedAt: time.Now().UTC(),
 		Images: append([]ImageAttachment(nil), q.images...), Files: append([]FileAttachment(nil), q.files...),
 	}
+}
+
+// Keep the configured sender header separate from the original input so the
+// recovery receipt continues to hash the exact content accepted by the host.
+func (e *Engine) recoveryInvocationForMessage(msg *Message) *recoveryInvocation {
+	invocation := invocationForMessage(msg)
+	invocation.SenderContext = e.buildSenderPrompt("", msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+	return invocation
+}
+
+func (e *Engine) recoveryInvocationForQueued(q queuedMessage) *recoveryInvocation {
+	invocation := invocationForQueued(q)
+	invocation.SenderContext = e.buildSenderPrompt("", q.userID, q.userName, q.msgPlatform, q.msgSessionKey, q.channelKey)
+	return invocation
 }

@@ -33,6 +33,8 @@ type contextRecoveryStartupError struct {
 	session *appServerSession
 }
 
+var _ core.RecoveryHistoryProvider = (*contextRecoveryStartupError)(nil)
+
 func (e *contextRecoveryStartupError) Error() string { return e.err.Error() }
 func (e *contextRecoveryStartupError) Unwrap() error { return e.err }
 func (e *contextRecoveryStartupError) RecoveryReason() string {
@@ -40,6 +42,10 @@ func (e *contextRecoveryStartupError) RecoveryReason() string {
 }
 func (e *contextRecoveryStartupError) StartFreshForRecovery(ctx context.Context) (core.AgentSession, error) {
 	return e.session.StartFreshForRecovery(ctx)
+}
+
+func (e *contextRecoveryStartupError) GetRecoveryHistory(ctx context.Context, sessionID string) (core.RecoveryHistory, error) {
+	return e.session.GetRecoveryHistory(ctx, sessionID)
 }
 
 // These are error fields, not arbitrary model output. The code can arrive in
@@ -224,5 +230,8 @@ func (s *appServerSession) closeFailedStartup(err error, resumeID string) error 
 	if closeErr := s.CloseForRecovery(ctx); closeErr != nil {
 		return errors.Join(err, closeErr)
 	}
+	// A rejected resume has no success response to populate threadID. Keep the
+	// exact requested identity for history export and fresh-thread validation.
+	s.threadID.Store(resumeID)
 	return &contextRecoveryStartupError{err: err, session: s}
 }

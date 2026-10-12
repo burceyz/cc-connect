@@ -18,7 +18,9 @@ type sendRecord struct {
 }
 
 type recordingAgent struct {
-	session *recordingSession
+	mu       sync.Mutex
+	session  *recordingSession
+	sessions []*recordingSession
 }
 
 func newRecordingAgent() *recordingAgent {
@@ -28,8 +30,16 @@ func newRecordingAgent() *recordingAgent {
 func (a *recordingAgent) Name() string { return "recording-agent" }
 
 func (a *recordingAgent) StartSession(_ context.Context, sessionID string) (core.AgentSession, error) {
-	a.session.setID(sessionID)
-	return a.session, nil
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// Keep the preconfigured first session for tests that block its result.
+	session := a.session
+	if len(a.sessions) > 0 {
+		session = newRecordingSession()
+	}
+	session.setID(sessionID)
+	a.sessions = append(a.sessions, session)
+	return session, nil
 }
 
 func (a *recordingAgent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
@@ -37,7 +47,35 @@ func (a *recordingAgent) ListSessions(_ context.Context) ([]core.AgentSessionInf
 }
 
 func (a *recordingAgent) Stop() error {
-	return a.session.Close()
+	a.mu.Lock()
+	sessions := append([]*recordingSession(nil), a.sessions...)
+	if len(sessions) == 0 {
+		sessions = []*recordingSession{a.session}
+	}
+	a.mu.Unlock()
+	for _, session := range sessions {
+		_ = session.Close()
+	}
+	return nil
+}
+
+func (a *recordingAgent) waitSessions(t *testing.T, n int) []*recordingSession {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		if len(a.sessions) >= n {
+			sessions := append([]*recordingSession(nil), a.sessions...)
+			a.mu.Unlock()
+			return sessions
+		}
+		a.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	t.Fatalf("timeout waiting for %d sessions, got %d", n, len(a.sessions))
+	return nil
 }
 
 type recordingSession struct {
@@ -150,9 +188,14 @@ func (s *recordingSession) waitRecords(t *testing.T, n int) []sendRecord {
 	return nil
 }
 
+type mediaText struct {
+	content  string
+	replyCtx any
+}
+
 type mediaPlatform struct {
 	mu       sync.Mutex
-	texts    []string
+	texts    []mediaText
 	images   []core.ImageAttachment
 	files    []core.FileAttachment
 	replyCtx []any
@@ -169,7 +212,7 @@ func (p *mediaPlatform) Reply(_ context.Context, replyCtx any, content string) e
 func (p *mediaPlatform) Send(_ context.Context, replyCtx any, content string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.texts = append(p.texts, content)
+	p.texts = append(p.texts, mediaText{content: content, replyCtx: replyCtx})
 	p.replyCtx = append(p.replyCtx, replyCtx)
 	return nil
 }
@@ -191,7 +234,10 @@ func (p *mediaPlatform) SendFile(_ context.Context, replyCtx any, file core.File
 func (p *mediaPlatform) snapshot() (texts []string, messageID string, images []core.ImageAttachment, files []core.FileAttachment, replyCtx []any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]string(nil), p.texts...), "",
+	for _, text := range p.texts {
+		texts = append(texts, text.content)
+	}
+	return texts, "",
 		append([]core.ImageAttachment(nil), p.images...),
 		append([]core.FileAttachment(nil), p.files...),
 		append([]any(nil), p.replyCtx...)
@@ -199,18 +245,28 @@ func (p *mediaPlatform) snapshot() (texts []string, messageID string, images []c
 
 func (p *mediaPlatform) waitTextContaining(t *testing.T, substr string) string {
 	t.Helper()
+	return p.waitTextContainingForContext(t, "", substr)
+}
+
+func (p *mediaPlatform) waitTextContainingForContext(t *testing.T, replyCtx, substr string) string {
+	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		texts, _, _, _, _ := p.snapshot()
-		for _, text := range texts {
-			if strings.Contains(strings.ToLower(text), strings.ToLower(substr)) {
-				return text
+		p.mu.Lock()
+		for _, text := range p.texts {
+			if replyCtx != "" && text.replyCtx != replyCtx {
+				continue
+			}
+			if strings.Contains(strings.ToLower(text.content), strings.ToLower(substr)) {
+				p.mu.Unlock()
+				return text.content
 			}
 		}
+		p.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
 	texts, _, _, _, _ := p.snapshot()
-	t.Fatalf("timeout waiting for text containing %q, got %#v", substr, texts)
+	t.Fatalf("timeout waiting for text containing %q for reply context %q, got %#v", substr, replyCtx, texts)
 	return ""
 }
 
@@ -234,6 +290,36 @@ func mediaMessage(content string) *core.Message {
 		UserName:   "tester",
 		Content:    content,
 		ReplyCtx:   "reply-ctx-1",
+	}
+}
+
+func TestRecordingAgentKeepsSessionsIndependent(t *testing.T) {
+	agent := newRecordingAgent()
+	t.Cleanup(func() { _ = agent.Stop() })
+	first, err := agent.StartSession(context.Background(), "first-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := agent.StartSession(context.Background(), "second-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := first.CurrentSessionID(); got != "first-session" {
+		t.Errorf("first session ID = %q, want first-session", got)
+	}
+	if err := first.Send("first prompt", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-second.Events():
+		t.Errorf("second session received the first session's event: %#v", event)
+	default:
+	}
+	if err := agent.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if first.Alive() || second.Alive() {
+		t.Fatal("agent.Stop left a session alive")
 	}
 }
 
@@ -428,8 +514,28 @@ func TestSendToSessionWithAttachmentsRequiresSessionWhenMultipleSessionsHaveAtta
 
 	engine.ReceiveMessage(platform, first)
 	engine.ReceiveMessage(platform, second)
-	agent.session.waitRecords(t, 2)
-	platform.waitTextContaining(t, "media ok")
+	for _, session := range agent.waitSessions(t, 2) {
+		session.waitRecords(t, 1)
+	}
+	platform.waitTextContainingForContext(t, "reply-ctx-1", "media ok")
+	platform.waitTextContainingForContext(t, "reply-ctx-2", "media ok")
+
+	// Each independent foreground turn saves before its final reply. Wait for
+	// both turns to release their busy locks as well before TempDir cleanup.
+	sessions := engine.GetSessions()
+	for _, key := range []string{first.SessionKey, second.SessionKey} {
+		session := sessions.FindByID(sessions.ActiveSessionID(key))
+		if session == nil {
+			t.Fatalf("missing active session for %s", key)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for session.Busy() && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if session.Busy() {
+			t.Fatalf("session %s did not finish its turn", key)
+		}
+	}
 
 	err := engine.SendToSessionWithAttachments(
 		"",

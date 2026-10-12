@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,6 +20,7 @@ import (
 )
 
 var _ core.RecoveryHistoryProvider = (*Agent)(nil)
+var _ core.RecoveryHistoryProvider = (*appServerSession)(nil)
 
 type recoveryHistoryLimits struct {
 	lineBytes     int
@@ -42,18 +44,81 @@ func (a *Agent) GetRecoveryHistory(ctx context.Context, sessionID string) (core.
 	if err := ctx.Err(); err != nil {
 		return core.RecoveryHistory{}, err
 	}
-	if !validRecoverySessionID(sessionID) {
-		return core.RecoveryHistory{}, fmt.Errorf("codex recovery history: invalid session ID")
-	}
 	a.mu.RLock()
 	codexHome, workDir := a.codexHome, a.workDir
 	a.mu.RUnlock()
+	return getRecoveryHistory(ctx, sessionID, resolveCodexHomeDir(codexHome), workDir)
+}
 
+// The executor's home and cwd can differ from the Agent defaults, especially
+// after a resume. Read only the original thread from its captured environment.
+func (s *appServerSession) GetRecoveryHistory(ctx context.Context, sessionID string) (core.RecoveryHistory, error) {
+	if err := ctx.Err(); err != nil {
+		return core.RecoveryHistory{}, err
+	}
+	if sessionID == "" || sessionID != s.CurrentSessionID() {
+		return core.RecoveryHistory{}, fmt.Errorf("codex recovery history: executor session identity mismatch")
+	}
+	s.runtimeMu.RLock()
+	workDir := s.workDir
+	s.runtimeMu.RUnlock()
+	s.procMu.Lock()
+	env := append([]string(nil), s.processEnv...)
+	processDir := ""
+	if s.cmd != nil {
+		processDir = s.cmd.Dir
+	}
+	s.procMu.Unlock()
+	codexHome, err := recoveryExecutorHome(env)
+	if err != nil {
+		return core.RecoveryHistory{}, err
+	}
+	if !filepath.IsAbs(codexHome) {
+		if processDir == "" {
+			return core.RecoveryHistory{}, fmt.Errorf("codex recovery history: relative executor home has no process directory")
+		}
+		codexHome = filepath.Join(processDir, codexHome)
+	}
+	return getRecoveryHistory(ctx, sessionID, codexHome, workDir)
+}
+
+func recoveryExecutorHome(env []string) (string, error) {
+	values := make(map[string]string)
+	for _, assignment := range env {
+		key, value, ok := strings.Cut(assignment, "=")
+		if !ok {
+			continue
+		}
+		if runtime.GOOS == "windows" {
+			key = strings.ToUpper(key)
+		}
+		values[key] = value
+	}
+	if home := values["CODEX_HOME"]; home != "" {
+		return home, nil
+	}
+	homeKey := "HOME"
+	if runtime.GOOS == "windows" {
+		homeKey = "USERPROFILE"
+	}
+	if home := values[homeKey]; home != "" {
+		return filepath.Join(home, ".codex"), nil
+	}
+	return "", fmt.Errorf("codex recovery history: executor home is missing from its captured environment")
+}
+
+func getRecoveryHistory(ctx context.Context, sessionID, codexHome, workDir string) (core.RecoveryHistory, error) {
+	if err := ctx.Err(); err != nil {
+		return core.RecoveryHistory{}, err
+	}
+	if !validRecoverySessionID(sessionID) {
+		return core.RecoveryHistory{}, fmt.Errorf("codex recovery history: invalid session ID")
+	}
 	cwd, err := recoveryCanonicalDir(workDir)
 	if err != nil {
 		return core.RecoveryHistory{}, fmt.Errorf("codex recovery history: working directory: %w", err)
 	}
-	root, err := recoveryCanonicalDir(filepath.Join(resolveCodexHomeDir(codexHome), "sessions"))
+	root, err := recoveryCanonicalDir(filepath.Join(codexHome, "sessions"))
 	if err != nil {
 		return core.RecoveryHistory{}, fmt.Errorf("codex recovery history: sessions directory: %w", err)
 	}
@@ -351,7 +416,7 @@ func recoveryMessageEntries(item recoveryResponseItem, stats *recoveryReadStats)
 		return nil
 	}
 	if (item.Channel != "" && item.Channel != "final" && item.Channel != "commentary") ||
-		(item.Phase != "" && item.Phase != "final" && item.Phase != "commentary") {
+		(item.Phase != "" && item.Phase != "final" && item.Phase != "final_answer" && item.Phase != "commentary") {
 		return nil
 	}
 	want := "input_text"
@@ -455,7 +520,7 @@ func recoveryEventMessage(raw json.RawMessage, stats *recoveryReadStats) []core.
 	default:
 		return nil
 	}
-	if (event.Phase != "" && event.Phase != "final" && event.Phase != "commentary") ||
+	if (event.Phase != "" && event.Phase != "final" && event.Phase != "final_answer" && event.Phase != "commentary") ||
 		(event.Channel != "" && event.Channel != "final" && event.Channel != "commentary") {
 		return nil
 	}
@@ -489,22 +554,27 @@ func truncateRecoveryText(text string, limit int) (string, bool) {
 	return text[:head] + recoveryTruncationMarker + text[tail:], true
 }
 
-// Keep the opening goal and a rolling recent suffix, rather than stopping at
-// the first size limit and silently losing subsequent user cancellations.
+// Keep the opening goal, recent evidence, and a bounded window of user inputs
+// that the evidence suffix would otherwise evict. These disjoint slices remain
+// in source order; equal text is never used to deduplicate user changes.
 type recoveryHistoryCollector struct {
-	limits         recoveryHistoryLimits
-	prefix         []core.RecoveryHistoryEntry
-	tail           []core.RecoveryHistoryEntry
-	prefixBytes    int
-	tailBytes      int
-	prefixClosed   bool
-	droppedEntries int
-	droppedBytes   int
+	limits          recoveryHistoryLimits
+	prefix          []core.RecoveryHistoryEntry
+	recentUsers     []core.RecoveryHistoryEntry
+	tail            []core.RecoveryHistoryEntry
+	prefixBytes     int
+	recentUserBytes int
+	tailBytes       int
+	prefixClosed    bool
+	droppedEntries  int
+	droppedBytes    int
+	droppedUsers    int
 }
 
 func (c *recoveryHistoryCollector) add(entry core.RecoveryHistoryEntry) {
 	size := len(entry.Content) + len(entry.CallID)
-	if !c.prefixClosed && len(c.prefix) < c.limits.prefixEntries && c.prefixBytes+size <= c.limits.totalBytes/4 {
+	prefixLimit := min(c.limits.prefixEntries, c.limits.totalEntries/4)
+	if !c.prefixClosed && len(c.prefix) < prefixLimit && c.prefixBytes+size <= c.limits.totalBytes/4 {
 		c.prefix = append(c.prefix, entry)
 		c.prefixBytes += size
 		return
@@ -512,19 +582,47 @@ func (c *recoveryHistoryCollector) add(entry core.RecoveryHistoryEntry) {
 	c.prefixClosed = true
 	c.tail = append(c.tail, entry)
 	c.tailBytes += size
-	for len(c.tail) > 0 && (c.prefixBytes+c.tailBytes > c.limits.totalBytes || len(c.prefix)+len(c.tail) > c.limits.totalEntries) {
-		dropped := len(c.tail[0].Content) + len(c.tail[0].CallID)
+	for len(c.tail) > 0 && (c.prefixBytes+c.recentUserBytes+c.tailBytes > c.limits.totalBytes || len(c.prefix)+len(c.recentUsers)+len(c.tail) > c.limits.totalEntries) {
+		oldest := c.tail[0]
 		c.tail[0] = core.RecoveryHistoryEntry{}
 		c.tail = c.tail[1:]
-		c.tailBytes -= dropped
-		c.droppedBytes += dropped
-		c.droppedEntries++
+		c.tailBytes -= len(oldest.Content) + len(oldest.CallID)
+		if oldest.Role == "user" {
+			c.keepRecentUser(oldest)
+		} else {
+			c.recordDropped(oldest)
+		}
+	}
+}
+
+func (c *recoveryHistoryCollector) keepRecentUser(entry core.RecoveryHistoryEntry) {
+	c.recentUsers = append(c.recentUsers, entry)
+	c.recentUserBytes += len(entry.Content) + len(entry.CallID)
+	// Reserve at least one normal-sized input, while leaving room for the
+	// opening history and the evidence suffix under the same total limits.
+	entryLimit := min(max(1, c.limits.totalEntries/4), c.limits.totalEntries-len(c.prefix))
+	byteLimit := min(max(c.limits.entryBytes, c.limits.totalBytes/4), c.limits.totalBytes-c.prefixBytes)
+	for len(c.recentUsers) > 0 && (len(c.recentUsers) > entryLimit || c.recentUserBytes > byteLimit) {
+		oldest := c.recentUsers[0]
+		c.recentUsers[0] = core.RecoveryHistoryEntry{}
+		c.recentUsers = c.recentUsers[1:]
+		c.recentUserBytes -= len(oldest.Content) + len(oldest.CallID)
+		c.recordDropped(oldest)
+	}
+}
+
+func (c *recoveryHistoryCollector) recordDropped(entry core.RecoveryHistoryEntry) {
+	c.droppedBytes += len(entry.Content) + len(entry.CallID)
+	c.droppedEntries++
+	if entry.Role == "user" {
+		c.droppedUsers++
 	}
 }
 
 func (c *recoveryHistoryCollector) entries() []core.RecoveryHistoryEntry {
-	entries := make([]core.RecoveryHistoryEntry, 0, len(c.prefix)+len(c.tail))
+	entries := make([]core.RecoveryHistoryEntry, 0, len(c.prefix)+len(c.recentUsers)+len(c.tail))
 	entries = append(entries, c.prefix...)
+	entries = append(entries, c.recentUsers...)
 	return append(entries, c.tail...)
 }
 
@@ -549,7 +647,10 @@ func recoveryHistoryWarnings(stats recoveryReadStats, collector recoveryHistoryC
 		warnings = append(warnings, fmt.Sprintf("Truncated %d visible items or identifiers: text is limited to %d bytes per item and call IDs to 1024 bytes; retained the beginning and end.", stats.truncatedItems, collector.limits.entryBytes))
 	}
 	if collector.droppedEntries > 0 {
-		warnings = append(warnings, fmt.Sprintf("Omitted %d middle history entries (%d visible bytes) to bound recovery memory; kept the opening history and latest entries. Omitted task changes may still matter.", collector.droppedEntries, collector.droppedBytes))
+		warnings = append(warnings, fmt.Sprintf("Omitted %d middle history entries (%d visible bytes) to bound recovery memory; kept the opening history, recent user inputs and latest evidence. Source line gaps mark omitted records.", collector.droppedEntries, collector.droppedBytes))
+	}
+	if collector.droppedUsers > 0 {
+		warnings = append(warnings, fmt.Sprintf("Omitted %d older user inputs beyond the recovery budget; recent user changes were prioritized. Earlier task constraints may still matter.", collector.droppedUsers))
 	}
 	if stats.invalidTimes > 0 {
 		warnings = append(warnings, fmt.Sprintf("%d visible records have missing or invalid timestamps; source line order is preserved.", stats.invalidTimes))

@@ -14,6 +14,8 @@ import (
 
 const contextRecoveryPrepareTimeout = 90 * time.Second
 
+var errContextRecoveryPersistence = errors.New("recovery_persistence_failed")
+
 // The executor can change during this invocation. Restore a temporary mode on
 // the current executor as well as the original one, never on shared defaults.
 func restoreInvocationMode(state *interactiveState, agent Agent) func() {
@@ -48,11 +50,16 @@ func isContextRecoveryError(err error) bool {
 }
 
 func recoveryNeedsReview(r *ContextRecoveryRecord) bool {
+	if r.ErrorCode == "old_executor_unconfirmed" || r.ErrorCode == errContextRecoveryPersistence.Error() {
+		return true
+	}
 	switch r.Phase {
-	case "model_turn_completed", "cancelled":
+	case "model_turn_completed":
 		return false
+	case "cancelled":
+		return r.InputStatus == "unknown" || r.InputStatus == "sending"
 	case "failed":
-		return r.ErrorCode == "old_executor_unconfirmed" || r.ErrorCode == "recovery_persistence_failed" || r.InputStatus != "accepted"
+		return r.InputStatus != "accepted"
 	default:
 		// A restart during preparation or send is not authorization to replay
 		// the failed input. The saved material/receipt needs reconciliation.
@@ -74,14 +81,29 @@ func (e *Engine) recoveryTargetValid(state *interactiveState, session *Session, 
 }
 
 func (e *Engine) publishContextRecovery(state *interactiveState, session *Session, sessions *SessionManager, id, phase, code string) error {
+	// Serialize receipt updates and persistence so a late input receipt cannot
+	// clear a failed durable write recorded by the completion path, or vice versa.
+	state.mu.Lock()
+	if previous := session.GetContextRecovery(); previous != nil && previous.ID == id && previous.ErrorCode == errContextRecoveryPersistence.Error() {
+		code = errContextRecoveryPersistence.Error()
+	}
 	record := session.updateContextRecovery(id, phase, code)
 	if record == nil {
+		state.mu.Unlock()
 		return errors.New("context_recovery_record_changed")
 	}
 	if err := sessions.SaveWithError(); err != nil {
-		return fmt.Errorf("persist context recovery: %w", err)
+		// Keep model completion evidence intact while fencing future inputs in
+		// this process. The prior on-disk in-flight receipt also fences restart.
+		session.mu.Lock()
+		if current := session.ContextRecovery; current != nil && current.ID == id {
+			current.ErrorCode = errContextRecoveryPersistence.Error()
+			current.UpdatedAt = time.Now().UTC()
+		}
+		session.mu.Unlock()
+		state.mu.Unlock()
+		return fmt.Errorf("%w: %v", errContextRecoveryPersistence, err)
 	}
-	state.mu.Lock()
 	callbacks := append([]func(*ContextRecoveryRecord){}, state.recoveryCallbacks...)
 	state.mu.Unlock()
 	for _, callback := range callbacks {
@@ -100,7 +122,7 @@ func (e *Engine) finishContextRecoveryTurn(state *interactiveState, session *Ses
 	}
 	if err := e.publishContextRecovery(state, session, sessions, id, phase, code); err != nil {
 		slog.Error("context recovery final receipt failed", "recovery_id", id, "error", err)
-		return errors.New("recovery_persistence_failed")
+		return errContextRecoveryPersistence
 	}
 	return nil
 }
@@ -111,15 +133,26 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	for {
 		err := e.consumeInteractiveEvents(state, session, sessions, key, msgID, turnStart, stopTyping, sendDone, replyCtx, lockGen)
 		stopTyping = nil // the consumer always releases its indicator
+		// EventResult can arrive before Send returns. Preserve a later durable
+		// receipt failure even when the consumer already saw model completion.
+		if record := session.GetContextRecovery(); record != nil && record.ErrorCode == errContextRecoveryPersistence.Error() {
+			err = errContextRecoveryPersistence
+		}
 		if err == nil {
 			return nil
 		}
 		if !isContextRecoveryError(err) {
 			phase := "failed"
-			if state.isStopped() || errors.Is(err, context.Canceled) {
+			if errors.Is(err, context.Canceled) {
 				phase = "cancelled"
 			}
-			e.finishContextRecoveryTurn(state, session, sessions, phase, "recovery_turn_failed")
+			code := "recovery_turn_failed"
+			if errors.Is(err, errContextRecoveryPersistence) {
+				code = errContextRecoveryPersistence.Error()
+			}
+			if finishErr := e.finishContextRecoveryTurn(state, session, sessions, phase, code); finishErr != nil {
+				return finishErr
+			}
 			return err
 		}
 		sendDone, err = e.prepareContextRecovery(state, session, sessions, key, lockGen, err)
@@ -168,12 +201,17 @@ func (e *Engine) prepareContextRecovery(state *interactiveState, session *Sessio
 			}
 			if err := e.publishContextRecovery(state, session, sessions, record.ID, phase, recoveryErr.Error()); err != nil {
 				slog.Error("context recovery failure receipt failed", "recovery_id", record.ID, "error", err)
+				if errors.Is(err, errContextRecoveryPersistence) {
+					recoveryErr = errContextRecoveryPersistence
+				}
 			}
 			state.mu.Lock()
 			state.recoveryTurnID = ""
 			state.mu.Unlock()
 		} else {
-			_ = e.finishContextRecoveryTurn(state, session, sessions, "failed", recoveryErr.Error())
+			if err := e.finishContextRecoveryTurn(state, session, sessions, "failed", recoveryErr.Error()); err != nil {
+				recoveryErr = err
+			}
 		}
 		if fresh != nil {
 			_ = fresh.Close()
@@ -247,7 +285,7 @@ func (e *Engine) prepareContextRecovery(state *interactiveState, session *Sessio
 	state.recoveryTurnID = id
 	state.mu.Unlock()
 	if err := sessions.SaveWithError(); err != nil {
-		return nil, errors.New("recovery_persistence_failed")
+		return nil, errContextRecoveryPersistence
 	}
 	// A failed startup without a starter may still own an unconfirmed
 	// executor. Persist the attempt before refusing recovery so a later
@@ -287,7 +325,18 @@ func (e *Engine) prepareContextRecovery(state *interactiveState, session *Sessio
 	if !e.recoveryTargetValid(state, session, sessions, key, nativeID, gen) {
 		return nil, context.Canceled
 	}
-	material := buildRecoveryMaterial(ctx, session, agent, invocation, record)
+	// Use the failed executor's actual history location and working directory.
+	// Shared agent defaults may have changed since that executor was started.
+	var historySource any = agent
+	if provider, ok := old.(RecoveryHistoryProvider); ok {
+		historySource = provider
+	} else if old == nil {
+		var provider RecoveryHistoryProvider
+		if errors.As(cause, &provider) {
+			historySource = provider
+		}
+	}
+	material := buildRecoveryMaterial(ctx, session, historySource, invocation, record)
 	material.SteeredInputs = inputs
 	if droppedInputs > 0 {
 		material.Warnings = append(material.Warnings, fmt.Sprintf("%d earlier IPC attempts are not in the inline evidence; check their original durable receipts if relevant.", droppedInputs))
@@ -299,7 +348,7 @@ func (e *Engine) prepareContextRecovery(state *interactiveState, session *Sessio
 		return nil, errors.New("recovery_material_write_failed")
 	}
 	if err := e.publishContextRecovery(state, session, sessions, id, "starting", ""); err != nil {
-		return nil, errors.New("recovery_persistence_failed")
+		return nil, errContextRecoveryPersistence
 	}
 	fresh, err = starter.StartFreshForRecovery(ctx)
 	if err != nil {
@@ -332,7 +381,7 @@ func (e *Engine) prepareContextRecovery(state *interactiveState, session *Sessio
 	}
 	queued := append([]queuedMessage(nil), state.pendingMessages...)
 	for _, q := range queued {
-		material.LaterInputs = append(material.LaterInputs, invocationForQueued(q))
+		material.LaterInputs = append(material.LaterInputs, e.recoveryInvocationForQueued(q))
 	}
 	// Attachments for later updates are supplied once to the fresh turn too.
 	images, files := append([]ImageAttachment(nil), invocation.Images...), append([]FileAttachment(nil), invocation.Files...)
@@ -367,7 +416,7 @@ func (e *Engine) prepareContextRecovery(state *interactiveState, session *Sessio
 	if err := sessions.SaveWithError(); err != nil {
 		state.mu.Unlock()
 		e.interactiveMu.Unlock()
-		return nil, errors.New("recovery_persistence_failed")
+		return nil, errContextRecoveryPersistence
 	}
 	if err := ctx.Err(); err != nil {
 		state.mu.Unlock()
@@ -391,8 +440,9 @@ func (e *Engine) prepareContextRecovery(state *interactiveState, session *Sessio
 			phase = "input_unknown"
 		}
 		saveErr := e.publishContextRecovery(state, session, sessions, id, phase, "")
-		if saveErr != nil && err == nil {
-			err = errors.New("recovery_persistence_failed")
+		if saveErr != nil {
+			slog.Error("context recovery input receipt failed", "recovery_id", id, "error", saveErr)
+			err = errContextRecoveryPersistence
 		}
 		completed := session.GetContextRecovery()
 		if saveErr == nil && (err == nil || (completed != nil && completed.ID == id && completed.TurnStatus == "completed")) {

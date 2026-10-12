@@ -50,7 +50,7 @@ func (invocation *recoveryInvocation) MarshalJSON() ([]byte, error) {
 	}{(*visibleInvocation)(invocation), len(invocation.Images), len(invocation.Files), attachments})
 }
 
-func buildRecoveryMaterial(ctx context.Context, session *Session, agent Agent, invocation *recoveryInvocation, record *ContextRecoveryRecord) *contextRecoveryMaterial {
+func buildRecoveryMaterial(ctx context.Context, session *Session, source any, invocation *recoveryInvocation, record *ContextRecoveryRecord) *contextRecoveryMaterial {
 	m := &contextRecoveryMaterial{
 		Record: cloneContextRecovery(record), HostSessionID: session.ID, Invocation: invocation,
 		Warnings: []string{
@@ -62,7 +62,7 @@ func buildRecoveryMaterial(ctx context.Context, session *Session, agent Agent, i
 	session.mu.Lock()
 	m.HostHistory = append([]HistoryEntry(nil), session.History...)
 	session.mu.Unlock()
-	if provider, ok := agent.(RecoveryHistoryProvider); ok {
+	if provider, ok := source.(RecoveryHistoryProvider); ok {
 		history, err := provider.GetRecoveryHistory(ctx, record.FromSessionID)
 		m.NativeHistory = history
 		if err != nil {

@@ -565,6 +565,8 @@ type interactiveState struct {
 	recoveryInputsDropped int
 	recoveryTurnID        string
 	recoveryCallbacks     []func(*ContextRecoveryRecord)
+	recoveryInputFailure  *recoveryInputFailure
+	recoveryFailureReady  chan struct{}
 	// busySession is the core.Session whose busy lock guards the in-flight
 	// turn. Set by getOrCreateInteractiveStateWith so /stop can release the
 	// lock after tearing the turn down (#1830).
@@ -3231,12 +3233,18 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		// graceful-stop waits. An agent that is hung but still PID-alive also
 		// falls through to normal queueing by design — breaking a live
 		// process's lock is out of scope for this path. Lock order:
-		// interactiveMu → session.mu, never reversed.
+		// interactiveMu → state.mu → session.mu, never reversed.
 		e.interactiveMu.Lock()
 		st, hasSt := e.interactiveStates[interactiveKey]
-		agentAlive := hasSt && st != nil && st.agentSession != nil && st.agentSession.Alive()
+		agentAlive, recoveryInFlight := false, false
+		if hasSt && st != nil {
+			st.mu.Lock()
+			agentAlive = st.agentSession != nil && st.agentSession.Alive()
+			recoveryInFlight = st.recovering || st.recoveryInputPending || st.recoveryInputFailure != nil
+			st.mu.Unlock()
+		}
 		e.interactiveMu.Unlock()
-		if !agentAlive && e.staleLockBreakAfter > 0 {
+		if !agentAlive && !recoveryInFlight && e.staleLockBreakAfter > 0 {
 			if since, broken := session.BreakStaleLock(e.staleLockBreakAfter); broken {
 				heldFor := time.Since(since).Round(time.Second)
 				slog.Warn("busy-stale-lock: agent process dead but lock held; broken (self-heal)",
@@ -3319,6 +3327,12 @@ func runMessageAccepted(msg *Message) {
 
 func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions *SessionManager, interactiveKey string, session *Session, lockGen uint64) (*Session, uint64) {
 	if e.resetOnIdle <= 0 || session == nil {
+		return nil, 0
+	}
+	// Elapsed idle time is not a new task boundary. Keep both the spent
+	// recovery budget and any unresolved execution/receipt gate until the
+	// user explicitly creates another session.
+	if session.GetContextRecovery() != nil {
 		return nil, 0
 	}
 
@@ -3418,8 +3432,9 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	defer state.mu.Unlock()
 
 	// Allow queueing when agentSession is nil (session is starting up,
-	// issue #565). Only reject if the session was established and died.
-	if state.stopped || (!state.recovering && state.agentSession != nil && !state.agentSession.Alive()) {
+	// issue #565). A rejected supplemental input also owns a recovery handoff
+	// before the event loop has begun preparation, even if its executor exited.
+	if state.stopped || (!state.recovering && state.recoveryInputFailure == nil && state.agentSession != nil && !state.agentSession.Alive()) {
 		return false
 	}
 
@@ -3506,7 +3521,13 @@ func (e *Engine) drainOrphanedQueue(session *Session, sessions *SessionManager, 
 	state, hasState := e.interactiveStates[interactiveKey]
 	e.interactiveMu.Unlock()
 
-	if !hasState || state == nil || state.agentSession == nil || !state.agentSession.Alive() {
+	if !hasState || state == nil {
+		return
+	}
+	state.mu.Lock()
+	canDrain := state.agentSession != nil && (state.agentSession.Alive() || state.recoveryInputFailure != nil)
+	state.mu.Unlock()
+	if !canDrain {
 		if hasState && state != nil {
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent session ended"))
 		}
@@ -4004,7 +4025,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.replyCtx = msg.ReplyCtx
 	state.currentMessageID = msg.MessageID
 	state.currentTurnUserMessageTimeMs = msg.UserMessageTimeMs
-	state.currentInvocation = invocationForMessage(msg)
+	state.currentInvocation = e.recoveryInvocationForMessage(msg)
 	state.currentTurnStartedAt = turnStart
 	state.logicalSessionKey = msg.SessionKey
 	state.sideSession = strings.HasSuffix(interactiveKey, "#cron:"+session.ID) || strings.HasSuffix(interactiveKey, "#timer:"+session.ID)
@@ -5352,6 +5373,7 @@ func (e *Engine) consumeInteractiveEvents(state *interactiveState, session *Sess
 
 	events := state.agentSession.Events()
 	stopCh := state.stopSignal()
+	recoveryFailures := state.recoveryFailureSignal()
 	for {
 		var event Event
 		var ok bool
@@ -5360,6 +5382,16 @@ func (e *Engine) consumeInteractiveEvents(state *interactiveState, session *Sess
 		case <-stopCh:
 			sp.discard()
 			return context.Canceled
+		case <-recoveryFailures:
+			state.mu.Lock()
+			err := state.takeRecoveryInputFailureLocked()
+			state.mu.Unlock()
+			if err == nil {
+				continue
+			}
+			cp.Finalize(ProgressCardStateFailed)
+			sp.discard()
+			return err
 		case event, ok = <-events:
 			if !ok {
 				goto channelClosed
@@ -6488,7 +6520,7 @@ func (e *Engine) consumeInteractiveEvents(state *interactiveState, session *Sess
 				state.currentMessageID = queued.messageID
 				state.fromVoice = queued.fromVoice
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
-				state.currentInvocation = invocationForQueued(queued)
+				state.currentInvocation = e.recoveryInvocationForQueued(queued)
 				state.currentTurnStartedAt = time.Now()
 				state.mu.Unlock()
 
@@ -6823,6 +6855,14 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 func (e *Engine) drainPendingMessages(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, lockGen uint64) bool {
 	for {
 		state.mu.Lock()
+		if failure := state.takeRecoveryInputFailureLocked(); failure != nil {
+			state.mu.Unlock()
+			if err := e.drainRecoveryInputFailure(state, session, sessions, sessionKey, lockGen, failure); err != nil {
+				e.notifyDroppedQueuedMessages(state, err)
+				return false
+			}
+			continue
+		}
 		if len(state.pendingMessages) == 0 {
 			session.Unlock(lockGen)
 			state.mu.Unlock()
@@ -6851,7 +6891,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.currentMessageID = queued.messageID
 		state.fromVoice = queued.fromVoice
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
-		state.currentInvocation = invocationForQueued(queued)
+		state.currentInvocation = e.recoveryInvocationForQueued(queued)
 		state.currentTurnStartedAt = time.Now()
 		state.mu.Unlock()
 
@@ -6996,6 +7036,7 @@ func (e *Engine) cmdPs(p Platform, msg *Message, args []string) {
 		return
 	}
 	as := state.agentSession
+	invocation := state.currentInvocation
 	if state.stopped || as == nil || !as.Alive() {
 		state.mu.Unlock()
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsNoSession))
@@ -7007,6 +7048,9 @@ func (e *Engine) cmdPs(p Platform, msg *Message, args []string) {
 	state.mu.Unlock()
 	sessions.Save()
 	if err := as.Send(text, "", nil, nil); err != nil {
+		if e.reportRecoveryInputFailure(state, session, sessions, iKey, as, invocation, err) {
+			return
+		}
 		slog.Error("ps: send failed", "error", err)
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSendFailed))
 		return
