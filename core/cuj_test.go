@@ -41,6 +41,30 @@ import (
 	"time"
 )
 
+func TestCUJ_A11_ChatMailboxSurvivesNew(t *testing.T) {
+	api, e, _, input := ipcFixture(t, false)
+	p := e.platforms[0].(*ipcTestPlatform)
+	message := func(id, content string) *Message {
+		return &Message{SessionKey: input.Target.SessionKey, Platform: p.Name(), UserID: "owner", MessageID: id, Content: content, ReplyCtx: input.Target.SessionKey}
+	}
+	e.ReceiveMessage(p, message("initial", "original user task"))
+	recoveryAwait(t, "initial user answer", func() bool {
+		return strings.Contains(strings.Join(p.getSent(), "\n"), "callback received") && !e.sessions.GetOrCreateActive(input.Target.SessionKey).Busy()
+	})
+	e.ReceiveMessage(p, message("new", "/new"))
+	recoveryAwait(t, "new confirmation", func() bool { return strings.Contains(strings.Join(p.getSent(), "\n"), e.i18n.T(MsgNewSessionCreated)) })
+	a := e.agent.(*ipcTestAgent)
+	a.fresh = true
+	a.session = &ipcTestSession{id: "thread-after-new", input: make(chan string, 16), events: make(chan Event, 16)}
+	input.Routing, input.Prompt = "chat", "follow up for the original task: result at /fixed/task"
+	ipcPost(t, api.handleIPCEvent, input)
+	recoveryAwait(t, "mail after new", func() bool {
+		return ipcReceipt(t, api, input.EventID).Status == "delivered" && !e.sessions.GetOrCreateActive(input.Target.SessionKey).Busy()
+	})
+	e.ReceiveMessage(p, message("history", "/history"))
+	recoveryAwait(t, "new chat sees original task metadata", func() bool { return strings.Contains(strings.Join(p.getSent(), "\n"), "/fixed/task") })
+}
+
 // CUJ: submit work during slow startup, queue a follow-up while the agent is
 // working, then check status. Both messages have receipts before either answer;
 // draining the queue must preserve each receipt without adding another one.

@@ -24,10 +24,19 @@ type ipcTestSession struct {
 	events     chan Event
 	steers     atomic.Int32
 	steerError error
+	id         string
+	closes     atomic.Int32
 }
 
-func (s *ipcTestSession) CurrentSessionID() string { return "thread-ipc" }
-func (s *ipcTestSession) Events() <-chan Event     { return s.events }
+func (s *ipcTestSession) Close() error { s.closes.Add(1); return nil }
+
+func (s *ipcTestSession) CurrentSessionID() string {
+	if s.id != "" {
+		return s.id
+	}
+	return "thread-ipc"
+}
+func (s *ipcTestSession) Events() <-chan Event { return s.events }
 func (s *ipcTestSession) Send(prompt, _ string, _ []ImageAttachment, _ []FileAttachment) error {
 	s.input <- prompt
 	s.events <- Event{Type: EventText, Content: "callback received"}
@@ -50,15 +59,130 @@ type ipcTestAgent struct {
 	stubAgent
 	dir     string
 	session *ipcTestSession
+	fresh   bool
+	onStart func()
 }
 
 func (a *ipcTestAgent) GetWorkDir() string      { return a.dir }
 func (a *ipcTestAgent) SupportsLiveInput() bool { return true }
 func (a *ipcTestAgent) StartSession(_ context.Context, id string) (AgentSession, error) {
-	if id != a.session.CurrentSessionID() {
+	if id != a.session.CurrentSessionID() && !(id == "" && a.fresh) {
 		return nil, errors.New("must resume pinned thread")
 	}
+	if a.onStart != nil {
+		a.onStart()
+	}
 	return a.session, nil
+}
+
+func TestIPC_ChatNewSessionReceivesAndRecordsActualIdentity(t *testing.T) {
+	api, e, _, input := ipcFixture(t, false)
+	input.Routing = "chat"
+	fresh := &ipcTestSession{id: "new-thread", input: make(chan string, 16), events: make(chan Event, 16)}
+	a := e.agent.(*ipcTestAgent)
+	a.session, a.fresh = fresh, true
+	session := e.sessions.NewSession(input.Target.SessionKey, "new")
+	w := ipcPost(t, api.handleIPCChatTarget, input.Target)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"agent_session_id":""`) {
+		t.Fatal("new chat without a model thread cannot be resolved", w.Body.String())
+	}
+	if w := ipcPost(t, api.handleIPCTarget, input.Target); w.Code != 409 {
+		t.Fatal("legacy target silently followed /new")
+	}
+	ipcPost(t, api.handleIPCEvent, input)
+	recoveryAwait(t, "chat delivery", func() bool { return ipcReceipt(t, api, input.EventID).Status == "delivered" && !session.Busy() })
+	r := ipcReceipt(t, api, input.EventID)
+	if r.Input != input || r.DeliveryTarget == nil || r.DeliveryTarget.SessionID != session.ID || r.DeliveryTarget.AgentSessionID != "new-thread" {
+		t.Fatalf("original or actual receiver changed: %+v", r)
+	}
+	for _, target := range []IPCTarget{input.Target, *r.DeliveryTarget} {
+		w := ipcPost(t, api.handleIPCAck, map[string]any{"event_id": input.EventID, "target": target})
+		if (w.Code == 200) != (target == *r.DeliveryTarget) {
+			t.Fatal("ack did not require actual recipient", w.Code)
+		}
+	}
+	e.sessions.NewSession(input.Target.SessionKey, "another")
+	ipcPost(t, api.handleIPCEvent, input)
+	if len(fresh.input) != 1 || ipcReceipt(t, api, input.EventID).DeliveryTarget.SessionID != session.ID {
+		t.Fatal("delivered event replayed or changed receiver after /new")
+	}
+}
+
+func TestIPC_ChatSwitchDuringStartupDoesNotSendAndCanRetry(t *testing.T) {
+	api, e, as, input := ipcFixture(t, false)
+	input.Routing = "chat"
+	e.interactiveStates = make(map[string]*interactiveState)
+	a := e.agent.(*ipcTestAgent)
+	a.fresh = true
+	var once sync.Once
+	a.onStart = func() { once.Do(func() { e.sessions.NewSession(input.Target.SessionKey, "changed during startup") }) }
+	ipcPost(t, api.handleIPCEvent, input)
+	recoveryAwait(t, "unsent stale route", func() bool { return ipcReceipt(t, api, input.EventID).Status == "waiting" })
+	if len(as.input) != 0 || ipcReceipt(t, api, input.EventID).DeliveryTarget != nil || ipcReceipt(t, api, input.EventID).Method != "" {
+		t.Fatal("input sent to a superseded session")
+	}
+	ipcPost(t, api.handleIPCEvent, input)
+	recoveryAwait(t, "retry on current chat", func() bool { return ipcReceipt(t, api, input.EventID).Status == "delivered" })
+	if len(as.input) != 1 {
+		t.Fatal("unsent event was lost or repeated")
+	}
+}
+
+func TestIPC_ChatStaleStartupCannotRecycleNewExecutor(t *testing.T) {
+	_, e, as, input := ipcFixture(t, false)
+	old := e.sessions.GetOrCreateActive(input.Target.SessionKey)
+	gen, _ := old.TryLock()
+	current := e.sessions.NewSession(input.Target.SessionKey, "new")
+	current.SetAgentSessionID("new-thread", "stub")
+	as.id = "new-thread"
+	state := e.interactiveStates[input.Target.SessionKey]
+	state.busySession = current
+	p := e.platforms[0]
+	var inputErr error
+	msg := &Message{SessionKey: input.Target.SessionKey, Content: "stale mail", ReplyCtx: input.Target.SessionKey,
+		ExpectedSessionID: old.ID, OnAgentInput: func(err error) { inputErr = err }}
+	e.processInteractiveMessage(p, msg, old, gen)
+	if !errors.Is(inputErr, errIPCChatNotSent) || e.interactiveStates[input.Target.SessionKey] != state ||
+		as.closes.Load() != 0 || len(as.input) != 0 {
+		t.Fatal("stale IPC startup affected the replacement executor")
+	}
+}
+
+func TestIPC_ChatBusyUnknownNeverMovesToNextSession(t *testing.T) {
+	api, e, as, input := ipcFixture(t, true)
+	input.Routing = "chat"
+	as.steerError = errors.New("lost reply")
+	ipcPost(t, api.handleIPCEvent, input)
+	r := ipcReceipt(t, api, input.EventID)
+	if r.Status != "unknown" || r.DeliveryTarget == nil || *r.DeliveryTarget != input.Target {
+		t.Fatalf("missing actual target: %+v", r)
+	}
+	e.sessions.NewSession(input.Target.SessionKey, "next")
+	ipcPost(t, api.handleIPCEvent, input)
+	if as.steers.Load() != 1 || ipcReceipt(t, api, input.EventID).Status != "unknown" {
+		t.Fatal("unknown event replayed after /new")
+	}
+}
+
+func TestIPC_ChatKeepsProjectChatTopicAndDirectoryIsolation(t *testing.T) {
+	for _, change := range []string{"project", "chat", "user", "topic", "cwd"} {
+		t.Run(change, func(t *testing.T) {
+			api, _, as, input := ipcFixture(t, true)
+			input.Routing = "chat"
+			switch change {
+			case "project":
+				input.Target.Project = "other"
+			case "cwd":
+				input.Target.CWD += "/other"
+			default:
+				input.Target.SessionKey += ":" + change
+			}
+			ipcPost(t, api.handleIPCEvent, input)
+			if ipcReceipt(t, api, input.EventID).Status != "blocked" || as.steers.Load() != 0 {
+				t.Fatal("fixed chat boundary bypassed")
+			}
+		})
+	}
 }
 
 type ipcTestPlatform struct{ stubPlatformEngine }

@@ -4018,7 +4018,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if agent != e.agent {
 		agentOverride = agent
 	}
-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
+	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, msg.ExpectedSessionID)
 
 	// Set workspaceDir on the state for idle reaper identification
 	if workspaceDir != "" {
@@ -4138,6 +4138,12 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			if msg.ExpectedAgentSessionID != "" && as.CurrentSessionID() != msg.ExpectedAgentSessionID {
 				finishInput(fmt.Errorf("ipc target session changed before input"))
 				return
+			}
+			if msg.BeforeAgentInput != nil {
+				if err := msg.BeforeAgentInput(as); err != nil {
+					finishInput(err)
+					return
+				}
 			}
 			finishInput(as.Send(promptContent, msg.MessageID, msg.Images, msg.Files))
 		}()
@@ -4344,7 +4350,7 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 
 // When agentOverride is non-nil it is used instead of e.agent to start the session.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string) *interactiveState {
+func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, expectedSessionID ...string) *interactiveState {
 	// /stop removes the state from the map immediately but tears the process
 	// down in the background. Wait that teardown out *before* taking the lock:
 	// spawning now would start a second process on the same agent session ID
@@ -4354,6 +4360,17 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	e.interactiveMu.Lock()
 	defer e.interactiveMu.Unlock()
 
+	if len(expectedSessionID) > 0 && expectedSessionID[0] != "" {
+		sessions.mu.RLock()
+		current := sessions.activeSession[sessionKey]
+		sessions.mu.RUnlock()
+		if current != expectedSessionID[0] {
+			// A stale IPC goroutine must not recycle the executor installed by
+			// /new. Return a transient failure without changing the live map.
+			return &interactiveState{platform: p, replyCtx: replyCtx, agent: e.agent,
+				busySession: session, startupError: errIPCChatNotSent}
+		}
+	}
 	state, ok := e.interactiveStates[sessionKey]
 	if inputErr := sessionInputError(session, sessions); inputErr != nil {
 		agent := e.agent

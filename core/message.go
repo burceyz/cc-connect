@@ -421,10 +421,12 @@ type Message struct {
 	ExtraContent           string                       // platform-enriched content (e.g. location text, reply quote) prepended for the agent
 	OnAccepted             func()                       // called once when the engine accepts this message for an agent turn
 	OnAgentInput           func(error)                  // optional receipt after AgentSession.Send; not a task-completion callback
+	BeforeAgentInput       func(AgentSession) error     // optional local IPC identity/receipt fence; failure sends no input
 	Origin                 InvocationOrigin             // host-supplied source of this specific invocation
 	sideSession            bool                         // host scheduler created a separate session; origin alone does not imply this
 	OnContextRecovery      func(*ContextRecoveryRecord) // separate from input delivery and acknowledgement
 	ExpectedAgentSessionID string                       // optional exact backend session fence for local IPC
+	ExpectedSessionID      string                       // optional CC session fence before creating/reusing an executor
 	ChannelKey             string                       // platform-provided channel identifier for workspace binding (optional)
 	// LegacyChannelKey is the platform-provided channel identifier used by an
 	// older workspace-binding scope. When both keys are set, multi-workspace

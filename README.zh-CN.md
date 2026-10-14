@@ -635,6 +635,7 @@ cc-connect send --tts "你好"
 ## 📚 文档
 
 - [使用指南](docs/usage.zh-CN.md) — 完整功能文档
+- [本机 IPC 固定聊天收信](docs/session-ipc.zh-CN.md) — `/new` 后的投递、实际接收者与旧事件兼容
 - [INSTALL.md](INSTALL.md) — AI Agent 友好的安装指南
 - [config.example.toml](config.example.toml) — 配置模板
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Issue / PR 提交流程与贡献说明

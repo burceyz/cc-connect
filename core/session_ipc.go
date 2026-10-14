@@ -24,11 +24,13 @@ type LiveInputSteerer interface {
 }
 
 var ErrNoActiveInput = errors.New("no active input turn")
+var errIPCChatNotSent = errors.New("chat_target_changed_before_send")
 var ipcEventIDPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 const sessionIPCProtocol = "cc-connect-session-ipc-v1"
 
-// IPCTarget pins the existing conversation, never a newest-session alias.
+// IPCTarget records an origin or an actual receiver. Chat routing keeps
+// Project, SessionKey (including user/topic isolation) and CWD fixed.
 type IPCTarget struct {
 	Project        string `json:"project"`
 	SessionKey     string `json:"session_key"`
@@ -41,6 +43,7 @@ type IPCInput struct {
 	EventID string    `json:"event_id"`
 	Target  IPCTarget `json:"target"`
 	Prompt  string    `json:"prompt"`
+	Routing string    `json:"routing,omitempty"` // empty preserves v1 pinned-session semantics
 }
 
 type IPCReceipt struct {
@@ -54,6 +57,7 @@ type IPCReceipt struct {
 	UpdatedAt      string                 `json:"updated_at"`
 	AcknowledgedAt string                 `json:"acknowledged_at,omitempty"`
 	Recovery       *ContextRecoveryRecord `json:"context_recovery,omitempty"`
+	DeliveryTarget *IPCTarget             `json:"delivery_target,omitempty"`
 }
 
 func (s *APIServer) initSessionIPC(dir string) error {
@@ -76,7 +80,7 @@ func (s *APIServer) handleIPCHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
 		return
 	}
-	apiJSON(w, http.StatusOK, map[string]string{"protocol": sessionIPCProtocol, "transport": "unix"})
+	apiJSON(w, http.StatusOK, map[string]any{"protocol": sessionIPCProtocol, "transport": "unix", "capabilities": []string{"chat_routing"}})
 }
 
 func ipcDecode(w http.ResponseWriter, r *http.Request, out any) bool {
@@ -99,11 +103,19 @@ func ipcDecode(w http.ResponseWriter, r *http.Request, out any) bool {
 
 // This endpoint is registered ONLY on the private Unix API, not HTTP webhooks.
 func (s *APIServer) handleIPCTarget(w http.ResponseWriter, r *http.Request) {
+	s.handleIPCTargetRouting(w, r, false)
+}
+
+func (s *APIServer) handleIPCChatTarget(w http.ResponseWriter, r *http.Request) {
+	s.handleIPCTargetRouting(w, r, true)
+}
+
+func (s *APIServer) handleIPCTargetRouting(w http.ResponseWriter, r *http.Request, chat bool) {
 	var target IPCTarget
 	if !ipcDecode(w, r, &target) {
 		return
 	}
-	e, session, err := s.resolveIPCTarget(&target, true)
+	e, session, err := s.resolveIPCRoute(&target, true, chat)
 	if err != nil {
 		apiJSON(w, http.StatusConflict, map[string]string{"code": err.Error()})
 		return
@@ -115,11 +127,16 @@ func (s *APIServer) handleIPCTarget(w http.ResponseWriter, r *http.Request) {
 	apiJSON(w, http.StatusOK, map[string]any{
 		"protocol": sessionIPCProtocol, "target": target,
 		"busy": session.Busy(), "supports_live_input": canSteer,
+		"supports_chat_routing": true,
 	})
 }
 
 func (s *APIServer) resolveIPCTarget(target *IPCTarget, capture bool) (*Engine, *Session, error) {
-	if target.Project == "" || target.SessionKey == "" || target.AgentSessionID == "" || target.CWD == "" {
+	return s.resolveIPCRoute(target, capture, false)
+}
+
+func (s *APIServer) resolveIPCRoute(target *IPCTarget, capture, chat bool) (*Engine, *Session, error) {
+	if target.Project == "" || target.SessionKey == "" || (!chat && target.AgentSessionID == "") || target.CWD == "" {
 		return nil, nil, errors.New("ipc_target_incomplete")
 	}
 	s.mu.RLock()
@@ -139,7 +156,14 @@ func (s *APIServer) resolveIPCTarget(target *IPCTarget, capture bool) (*Engine, 
 	e.sessions.mu.RLock()
 	defer e.sessions.mu.RUnlock()
 	session := e.sessions.sessions[e.sessions.activeSession[target.SessionKey]]
-	if session == nil || session.GetAgentSessionID() != target.AgentSessionID {
+	if session == nil {
+		return nil, nil, errors.New("ipc_target_changed")
+	}
+	if chat {
+		target.SessionID, target.AgentSessionID = session.ID, session.GetAgentSessionID()
+		return e, session, nil
+	}
+	if session.GetAgentSessionID() != target.AgentSessionID {
 		return nil, nil, errors.New("ipc_target_changed")
 	}
 	if capture && target.SessionID == "" {
@@ -221,7 +245,7 @@ func (s *APIServer) handleIPCEvent(w http.ResponseWriter, r *http.Request) {
 	if !ipcDecode(w, r, &input) {
 		return
 	}
-	if !ipcEventIDPattern.MatchString(input.EventID) || strings.TrimSpace(input.Prompt) == "" || len(input.Prompt) > 8192 {
+	if !ipcEventIDPattern.MatchString(input.EventID) || strings.TrimSpace(input.Prompt) == "" || len(input.Prompt) > 8192 || (input.Routing != "" && input.Routing != "chat") {
 		apiJSON(w, http.StatusBadRequest, map[string]string{"code": "ipc_input_invalid"})
 		return
 	}
@@ -247,7 +271,8 @@ func (s *APIServer) handleIPCEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	receipt := &IPCReceipt{Input: input, SHA256: digest, Status: "dispatching", Boot: s.ipcBoot}
-	e, session, err := s.resolveIPCTarget(&input.Target, false)
+	target := input.Target // Never mutate the immutable input or its digest.
+	e, session, err := s.resolveIPCRoute(&target, false, input.Routing == "chat")
 	if err != nil {
 		receipt.Status, receipt.Code = "blocked", err.Error()
 	}
@@ -291,13 +316,18 @@ func (s *APIServer) finishIPC(id, status, method, turn, code string) {
 func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput) {
 	lockGen, locked := session.TryLock()
 	if !locked {
-		s.steerIPC(e, input)
+		s.steerIPC(e, session, input)
 		return
 	}
 	// Revalidate after obtaining the idle-session lease; no implicit /switch.
-	if _, current, err := s.resolveIPCTarget(&input.Target, false); err != nil || current != session {
+	target := input.Target
+	if _, current, err := s.resolveIPCRoute(&target, false, input.Routing == "chat"); err != nil || current != session {
 		session.UnlockWithoutUpdate(lockGen)
-		s.finishIPC(input.EventID, "blocked", "", "", "ipc_target_changed")
+		if input.Routing == "chat" {
+			s.finishIPC(input.EventID, "waiting", "", "", errIPCChatNotSent.Error())
+		} else {
+			s.finishIPC(input.EventID, "blocked", "", "", "ipc_target_changed")
+		}
 		return
 	}
 	var platform Platform
@@ -327,18 +357,52 @@ func (s *APIServer) dispatchIPC(e *Engine, session *Session, input IPCInput) {
 		ExpectedAgentSessionID: input.Target.AgentSessionID,
 		OnContextRecovery:      func(record *ContextRecoveryRecord) { s.recordIPCRecovery(input.EventID, record) },
 		OnAgentInput: func(err error) {
-			status, code := "delivered", ""
-			if err != nil {
+			status, code, method := "delivered", "", "start"
+			if errors.Is(err, errIPCChatNotSent) {
+				status, code, method = "waiting", errIPCChatNotSent.Error(), ""
+			} else if err != nil {
 				status, code = "unknown", "agent_input_failed_or_unconfirmed"
 			}
-			s.finishIPC(input.EventID, status, "start", "", code)
+			s.finishIPC(input.EventID, status, method, "", code)
 		},
+	}
+	if input.Routing == "chat" {
+		msg.ExpectedSessionID = session.ID
+		msg.ExpectedAgentSessionID = ""
+		msg.BeforeAgentInput = func(as AgentSession) error { return s.prepareIPCChatInput(e, session, input, as) }
 	}
 	e.ensureInteractiveStateForQueueing(input.Target.SessionKey, platform, replyCtx)
 	go e.processInteractiveMessage(platform, msg, session, lockGen)
 }
 
-func (s *APIServer) steerIPC(e *Engine, input IPCInput) {
+// Commit the actual receiver immediately before backend input. A later /new
+// cannot redirect this attempt: the caller sends only to the captured executor.
+// A failure after this boundary is ambiguous and is never automatically retried.
+func (s *APIServer) prepareIPCChatInput(e *Engine, session *Session, input IPCInput, as AgentSession) error {
+	s.ipcMu.Lock()
+	defer s.ipcMu.Unlock()
+	target := input.Target
+	if _, current, err := s.resolveIPCRoute(&target, false, true); err != nil || current != session {
+		return errIPCChatNotSent
+	}
+	e.sessions.mu.RLock()
+	defer e.sessions.mu.RUnlock()
+	if e.sessions.activeSession[target.SessionKey] != session.ID || as.CurrentSessionID() == "" ||
+		session.GetAgentSessionID() != as.CurrentSessionID() || target.AgentSessionID != as.CurrentSessionID() {
+		return errIPCChatNotSent
+	}
+	receipt, err := s.ipcRead(input.EventID)
+	if err != nil {
+		return fmt.Errorf("ipc delivery receipt: %w", err)
+	}
+	if receipt.Status != "dispatching" || receipt.DeliveryTarget != nil {
+		return errors.New("ipc delivery already committed")
+	}
+	receipt.DeliveryTarget = &target
+	return s.ipcSave(receipt)
+}
+
+func (s *APIServer) steerIPC(e *Engine, session *Session, input IPCInput) {
 	e.interactiveMu.Lock()
 	state := e.interactiveStates[input.Target.SessionKey]
 	var as AgentSession
@@ -376,7 +440,19 @@ func (s *APIServer) steerIPC(e *Engine, input IPCInput) {
 		s.finishIPC(input.EventID, "waiting", "", "", "session_busy_without_live_input")
 		return
 	}
-	turn, err := steerer.SteerInput(input.Target.AgentSessionID, input.Prompt)
+	expected := input.Target.AgentSessionID
+	if input.Routing == "chat" {
+		if err := s.prepareIPCChatInput(e, session, input, as); err != nil {
+			if errors.Is(err, errIPCChatNotSent) {
+				s.finishIPC(input.EventID, "waiting", "", "", errIPCChatNotSent.Error())
+			} else {
+				s.finishIPC(input.EventID, "unknown", "", "", "ipc_delivery_commit_failed")
+			}
+			return
+		}
+		expected = as.CurrentSessionID()
+	}
+	turn, err := steerer.SteerInput(expected, input.Prompt)
 	status := "delivered"
 	if errors.Is(err, ErrNoActiveInput) {
 		status = "not_sent"
@@ -404,7 +480,7 @@ func (s *APIServer) recordIPCRecovery(id string, record *ContextRecoveryRecord) 
 		slog.Error("ipc recovery receipt unavailable", "event_id", id)
 		return
 	}
-	if receipt.Input.Target.AgentSessionID != record.FromSessionID {
+	if receipt.receiver().AgentSessionID != record.FromSessionID {
 		return
 	}
 	if receipt.Recovery != nil && receipt.Recovery.UpdatedAt.After(record.UpdatedAt) {
@@ -414,6 +490,13 @@ func (s *APIServer) recordIPCRecovery(id string, record *ContextRecoveryRecord) 
 	if err := s.ipcSave(receipt); err != nil {
 		slog.Error("ipc recovery receipt update failed", "event_id", id)
 	}
+}
+
+func (r *IPCReceipt) receiver() IPCTarget {
+	if r.DeliveryTarget != nil {
+		return *r.DeliveryTarget
+	}
+	return r.Input.Target
 }
 
 func (s *APIServer) handleIPCAck(w http.ResponseWriter, r *http.Request) {
@@ -427,7 +510,8 @@ func (s *APIServer) handleIPCAck(w http.ResponseWriter, r *http.Request) {
 	s.ipcMu.Lock()
 	defer s.ipcMu.Unlock()
 	receipt, err := s.ipcRead(ack.EventID)
-	if err != nil || receipt.Input.Target != ack.Target {
+	if err != nil || receipt.receiver() != ack.Target ||
+		(receipt.Input.Routing == "chat" && (receipt.DeliveryTarget == nil || receipt.Status == "waiting")) {
 		apiJSON(w, http.StatusConflict, map[string]string{"code": "ipc_ack_mismatch"})
 		return
 	}
