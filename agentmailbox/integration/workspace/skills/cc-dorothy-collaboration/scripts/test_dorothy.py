@@ -92,7 +92,11 @@ report = (('  完整资料起点\n' + '中文资料🙂\n' * 270000 + '完整资
 step(1 if mode != 'blocked' else 2, 'agent_response', 'DONE', '已完成资料核对。\n')
 step(2 if mode != 'blocked' else 3, 'tool', 'DONE')
 step(3 if mode != 'blocked' else 4, 'agent_response', 'DONE', report)
-if mode != 'missing_result':
+if mode == 'native_error':
+    emit('result', conversation_id=sid, status='ERROR', response='原生聚合回复',
+         error='Malformed function call: SECRET fixture error')
+    time.sleep(0.2)  # The worker must observe exit 0 instead of killing on ERROR.
+elif mode != 'missing_result':
     emit('result', conversation_id=sid, status='SUCCESS', response='原生聚合回复，不是最终报告')
 if mode == 'result_then_wait':
     time.sleep(120)
@@ -105,6 +109,7 @@ if mode == 'exit_failure':
 class DorothyWorkerTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue(Path('/usr/bin/sandbox-exec').is_file())
+        dorothy.HERMES_RUNTIME.mkdir(parents=True, exist_ok=True)
         PROBE_ROOT.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix='worker-tests-', dir=PROBE_ROOT)
         self.root = Path(self.temp.name).resolve()
@@ -262,6 +267,20 @@ class DorothyWorkerTests(unittest.TestCase):
         self.assertEqual(len(launches), 1)
         self.cli('cancel', 'duplicate')
         self.assertEqual(self.wait_finished('duplicate')['status'], 'cancelled')
+
+    def test_error_terminal_preserves_natural_exit_and_failure_diagnostic(self):
+        self.submit('native-error', 'native_error')
+        value = self.wait_finished('native-error')
+        self.assertEqual(value['status'], 'native_run_failed')
+        self.assertEqual(value['returncode'], 0)
+        self.assertEqual(value['native_status'], 'ERROR')
+        self.assertEqual(value['native_outcome']['error']['code'], 'malformed_function_call')
+        self.assertNotIn('SECRET', json.dumps(value))
+        dest = self.runtime / 'jobs/native-error'
+        self.assertEqual(value['partial_sha256'], dorothy.file_digest(dest / 'partial.md'))
+        self.assertFalse((dest / 'report.md').exists())
+        with self.assertRaisesRegex(ValueError, 'result_not_complete'):
+            dorothy.result('native-error', self.runtime)
 
     def test_six_slots_and_shared_nested_directory_exclusion(self):
         self.submit('exclusive', 'blocked')

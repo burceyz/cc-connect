@@ -25,6 +25,26 @@ Hermes运行目录可放置 `routing.json`，例如：
 
 `--tool-policy none`只接收内联文本，关闭全部工具和运行环境上下文。显式 `--profile happy2` 或 `--profile happy1`可用，仍限DeepSeek/High并核对原生证明；无工具任务也不能启动子Agent。隐式none仍选Go，因此Go被暂停时必须明确选择Happy。`research`继续只接受Go/High。普通来源与工作目录规则不构成系统读取白名单，供应商选取仍须满足调用方已确认的材料边界。
 
+## 调用失败的原因与可见正文
+
+Hermes的新失败回执分别记录 `stream_status`（调用流状态）和 `native_outcome`（对应原生轮次的结束原因）。合法的空正文不再统称为 `invalid_event`；能核对到原生证据时，分别显示 `max_tokens`、`context_window_exceeded`、`provider_error` 等原因。错误流仍保持失败。旧回执不改写，可在安装后的工作区运行：
+
+```sh
+python3 skills/cc-dsh-collaboration/scripts/bridge.py diagnose --run /绝对路径/运行目录
+```
+
+诊断核对原session、执行目录、任务正文和该轮事件范围，不把后来的成功算到旧失败上；输出仅含原因、数字和哈希，不导出原生错误原文、思考或工具内容。任务文件字节上限不能代替模型容量，材料、历史和回答预留须一并计算。
+
+桃乐丝的 `status` 展示原生状态、错误类别、错误步骤和正文哈希。已验证的原生1.3.3行为是：中途错误重试后或下一轮正常答复时，最终 `ERROR` 仍可能携带此前错误。入口继续要求真实 `SUCCESS` 和正常退出才报告完成；失败终态也等待实际退出，避免主动终止把原退出码覆盖。
+
+需要取回失败轮的可见答复时使用：
+
+```sh
+python3 skills/cc-dorothy-collaboration/scripts/dorothy.py export-visible --job 原任务编号
+```
+
+该命令核对进程已退出、原生快照哈希、最后一轮任务和完整回复步骤，再把调用流正文与原生JSONL逐字比对。返回 `visible_reply` 与本轮可见消息；`status` 和 `native_success` 保留原事实，不创建 `report.md`，不把取件成功当作任务通过。缺证或正文不一致时明确失败，不重新调用模型。它不读取SQLite、思考字段或工具输出，不自动续谈、换订阅或重投任务。
+
 ## 合并与验证
 
 本版本合并了六槽、公共父目录保护和通信接入。公共父目录不能作为单个任务的独占执行目录，具体写目录相同或嵌套时仍拒绝并发；只读来源不占写目录租约。

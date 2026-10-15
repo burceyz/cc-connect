@@ -1,5 +1,6 @@
 """Antigravity 1.3.3 protocol and workspace-write process boundary."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -14,6 +15,76 @@ MAX_OUTPUT = 16 * 1024 * 1024
 ID_PATTERN = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}')
 MCP_TOOLS = ('list_peers', 'send_message', 'read_message', 'ack_message',
              'message_status', 'wait_for_message')
+
+
+def error_summary(text):
+    """Keep a failure category and fingerprint, never provider error prose."""
+    if not isinstance(text, str) or not text:
+        return None
+    result = {'code': 'native_error', 'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest()}
+    lower = text.lower()
+    if 'malformed function call' in lower or 'improperly formatted function call' in lower:
+        result['code'] = 'malformed_function_call'
+    elif 'output token limit' in lower:
+        result['code'] = 'max_tokens'
+    elif 'context window' in lower or 'input token limit' in lower:
+        result['code'] = 'context_window_exceeded'
+    elif 'context deadline exceeded' in lower or 'timed out' in lower:
+        result['code'] = 'native_timeout'
+    elif 'individual quota reached' in lower or 'quota_exhausted' in lower or 'quota exceeded' in lower:
+        result['code'] = 'quota_exceeded'
+    match = re.search(r'\b(?:Error|HTTP|status code|code)\s*[:=]?\s*([45][0-9]{2})\b', text, re.IGNORECASE)
+    if match:
+        result['http_status'] = int(match[1])
+        if result['code'] == 'native_error':
+            result['code'] = 'rate_limited' if match[1] == '429' else 'provider_error'
+    return result
+
+
+def visible_turn(path, task, reply_index):
+    """Read visible text from the last archived turn; thinking/tools stay private."""
+    messages, errors = [], []
+    matched = False
+    last_index = -1
+    last_relevant = None
+    prefix = '<USER_REQUEST>\n' + task + '\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: '
+    suffix = '.\n</ADDITIONAL_METADATA>'
+    with Path(path).open(encoding='utf-8') as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError('native_transcript_invalid')
+            index = row.get('step_index')
+            if type(index) is not int or index <= last_index:
+                raise ValueError('native_transcript_invalid')
+            last_index = index
+            kind, text = row.get('type'), row.get('content')
+            if kind == 'USER_INPUT':
+                if not isinstance(text, str):
+                    raise ValueError('native_transcript_invalid')
+                matched = text == task
+                if text.startswith(prefix) and text.endswith(suffix):
+                    stamp = text[len(prefix):-len(suffix)]
+                    matched = bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})', stamp))
+                messages = [{'role': 'user', 'step_index': index, 'text': task}]
+                errors = []
+            elif matched and kind == 'PLANNER_RESPONSE' and text:
+                if not isinstance(text, str):
+                    raise ValueError('native_transcript_invalid')
+                messages.append({'role': 'assistant', 'step_index': index, 'text': text})
+            elif matched and kind == 'ERROR_MESSAGE':
+                errors.append({'step_index': index, 'error': error_summary(text)})
+            if kind not in ('SYSTEM_MESSAGE', 'CHECKPOINT', 'FINISH'):
+                last_relevant = row
+    if not matched:
+        raise ValueError('native_task_mismatch')
+    if (not last_relevant or last_relevant.get('step_index') != reply_index or
+            last_relevant.get('type') != 'PLANNER_RESPONSE' or last_relevant.get('status') != 'DONE' or
+            not messages or messages[-1]['role'] != 'assistant' or messages[-1]['step_index'] != reply_index):
+        raise ValueError('visible_reply_unverified')
+    return messages, errors
 
 
 def system_temp_roots():
@@ -171,9 +242,11 @@ class Stream:
         self.reply = []
         self.reply_done = False
         self.tools = {}
+        self.input_index = None
+        self.error_steps = []
 
     def feed(self, line):
-        if self.error:
+        if self.error and self.error != 'native_run_failed':
             return
         try:
             self._feed(json.loads(line))
@@ -200,7 +273,10 @@ class Stream:
             value = event['result']
             if not isinstance(value, dict) or value.get('conversation_id') != self.session_id or not self.session_id:
                 raise ValueError()
+            if value.get('status') not in ('SUCCESS', 'ERROR'):
+                raise ValueError()
             self.terminal = {k: value.get(k) for k in ('status', 'usage')}
+            self.terminal['error'] = error_summary(value.get('error'))
             if value.get('status') != 'SUCCESS':
                 self.error = 'native_run_failed'
 
@@ -217,6 +293,8 @@ class Stream:
             self.last_index, self.last_kind = index, kind
         if kind == 'user_input':
             self.accepted = self.accepted or state == 'DONE'
+            if state == 'DONE' and self.input_index is None:
+                self.input_index = index
         elif kind == 'agent_response':
             text = step.get('text_delta', '')
             if not isinstance(text, str) or state not in ('ACTIVE', 'DONE'):
@@ -236,6 +314,18 @@ class Stream:
             info = step.get('tool_info') or {}
             self.tools[index] = {'name': step.get('tool_name') or info.get('name'),
                                  'state': state, 'error': bool(info.get('error'))}
+        elif kind == 'error_message' and index not in self.error_steps:
+            self.error_steps.append(index)
+
+    def diagnostic(self):
+        terminal = self.terminal or {}
+        usage = terminal.get('usage')
+        safe_usage = {k: v for k, v in (usage.items() if isinstance(usage, dict) else ())
+                      if k in ('input_tokens', 'output_tokens', 'thinking_tokens', 'cache_read_tokens', 'total_tokens')
+                      and type(v) is int and v >= 0}
+        return {'status': terminal.get('status'), 'error': terminal.get('error'),
+                'input_step_index': self.input_index, 'error_step_indices': self.error_steps,
+                'usage': safe_usage}
 
     def report(self):
         text = ''.join(self.reply)

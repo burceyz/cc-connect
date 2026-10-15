@@ -398,7 +398,9 @@ def status(key, runtime=RUNTIME):
                         'native_group': 'running' if members else 'unknown' if child_unknown else 'absent',
                         'native_archive': bool(state.get('native_sha256')),
                         'callback_worker': 'running' if process_matches(callback_launch.get('worker')) else 'absent'},
-            'callback': read_json(dest / 'callback.json') if (dest / 'callback.json').exists() else None}
+            'callback': read_json(dest / 'callback.json') if (dest / 'callback.json').exists() else None,
+            **{field: state[field] for field in ('native_status', 'native_outcome', 'protocol',
+                                                 'partial_bytes', 'partial_sha256') if field in state}}
 
 
 def result(key, runtime=RUNTIME):
@@ -413,6 +415,51 @@ def result(key, runtime=RUNTIME):
         raise ValueError('report_changed')
     return value | {'report_path': str(dest / 'report.md'), 'report_bytes': len(raw),
                     'report_sha256': digest(raw), 'report': raw.decode('utf-8')}
+
+
+def export_visible(key, runtime=RUNTIME):
+    """Export a verified visible reply without promoting a failed invocation."""
+    runtime = runtime_path(runtime)
+    value = status(key, runtime)
+    if (value['status'] in ACTIVE or value['cleanup']['worker'] != 'absent' or
+            value['cleanup']['native_group'] != 'absent'):
+        raise ValueError('native_execution_not_closed')
+    dest = job_path(runtime, key)
+    request = checked_request(dest)
+    state = read_json(dest / 'state.json')
+    archive = dest / 'native'
+    if not state.get('native_sha256') or tree_digest(archive) != state['native_sha256']:
+        raise ValueError('native_archive_changed')
+    sid = state.get('conversation_id')
+    if not isinstance(sid, str) or not native.ID_PATTERN.fullmatch(sid):
+        raise ValueError('invalid_conversation_id')
+    path = archive / 'antigravity-cli/brain' / sid / '.system_generated/logs/transcript_full.jsonl'
+    if not path.resolve().is_relative_to(archive.resolve()):
+        raise ValueError('native_transcript_outside_archive')
+    protocol = state.get('protocol', {})
+    if (protocol.get('input_accepted') is not True or protocol.get('reply_done') is not True or
+            protocol.get('last_step_type') != 'agent_response' or
+            type(protocol.get('reply_index')) is not int or
+            protocol.get('reply_index') != protocol.get('last_step_index')):
+        raise ValueError('visible_reply_unverified')
+    messages, errors = native.visible_turn(path, (dest / 'task.md').read_text(encoding='utf-8'),
+                                           protocol.get('reply_index'))
+    # CLI DONE events add one newline per visible response. Check the captured
+    # stream against the independently archived, hash-verified native source.
+    if (dest / 'partial.md').is_symlink():
+        raise ValueError('visible_text_mismatch')
+    raw = (dest / 'partial.md').read_bytes()
+    expected = ''.join(message['text'] + '\n' for message in messages if message['role'] == 'assistant').encode('utf-8')
+    if (raw != expected or (state.get('partial_sha256') and digest(raw) != state['partial_sha256']) or
+            ('partial_bytes' in state and state['partial_bytes'] != len(raw))):
+        raise ValueError('visible_text_mismatch')
+    reply = (messages[-1]['text'] + '\n').encode('utf-8')
+    return value | {'artifact_kind': 'visible_reply', 'verification': 'native_archive',
+                    'native_success': state.get('native_status') == 'SUCCESS',
+                    'native_archive_sha256': state['native_sha256'],
+                    'visible_messages': messages, 'native_error_steps': errors,
+                    'visible_reply': reply.decode('utf-8'), 'visible_reply_bytes': len(reply),
+                    'visible_reply_sha256': digest(reply), 'task_sha256': request['task_sha256']}
 
 
 def verify_parent_binding(binding_file, service_socket):
@@ -752,7 +799,7 @@ def execute_native(dest, request, state, lease_fds, interrupted, mailbox_ctx=Non
                                 )
                             except Exception:
                                 pass
-                if reason or stream.error:
+                if reason or (stream.error and stream.error != 'native_run_failed'):
                     reason = reason or stream.error
                     break
             if buffer.strip() and reason is None:
@@ -941,6 +988,7 @@ def worker(key, runtime, lease_fd, workspace_fd):
             stream, reason, code, clean = execute_native(dest, request, state, (lease_fd, workspace_fd), lambda: interrupted, mailbox_ctx=mailbox_ctx)
             state_update(dest, state, status='saving', returncode=code, cleanup_confirmed=clean,
                          tools=list(stream.tools.values()), native_status=(stream.terminal or {}).get('status'),
+                         native_outcome=stream.diagnostic(),
                          protocol={'input_accepted': stream.accepted, 'reply_done': stream.reply_done,
                                    'last_step_type': stream.last_kind, 'reply_index': stream.reply_index,
                                    'last_step_index': stream.last_index})
@@ -950,6 +998,7 @@ def worker(key, runtime, lease_fd, workspace_fd):
             raw_partial = ''.join(stream.partial).encode('utf-8')
             if raw_partial:
                 native.private_file(dest / 'partial.md', raw_partial)
+                state.update(partial_bytes=len(raw_partial), partial_sha256=digest(raw_partial))
             native.copy_tree(request['native_dir'], dest / 'native')
             state['native_sha256'] = tree_digest(dest / 'native')
             shutil.rmtree(request['native_dir'])
@@ -1122,7 +1171,7 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description='由 Atlas 按任务调用桃乐丝')
     sub = parser.add_subparsers(dest='action', required=True)
-    for name in ('submit', 'followup', 'status', 'result', 'cancel', '_worker', '_watch'):
+    for name in ('submit', 'followup', 'status', 'result', 'export-visible', 'cancel', '_worker', '_watch'):
         item = sub.add_parser(name)
         item.add_argument('--runtime', type=Path, default=RUNTIME)
         item.add_argument('--job', required=True)
@@ -1149,6 +1198,8 @@ def main():
                             team=getattr(args, 'team', None))
         elif args.action in ('status', 'result', 'cancel'):
             output = globals()[args.action](args.job, args.runtime)
+        elif args.action == 'export-visible':
+            output = export_visible(args.job, args.runtime)
         elif args.action == '_worker':
             worker(args.job, args.runtime, args.lease_fd, args.workspace_fd)
             return

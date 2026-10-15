@@ -162,6 +162,9 @@ def status(key, runtime=None):
             raise ValueError('instance_mismatch')
         if run.get('cwd') != target:
             raise ValueError('cwd_mismatch')
+        for field in ('stream_status', 'native_outcome'):
+            if field in run:
+                record[field] = run[field]
     notification = notify.read(dest)
     if notification is not None:
         record = record | {'notification': notification}

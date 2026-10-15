@@ -355,6 +355,8 @@ class Projection:
         self.tool_policy_attestation = None
 
     def feed(self, line):
+        if self.error in ('invalid_event', 'tool_policy_violation'):
+            return
         try:
             event = json.loads(line)
             if not isinstance(event, dict):
@@ -369,7 +371,7 @@ class Projection:
                 self.session_id = sid
             elif kind == 'final':
                 text = event.get('text')
-                if self.final is not None or not isinstance(text, str) or not text.strip():
+                if self.final is not None or not isinstance(text, str):
                     raise ValueError()
                 self.final = text
             elif kind == 'error':
@@ -391,6 +393,8 @@ class Projection:
     def status(self, returncode):
         if self.error:
             return self.error
+        if self.final is not None and not self.final.strip():
+            return 'empty_response'
         if returncode != 0:
             return 'process_failed'
         if self.session_id is None or self.final is None:
@@ -1155,6 +1159,17 @@ def run(task_path, resume, timeout, runtime=None, executable=None, allow_incompl
                     host_runtime.deactivate_mailbox(service_sock, mailbox_token, mailbox_gen)
                 except Exception:
                     pass
+        if status != 'completed' and record.get('session_id'):
+            record['stream_status'] = status
+            try:
+                _, native_rows = session_rows(record['session_id'], runtime, instance_id)
+                details = native_run_diagnostic(record, native_rows, input_task)
+                record['native_outcome'] = details
+                if (status in ('empty_response', 'process_failed', 'dsh_error') and
+                        details['status'] != 'completed'):
+                    status = details['status']
+            except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+                record['native_outcome'] = {'status': 'unavailable'}
         if status == 'completed' and source_fields:
             try:
                 _, native_rows = session_rows(record['session_id'], runtime, instance_id)
@@ -1200,7 +1215,7 @@ def render_transcript(messages):
 
 
 def session_rows(sid, runtime, instance_id=None):
-    if not re.fullmatch(r'session-[a-zA-Z0-9-]+', sid):
+    if not isinstance(sid, str) or not re.fullmatch(r'session-[a-zA-Z0-9-]+', sid):
         raise ValueError('invalid_session')
     home = instances.root(runtime, instance_id) / 'home'
     matches = list((home / 'sessions').glob('*/' + sid + '/session.v4.jsonl.zstd'))
@@ -1212,6 +1227,127 @@ def session_rows(sid, runtime, instance_id=None):
     raw = subprocess.run(['zstd', '-dc', str(source)], stdout=subprocess.PIPE,
                          stderr=subprocess.DEVNULL, check=True, timeout=30).stdout
     return source, [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+
+def native_run_diagnostic(record, rows, task):
+    """Read one exact turn; never persist prompts, reasoning or raw error text."""
+    if (not rows or not isinstance(rows[0], dict) or rows[0].get('type') != 'session' or
+            rows[0].get('id') != record.get('session_id') or
+            not isinstance(rows[0].get('cwd'), str) or not isinstance(record.get('cwd'), str) or
+            Path(rows[0]['cwd']).resolve() != Path(record['cwd']).resolve()):
+        raise ValueError('source_identity_mismatch')
+    before = record.get('source_before_seq')
+    if type(before) is not int or before < -1:
+        raise ValueError('source_cursor_invalid')
+    start = None
+    accepted = False
+    previous_seq = -1
+    cursor_found = before == -1
+    content = [{'type': 'text', 'text': task.decode('utf-8')}]
+    for index, row in enumerate(rows[1:], 1):
+        if not isinstance(row, dict) or not isinstance(row.get('data'), dict):
+            raise ValueError('native_event_invalid')
+        seq = row.get('seq')
+        if type(seq) is not int or seq != previous_seq + 1:
+            raise ValueError('native_sequence_invalid')
+        previous_seq = seq
+        if seq == before:
+            cursor_found = True
+        if seq <= before:
+            continue
+        if not cursor_found:
+            raise ValueError('source_cursor_invalid')
+        kind, data = row.get('type'), row.get('data', {})
+        if kind == 'turn/start':
+            if start is not None or type(data.get('turn')) is not int:
+                raise ValueError('native_turn_incomplete')
+            start = row
+        if start is None:
+            continue
+        if kind == 'user/message':
+            source = data.get('source')
+            if not isinstance(source, dict):
+                raise ValueError('native_event_invalid')
+            if source.get('kind') == 'user':
+                if accepted or data.get('content') != content:
+                    raise ValueError('task_not_in_source')
+                accepted = True
+        if kind == 'turn/end':
+            if not accepted or data.get('turn') != start['data']['turn']:
+                raise ValueError('native_turn_mismatch')
+            break
+    else:
+        raise ValueError('native_turn_incomplete')
+
+    reason = data.get('reason', {})
+    if not isinstance(reason, dict):
+        raise ValueError('native_reason_unknown')
+    kind = reason.get('kind')
+    statuses = {'completed': 'completed', 'max-tokens': 'max_tokens',
+                'error': 'native_error', 'aborted': 'native_cancelled',
+                'cancelled': 'native_cancelled'}
+    if not isinstance(kind, str) or kind not in statuses:
+        raise ValueError('native_reason_unknown')
+    details = {'status': statuses[kind], 'reason': kind,
+               'turn': start['data']['turn'], 'start_seq': start['seq'], 'end_seq': seq,
+               'source_prefix_sha256': digest(json.dumps(rows[:index + 1], sort_keys=True,
+                    ensure_ascii=False, separators=(',', ':')).encode('utf-8'))}
+    if kind == 'error':
+        error = reason.get('error', {})
+        if not isinstance(error, dict):
+            raise ValueError('native_event_invalid')
+        code = error.get('code')
+        if not isinstance(code, str):
+            raise ValueError('native_event_invalid')
+        allowed = {'CONTEXT_WINDOW_EXCEEDED': 'context_window_exceeded',
+                   'QUOTA': 'quota_exceeded', 'QUOTA_EXCEEDED': 'quota_exceeded',
+                   'AUTH': 'authentication_failed', 'RATE_LIMIT': 'rate_limited',
+                   'SERVER': 'provider_error', 'TIMEOUT': 'provider_timeout',
+                   'TRANSPORT': 'transport_error', 'EMPTY_RESPONSE': 'empty_response',
+                   'INVALID_REQUEST': 'invalid_request', 'PI_AI_ERROR': 'native_error'}
+        details['status'] = allowed.get(code, 'native_error')
+        details['error_code'] = code if code in allowed else 'OTHER'
+        message = error.get('message', '')
+        match = re.search(r'\b([45][0-9]{2}) status code\b', message) if isinstance(message, str) else None
+        if match:
+            details['http_status'] = int(match.group(1))
+    for row in rows[1:index + 1]:
+        data = row.get('data', {})
+        if row.get('type') == 'request/context':
+            capacity = data.get('contextWindow')
+            if type(capacity) is int and capacity > 0:
+                details['context_window'] = capacity
+        elif row.get('type') == 'assistant/message' and row['seq'] >= start['seq']:
+            message = data.get('message', {})
+            usage = data.get('usage', {})
+            if not isinstance(message, dict) or not isinstance(usage, dict):
+                raise ValueError('native_event_invalid')
+            blocks = message.get('content', [])
+            if (not isinstance(blocks, list) or any(not isinstance(block, dict) for block in blocks) or
+                    any(not isinstance(block.get('text'), str) for block in blocks if block.get('type') == 'text')):
+                raise ValueError('native_event_invalid')
+            details['usage'] = {key: usage[key] for key in
+                ('inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens')
+                if type(usage.get(key)) is int and usage[key] >= 0}
+            details['visible_text_bytes'] = sum(len(block['text'].encode('utf-8'))
+                for block in blocks if block.get('type') == 'text')
+    return details
+
+
+def diagnose_run(path, runtime=None):
+    """Inspect historical evidence without resuming or rewriting a run."""
+    runtime = RUNTIME if runtime is None else runtime
+    _, initial = load_run(path, runtime)
+    with locked(instances.root(runtime, initial.get('instance_id'))):
+        dest, record = load_run(path, runtime)
+        task = (dest / 'task.md').read_bytes()
+        if digest(task) != record.get('task_sha256'):
+            raise ValueError('artifact_modified')
+        task = source_policy.exported_prompt(dest, task, record)
+        _, rows = session_rows(record['session_id'], runtime, record.get('instance_id'))
+        return {'recorded_status': record['status'], 'returncode': record.get('returncode'),
+                'session_id': record['session_id'],
+                'native_outcome': native_run_diagnostic(record, rows, task)}
 
 
 def export_run(path, runtime=None):
@@ -1300,6 +1436,8 @@ def main():
     call.add_argument('--team', help='Collaboration group identifier for shared tasks')
     export = sub.add_parser('export')
     export.add_argument('--run', required=True)
+    diagnostic = sub.add_parser('diagnose', help='只读核对指定运行的原生结束原因，不重试任务')
+    diagnostic.add_argument('--run', required=True)
     args = parser.parse_args()
     try:
         scope()
@@ -1341,7 +1479,10 @@ def main():
                             tool_policy=args.tool_policy, model=args.model, sources=args.source,
                             team=args.team)
             return 0 if status == 'completed' else 1
-        export_run(args.run)
+        if args.command == 'diagnose':
+            print(json.dumps(diagnose_run(args.run), ensure_ascii=False))
+        else:
+            export_run(args.run)
         return 0
     except (ValueError, OSError, KeyError, subprocess.SubprocessError) as exc:
         # Do not echo paths or exception messages that could include task data.

@@ -74,6 +74,36 @@ class StreamTests(unittest.TestCase):
         self.assertIsNone(stream.report())
         self.assertEqual(''.join(stream.partial), '部分结果')
 
+    def test_recovered_native_error_keeps_its_diagnostic_but_is_not_success(self):
+        stream = self.start()
+        self.step(stream, 1, 'error_message', 'DONE')
+        self.step(stream, 2, 'agent_response', 'DONE', '可见答复')
+        stream.feed(event('result', conversation_id='session-1', status='ERROR',
+            error='Malformed function call: SECRET request body',
+            usage={'input_tokens': 10, 'output_tokens': 2, 'private': 'SECRET'}))
+        diagnostic = stream.diagnostic()
+        self.assertEqual(diagnostic['error']['code'], 'malformed_function_call')
+        self.assertEqual(diagnostic['error_step_indices'], [1])
+        self.assertEqual(diagnostic['usage'], {'input_tokens': 10, 'output_tokens': 2})
+        self.assertNotIn('SECRET', json.dumps(diagnostic))
+        self.assertIsNone(stream.report())
+        # An ERROR terminal does not make trailing malformed events acceptable.
+        stream.feed(event('result', conversation_id='session-1', status='SUCCESS'))
+        self.assertEqual(stream.error, 'invalid_native_stream')
+
+    def test_historical_terminal_error_is_separate_from_current_error_steps(self):
+        stream = self.start()
+        self.step(stream, 1, 'agent_response', 'DONE', '本轮答复')
+        stream.feed(event('result', conversation_id='session-1', status='ERROR',
+                          error='agent executor error: Error 400, Message: SECRET'))
+        self.assertEqual(stream.diagnostic()['error_step_indices'], [])
+        self.assertEqual(stream.diagnostic()['error']['http_status'], 400)
+        self.assertIsNone(stream.report())
+        quota = native.error_summary('RESOURCE_EXHAUSTED (code 429): Individual quota reached. SECRET')
+        self.assertEqual(quota['code'], 'quota_exceeded')
+        self.assertEqual(quota['http_status'], 429)
+        self.assertNotIn('SECRET', json.dumps(quota))
+
 
 class ArchiveTests(unittest.TestCase):
     def test_archive_refuses_symlinks_without_copying_target(self):
