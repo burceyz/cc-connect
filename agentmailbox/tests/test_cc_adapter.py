@@ -261,6 +261,76 @@ class TestCCAdapter(unittest.TestCase):
         finally:
             adapter.close()
 
+    def _retire(self, adapter, scope, generation, withdrawn=True, ended=None):
+        folder = adapter.runtime_dir / 'withdrawals'
+        folder.mkdir(exist_ok=True)
+        cc_adapter.atomic_write_json(folder / (scope + '.json'), {
+            'schema': 1, 'scope': scope, 'mailbox_id': 'mbx-1', 'generation': generation,
+            'withdrawn': withdrawn, 'retired_generations': ended or [generation]}, 'withdrawal')
+
+    def test_leave_rejoin_and_late_old_departure_preserve_the_new_generation(self):
+        adapter = self._adapter()
+        try:
+            with patch('cc_adapter.call_cc_socket', side_effect=lambda *a, **k: self._chat_target()), \
+                 patch('cc_adapter.register_task_mailbox', return_value=({'mailbox_id': 'mbx-1'}, 'tok-1')), \
+                 patch('cc_adapter.activate_mailbox') as activate, \
+                 patch('cc_adapter.deactivate_mailbox') as deactivate, \
+                 patch('cc_adapter.heartbeat_mailbox'):
+                scope = adapter.sync_chat('agentmailbox', 'feishu:chat:user', str(self.root / 'proj'))
+                old = adapter.atlas_mailboxes[scope]['generation']
+                self._retire(adapter, scope, old)
+                self.assertIsNone(adapter.sync_chat('agentmailbox', 'feishu:chat:user', str(self.root / 'proj')))
+                self.assertEqual(adapter.atlas_mailboxes[scope]['phase'], 'retired')
+                self.assertNotIn(scope, adapter.active_targets)
+                self._retire(adapter, scope, old, withdrawn=False)
+                self.assertEqual(adapter.sync_chat('agentmailbox', 'feishu:chat:user', str(self.root / 'proj')), scope)
+                current = adapter.atlas_mailboxes[scope]['generation']
+                self.assertNotEqual(old, current)
+                activate.reset_mock()
+                deactivate.reset_mock()
+                self._retire(adapter, scope, old)
+                self.assertEqual(adapter.sync_chat('agentmailbox', 'feishu:chat:user', str(self.root / 'proj')), scope)
+                self.assertEqual(adapter.atlas_mailboxes[scope]['generation'], current)
+                activate.assert_not_called()
+                deactivate.assert_not_called()
+                self.assertTrue(adapter._withdrawn(scope, old))
+                self.assertFalse(adapter._withdrawn(scope, current))
+        finally:
+            adapter.close()
+
+    def test_retired_delivery_is_query_only_even_after_rejoin(self):
+        adapter = self._adapter()
+        try:
+            scope = self._scope_target(adapter)
+            with patch('cc_adapter.call_cc_socket', side_effect=lambda s, m, p, payload=None, **k:
+                       (200, {'input': payload, 'status': 'unknown'})), patch('cc_adapter.request_unix'):
+                adapter._deliver_to_cc(scope, message('msg-retired'), 'att-1', 'tok-1', 'gen-1',
+                                       adapter.active_targets[scope])
+            path = next(adapter.events_dir.glob('*.json'))
+            saved = json.loads(path.read_bytes())
+            original_input = saved['input']
+            self._retire(adapter, scope, 'gen-1', withdrawn=False)
+            adapter.atlas_mailboxes[scope]['generation'] = 'gen-2'
+            adapter.active_targets[scope]['session_id'] = 'cc-s2'
+            for status in ('delivered', 'unknown', 'waiting'):
+                with self.subTest(status=status):
+                    calls = []
+                    def cc(sock, method, route, payload=None, **kwargs):
+                        calls.append(method)
+                        return 200, {'input': original_input, 'status': status,
+                                     'code': 'turn_not_ready', 'boot': 'a' * 32,
+                                     'delivery_target': {'session_id': 'cc-s1'}}
+                    with patch('cc_adapter.call_cc_socket', side_effect=cc), patch('cc_adapter.request_unix'):
+                        adapter._query_saved_event(path, json.loads(json.dumps(saved)))
+                    self.assertEqual(calls, ['GET'])
+                    self.assertEqual(json.loads(path.read_bytes())['input'], original_input)
+            with patch('cc_adapter.call_cc_socket') as cc:
+                self.assertIsNone(adapter._deliver_to_cc(scope, message('new-old'), 'att-2', 'tok-1', 'gen-1',
+                                                        adapter.active_targets[scope]))
+                cc.assert_not_called()
+        finally:
+            adapter.close()
+
     # ------------------------------------------------------------- delivery
 
     def _scope_target(self, adapter):

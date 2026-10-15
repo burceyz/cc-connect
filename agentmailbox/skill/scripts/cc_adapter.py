@@ -312,8 +312,33 @@ class CcAdapter:
 
     # ----------------------------------------------------------- chat syncing
 
+    def _withdrawn(self, scope, generation=None):
+        path = self.runtime_dir / 'withdrawals' / (scope + '.json')
+        if not path.exists():
+            return False
+        record = read_control_json(path, 'withdrawal')
+        mbx = self.atlas_mailboxes.get(scope)
+        if (record.get('schema') != 1 or record.get('scope') != scope or
+                not mbx or record.get('mailbox_id') != mbx['mailbox_id'] or
+                not isinstance(record.get('withdrawn'), bool)):
+            raise ValueError('invalid_mailbox_withdrawal')
+        ended = record.get('retired_generations', [])
+        if not isinstance(ended, list) or any(not isinstance(g, str) or not g for g in ended):
+            raise ValueError('invalid_mailbox_withdrawal')
+        if generation is not None and generation in ended:
+            return True
+        return bool(record['withdrawn'] and record.get('generation') == (generation or mbx.get('generation')))
+
     def sync_chat(self, project, session_key, cwd):
         """Verify the chat address with CC and ensure the Atlas mailbox matches."""
+        scope = compute_scope(project, session_key, cwd, self.cc_socket)
+        if self._withdrawn(scope):
+            mbx = self.atlas_mailboxes[scope]
+            self.active_targets.pop(scope, None)
+            if mbx.get('phase') != 'retired' and self._end_generation(mbx, mbx['generation']):
+                mbx['phase'] = 'retired'
+                self._save_chat_state(scope)
+            return None
         req = {
             "project": project,
             "session_key": session_key,
@@ -674,6 +699,8 @@ class CcAdapter:
                 record = None
         created = record is None
         if created:
+            if self._withdrawn(scope, generation):
+                return None
             if not isinstance(target, dict):
                 sys.stderr.write(f"[cc_adapter] no saved target for event {event_id}\n")
                 return None
@@ -731,7 +758,8 @@ class CcAdapter:
             return
         if status != 200 or not isinstance(res, dict):
             return
-        self._apply_receipt(event_file, record, res, allow_retry=True)
+        self._apply_receipt(event_file, record, res,
+                            allow_retry=not self._withdrawn(record['scope'], record['generation']))
 
     def _record_cc_rejection(self, event_file, record, status, res):
         """A non-200 POST means no receipt was accepted; make it observable."""
@@ -873,6 +901,8 @@ class CcAdapter:
             scope = record.get("scope")
             mbx = self.atlas_mailboxes.get(scope) if isinstance(scope, str) else None
             if not mbx or not record.get("generation") or not record.get("request_id"):
+                continue
+            if self._withdrawn(scope, record['generation']):
                 continue
             if not isinstance(record.get("target"), dict):
                 record["target"] = self.active_targets.get(scope)
