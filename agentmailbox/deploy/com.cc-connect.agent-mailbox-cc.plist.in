@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.cc-connect.agent-mailbox-cc</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@PYTHON@</string>
+    <string>-B</string>
+    <string>@WORKSPACE@/skills/cc-agent-ipc/scripts/cc_adapter.py</string>
+    <string>--config</string>
+    <string>@RUNTIME@/cc-adapter.json</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CC_DATA_DIR</key><string>@CC_DATA@</string>
+    <key>AGENT_MAILBOX_RUNTIME</key><string>@RUNTIME@</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>@RUNTIME@/adapter.stdout.log</string>
+  <key>StandardErrorPath</key><string>@RUNTIME@/adapter.stderr.log</string>
+</dict>
+</plist>

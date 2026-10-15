@@ -1,0 +1,25 @@
+# Fixed final overlay: source tasks keep native reads and deny file mutations.
+# The bridge snapshots and hashes these bytes for each accepted source task.
+- id: sandbox-policy
+  config:
+    mode: read-only
+- id: permission
+  config:
+    defaultPreset: read-only
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: never
+- id: approval
+  config:
+    policy: never
+- id: fs-sandbox
+  disabled: false
+- id: plugin-manager
+  disabled: true
+- id: tool-plugin-manager
+  disabled: true
+- id: hmr
+  disabled: true
+- id: config-editor
+  disabled: true

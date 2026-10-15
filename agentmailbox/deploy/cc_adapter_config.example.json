@@ -1,0 +1,11 @@
+{
+  "service_socket": "/Users/agent/.cc-connect/mailbox/api.sock",
+  "admin_token_path": "/Users/agent/.cc-connect/mailbox/admin-token",
+  "cc_socket": "/Users/agent/.cc-connect/run/api.sock",
+  "session_index_path": "/Users/agent/.cc-connect/sessions/default.json",
+  "runtime_dir": "/Users/agent/.cc-connect/mailbox/adapter",
+  "cc_project": "default",
+  "allowed_projects": ["default"],
+  "cc_cwd": "/Users/agent/WorkSpace/my-project",
+  "poll_interval": 2.0
+}

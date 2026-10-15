@@ -1,0 +1,9 @@
+!skill/scripts/
+!skill/scripts/**
+build/
+__pycache__/
+*.py[cod]
+
+# This local integration tree also contains private operating notes and fixtures.
+# Only the reviewed launcher source/test manifest is explicitly tracked.
+integration/workspace/

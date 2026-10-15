@@ -1,0 +1,444 @@
+{
+  "release": "agent-mailbox-v1.0.0-atlas.20261015.1",
+  "base_commit": "ee80730c561ab9c994f3d612aca8e059391d159c",
+  "frozen_at": "2026-10-15T11:56:37.930058+08:00",
+  "files": [
+    {
+      "path": ".gitignore",
+      "sha256": "cd2b196729ff186de79b93db6c3ede86d7315f7cccabe639406ae522c817775c",
+      "bytes": 243
+    },
+    {
+      "path": "DESIGN.md",
+      "sha256": "7705b1be58cba118c998a53487dd40f218a31f17fe3d58f6cea54347a04f0844",
+      "bytes": 4494
+    },
+    {
+      "path": "PROTOCOL.md",
+      "sha256": "91c705e658b8376166e43c3b6fd19813b399008cef5d2371fdcb1f5a92f73bd4",
+      "bytes": 17466
+    },
+    {
+      "path": "README.md",
+      "sha256": "07a95d9a81a081ab700b08da976115682829a7ec3dd920ebbff2457c60c53eb9",
+      "bytes": 2285
+    },
+    {
+      "path": "cmd/agent-mailbox/main.go",
+      "sha256": "e906491fde7cdd35e6c827f4d593c8c40f19f345f6b9821d44ae172f7a743db1",
+      "bytes": 1386
+    },
+    {
+      "path": "deploy/README.md",
+      "sha256": "f489b6bd3a488d07d493fc36b6f5588409c9c63862119336722d293f2e470274",
+      "bytes": 3360
+    },
+    {
+      "path": "deploy/cc_adapter_config.example.json",
+      "sha256": "6ba9415068ab85d79fd74fa30b20b73934ba5a17f81463c16127ea2844f01bd2",
+      "bytes": 464
+    },
+    {
+      "path": "deploy/com.cc-connect.agent-mailbox-cc.plist.in",
+      "sha256": "905076495bc194acc5104c1872af0c56f7a576f830906de666c04f29242fa26d",
+      "bytes": 1033
+    },
+    {
+      "path": "deploy/com.cc-connect.agent-mailbox.plist.in",
+      "sha256": "d1eca56418b8336fcba2b17a22d157b3c4a75490570bb4e86180922feb643cea",
+      "bytes": 788
+    },
+    {
+      "path": "go.mod",
+      "sha256": "1204922614718796d746ba66cb140b4069eb5edd13ecbdbfd2e52ac60902905e",
+      "bytes": 510
+    },
+    {
+      "path": "go.sum",
+      "sha256": "fea1e810f933de4f817aa01296df8ffa932934fa800a14a6302a71c2cf243f9e",
+      "bytes": 1789
+    },
+    {
+      "path": "integration/README.md",
+      "sha256": "c71850eef73161fd10cea23f0a443408f961bb8bf3582b29744be5c579a461e4",
+      "bytes": 3250
+    },
+    {
+      "path": "integration/workspace/skills/cc-dorothy-collaboration/scripts/dorothy.py",
+      "sha256": "f83f8e50d00b01318b9c8df937873c184350ffc8646a2213098f55e5e810c522",
+      "bytes": 55725
+    },
+    {
+      "path": "integration/workspace/skills/cc-dorothy-collaboration/scripts/native.py",
+      "sha256": "825893890b48cc7698c6b4f53572c761e906f6bdf54a70ff48cc2190dc283eb5",
+      "bytes": 10995
+    },
+    {
+      "path": "integration/workspace/skills/cc-dorothy-collaboration/scripts/test_callback.py",
+      "sha256": "a7b1d3fd2ba6023293732d46b981e998e49ef33602d9803c4a5fb949b0b28e7e",
+      "bytes": 4979
+    },
+    {
+      "path": "integration/workspace/skills/cc-dorothy-collaboration/scripts/test_cwd.py",
+      "sha256": "8d76a56a1534582dac02506760d8b454c4bdbfa2dfdd38b324cdad3380078d20",
+      "bytes": 12275
+    },
+    {
+      "path": "integration/workspace/skills/cc-dorothy-collaboration/scripts/test_dorothy.py",
+      "sha256": "fc29172d2c8feace36a675fedf9da0673a7dc2d6052c86baf9b0c91717ff508e",
+      "bytes": 34072
+    },
+    {
+      "path": "integration/workspace/skills/cc-dorothy-collaboration/scripts/test_dorothy_slots.py",
+      "sha256": "333ac06837c03e93ede1808302dc7a95c8eecc6f2bf4f56fb76df6483c9f8b3c",
+      "bytes": 7060
+    },
+    {
+      "path": "integration/workspace/skills/cc-dorothy-collaboration/scripts/test_native.py",
+      "sha256": "845818f3a6ac6cfd9ecea95621b4c1d5f8d447dc4e0065fd42143d5510b19a4a",
+      "bytes": 5209
+    },
+    {
+      "path": "integration/workspace/skills/cc-dorothy-collaboration/scripts/test_permissions.py",
+      "sha256": "13cac5280e59c0e4d7e0fc99dcc8b843b742618e0491c7dd4f5afae223d334e1",
+      "bytes": 14895
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/bridge.py",
+      "sha256": "1b1724854cd350a05e10cc49dc9b027cc6ecb8c9ecd2f69325c106b5eb3ac050",
+      "bytes": 66308
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/consultation-policy.mjs",
+      "sha256": "e2e6a2f9e634cd80f5aacffba727e58891a7beb8e1ca1896110db54eaad43e6a",
+      "bytes": 3479
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/consultation-policy.patch.yml",
+      "sha256": "ca82293ee31d94125108a5e07c815c17e5de98c4c05c29b927829ec42c27e75b",
+      "bytes": 3113
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/instances.py",
+      "sha256": "1e0c5484546aceeee2be7f732f8431161dfc33a6650ac330eaf7970f71ee0894",
+      "bytes": 8491
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/ipc.py",
+      "sha256": "fb9e2214e8cf25d46786ad29212a01f4f21f4677290bd3a6b835c4d8f49d18d6",
+      "bytes": 31376
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/jobs.py",
+      "sha256": "1ac402f3598b068071c036a62117acf32b3fb853bd8d6d2b5f1eb6be25d2de51",
+      "bytes": 26984
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/notify.py",
+      "sha256": "6b7f292c31f3ab0dcb9dc5022ed1007eed18a8923cd53afc2015346bcbb08404",
+      "bytes": 8170
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/offline.py",
+      "sha256": "f844972d2738bffa03d6dd5176651b03ea90754af1cb9bc01b45bb02d134c3db",
+      "bytes": 20433
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/read-sources.patch.yml",
+      "sha256": "373cdd757a979a5372048483f497bbabe3080570c7c80b6950e7621ba7dbdff6",
+      "bytes": 567
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/read_sources.py",
+      "sha256": "bfb59e1a517ba2e7b555738c6ec5426f33987894780fb1a2e9734396e3600481",
+      "bytes": 3948
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/research-policy.mjs",
+      "sha256": "eeaf3de6f6a9ec38a54fcd8e69e03e6518249794e53ee2dc1028afd6ae1ef357",
+      "bytes": 7354
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/research-policy.patch.yml",
+      "sha256": "dab86f91ff03f75bfb936874bee42ecd6ab7830f46fdd19ea82342aafefbbecc",
+      "bytes": 3232
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/routing.py",
+      "sha256": "7c51587b6c9b3d3c1a0f50ff3033b93d4f3e7747555c06542a931843b656fee5",
+      "bytes": 2688
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/shell_probe.py",
+      "sha256": "fc93e5f4a4846ea3c62790eeb5d7603d2dc820febcccae0c999e18c7cb440a80",
+      "bytes": 2460
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_bridge.py",
+      "sha256": "7309dcf439bafb5cb84aa53357230292836d5823ae48b83ad323b0a5b106ef10",
+      "bytes": 17660
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_bridge_instances.py",
+      "sha256": "38a933d4ec8cd908dc1889122c3400dab83cb331042986fdaf31214b88c0941e",
+      "bytes": 3285
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_consultation.py",
+      "sha256": "9d8e864d69d215f57c76ffe8a79a2a2c51149188e9d3799bdfde1196d867e22d",
+      "bytes": 33082
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_consultation_policy.mjs",
+      "sha256": "67061147a9f2e52d67a81068aacf85934497d1c52aceedaf63cabd8afac92059",
+      "bytes": 6565
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_consultation_stop.mjs",
+      "sha256": "6c63386efed5eb07afe0bb24698cbe5ca254ed734764b988d1a82c9dbfba307c",
+      "bytes": 1266
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_cwd.py",
+      "sha256": "e7bdda9dadf3236eb7a09073edd7679fa5027e83260bbea7e3748b992d145dc3",
+      "bytes": 9422
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_happy1.py",
+      "sha256": "233ea50dbc8311ac1e9abe29864af89e8de17a3313681c297def3d9564e5e426",
+      "bytes": 3482
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_instances.py",
+      "sha256": "5fd7fda17a11c8316cf5b387d1fbce481d3a40ac05cfbaa27861887565b9a9be",
+      "bytes": 13421
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_ipc.py",
+      "sha256": "3bdbc2bb8b8e576313e2adad4e76a61758f8b223c0eb36f8499f5a19e32602fe",
+      "bytes": 44162
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_job_instances.py",
+      "sha256": "b4709a4a0ddecbc8ee8e6b4b7442720a094c34fadde68c68fcd27c7366ee9a37",
+      "bytes": 6077
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_jobs.py",
+      "sha256": "6705be5aaafe14f09835f3b4eaa5b1fe284686e303c550ee11536c848b57314c",
+      "bytes": 11115
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_mailbox_bridge.py",
+      "sha256": "cf00956e6a8367af867d9b47d6c19d301cd39d6b5cb70bd91c5115c32bbc55b8",
+      "bytes": 44917
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_mailbox_plugin.mjs",
+      "sha256": "64c38ce74b3edc3a0b469caafe95d12e0968f4d73299cea3bf8eb8e643dab1de",
+      "bytes": 30835
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_mailbox_plugin_service.mjs",
+      "sha256": "6e919d0fcc46858a115c057a90ea6aa336c296401c6a1710fbfac917ee86e4c7",
+      "bytes": 12102
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_models.py",
+      "sha256": "6ea7cb58f3bad0b4a00fdfb260e02c4d6fb96b8dba4850eb2a43793d35e9e975",
+      "bytes": 14795
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_multi_failures.py",
+      "sha256": "cedbdc658153473dbde14710dd40cfe4f37b123625e6fabd1783bef18c0ed30e",
+      "bytes": 12836
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_notify.py",
+      "sha256": "2dbb2589fe2eacfc52fea04c9532a4b2b0ed70a0fab6ce7fb2906ebad8ee56df",
+      "bytes": 10870
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_offline.py",
+      "sha256": "2c1c5afb223bb28c7a432aa7eaf5695bf9f5c02d62df3218ce8685acfcdaecbd",
+      "bytes": 16716
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_profiles.py",
+      "sha256": "d4a8406498bec92ae3a3316f73ea12eaa3b41ea48b920d5efeb8a8a9c4c1f244",
+      "bytes": 9947
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_read_sources.py",
+      "sha256": "ab9036da580bfb0aae6fa905b02f9684898237e77276b4c9654575dbc48b9997",
+      "bytes": 13633
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_reasoning_effort.py",
+      "sha256": "d5ce306a8fa11f0cc2ae9093e83765cca06a74d6efa6482e85a7ecf356a194c2",
+      "bytes": 17606
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_research_policy.mjs",
+      "sha256": "3fd0a137b39627ed3699740552746ab7decbd73c7d56cf78ac9ba452b37e6520",
+      "bytes": 6790
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_research_tools.mjs",
+      "sha256": "b1cc5ceeca7f01c574b1d54e0be3c31de058d77a7d75d1c26feebc1fb8467c60",
+      "bytes": 539
+    },
+    {
+      "path": "integration/workspace/skills/cc-dsh-collaboration/scripts/test_subscription_routing.py",
+      "sha256": "9e744f35526794a26dbb05e5b28b704c5a1e096dc56ebe54721a942a33fb8190",
+      "bytes": 30596
+    },
+    {
+      "path": "internal/mailbox/ids.go",
+      "sha256": "134401251cb20bf7b15fd8a3018722fc15d16258827a97918c08b5325656ef87",
+      "bytes": 928
+    },
+    {
+      "path": "internal/mailbox/run.go",
+      "sha256": "d5e1776ef6c8e27fb4fee64c20afa3e2dd3c942c4821134a3ab733cf87a5720f",
+      "bytes": 8269
+    },
+    {
+      "path": "internal/mailbox/run_test.go",
+      "sha256": "99984647aaccb53d151d55f340bc925d7dd4c83a0d4c921f18c25aedd506d676",
+      "bytes": 10736
+    },
+    {
+      "path": "internal/mailbox/server.go",
+      "sha256": "58fd6118580acb39c8687de00a6771d536c382c0b197bff5fcf26aea8f96c5c2",
+      "bytes": 13544
+    },
+    {
+      "path": "internal/mailbox/server_test.go",
+      "sha256": "498ef51bb28c8c52058cf8fa89b7157204be6d661754a7d4388a63c36d30da95",
+      "bytes": 19041
+    },
+    {
+      "path": "internal/mailbox/store.go",
+      "sha256": "ce5ccb78c59bc452235eb0915e1adeeccd7e7722d80fe6da02af6c070feb2c60",
+      "bytes": 29211
+    },
+    {
+      "path": "internal/mailbox/store_test.go",
+      "sha256": "bfca23ec35ec33f0ddc7c3eeb5f7f0d410f9ef0bc52dfa687ad2e4e21b23ff7d",
+      "bytes": 40126
+    },
+    {
+      "path": "internal/mailbox/types.go",
+      "sha256": "c3c5de6079f4899ea735921100e468b9a8ebee8588371c62397d5f9b9aabd005",
+      "bytes": 6284
+    },
+    {
+      "path": "skill/SKILL.md",
+      "sha256": "59c6df700839f5544bd3684ed0819fc421fd1dff980ee4f5f8df09272dfeebe8",
+      "bytes": 4252
+    },
+    {
+      "path": "skill/references/operations.md",
+      "sha256": "9c30ec0289e393915823acbff247a1be2e2b10fab9cb1f3fc905b51e4c078532",
+      "bytes": 4433
+    },
+    {
+      "path": "skill/references/protocol.md",
+      "sha256": "91c705e658b8376166e43c3b6fd19813b399008cef5d2371fdcb1f5a92f73bd4",
+      "bytes": 17466
+    },
+    {
+      "path": "skill/scripts/agy_hook.py",
+      "sha256": "3c41de7d15426864a895fe3dcbf1199ebc1bf33963cabe61b850fe52a432707d",
+      "bytes": 20820
+    },
+    {
+      "path": "skill/scripts/cc_adapter.py",
+      "sha256": "1ea8c11ed41dfa2d9e87f6b97f52f2b2ae3f7e5ee10eca7012bf5c558553e332",
+      "bytes": 40284
+    },
+    {
+      "path": "skill/scripts/client.py",
+      "sha256": "37f3440d83f87254a818b77a9db42868bdd08af05dc595ff33939b746cabfd02",
+      "bytes": 9652
+    },
+    {
+      "path": "skill/scripts/dsh-plugin.mjs",
+      "sha256": "816dfc6add77ccbe2cc807584ccd33e926a5583e1ca74be2d743f2c94518fe87",
+      "bytes": 28402
+    },
+    {
+      "path": "skill/scripts/host_runtime.py",
+      "sha256": "eac8d68aea40c8b5fc48833cdd1bd20d25527e672ce08a1d6208cfd0db0d464d",
+      "bytes": 24290
+    },
+    {
+      "path": "skill/scripts/mailbox.py",
+      "sha256": "32137e610688448f1e4deec444ddc61de18ad8cc5bb54aa85051be540101c000",
+      "bytes": 3872
+    },
+    {
+      "path": "skill/scripts/mcp_server.py",
+      "sha256": "43e3ee71ff113298018e0c72921eb737bcb31c7f1c8b7eaa4acfdb26cebf9242",
+      "bytes": 9888
+    },
+    {
+      "path": "skill/tests/test_client_unit.py",
+      "sha256": "529d42695295b334fcf62fdea6e26ced327764e827a3b8c6373618f6a888c1ec",
+      "bytes": 8557
+    },
+    {
+      "path": "skill/tests/test_mailbox_e2e.py",
+      "sha256": "cb7f0d98bbf8995d2aaba151fa65ce3456eb45b0224596ec97646d13211522c2",
+      "bytes": 23538
+    },
+    {
+      "path": "tests/__init__.py",
+      "sha256": "735469839c842bc3fbc34792d87ecca2fb190d80bc5c631024bb850a07b5bbfb",
+      "bytes": 16
+    },
+    {
+      "path": "tests/support.py",
+      "sha256": "9e4f27b8a55844b11c003013763bc26180bf076afea5c323c4b2d078359b6203",
+      "bytes": 10912
+    },
+    {
+      "path": "tests/test_agy_hook.py",
+      "sha256": "009098a60abd8973ea401ed4bc23f73a3bfd4933e70c0a607b32a837b2a3eb7b",
+      "bytes": 26240
+    },
+    {
+      "path": "tests/test_agy_hook_live.py",
+      "sha256": "149c94373132aad853f27832a3db140d4ea8cf6fb75bb2ca02d8e7964899ad25",
+      "bytes": 19804
+    },
+    {
+      "path": "tests/test_cc_adapter.py",
+      "sha256": "ed345a0c1b2c914f5f3a1ca6f5907d519c4e292303b66e99112bab26bdfbabfc",
+      "bytes": 38363
+    },
+    {
+      "path": "tests/test_dorothy_mailbox.py",
+      "sha256": "93a4fe1a413d2d146e919e75f9a9e0915deb866d5783c243e59843da65f671e9",
+      "bytes": 31349
+    },
+    {
+      "path": "tests/test_host_runtime.py",
+      "sha256": "7d4de3105a344db8f6c0b0622615f16705d291c994b856e82923d8a49bb29ab1",
+      "bytes": 24075
+    },
+    {
+      "path": "tests/test_integration.py",
+      "sha256": "47f3c3e356a3a77b0ff626f587ebf22b83a22609845097b699531ab45b0c3503",
+      "bytes": 14980
+    },
+    {
+      "path": "tests/test_real_agy_live.py",
+      "sha256": "dbeaee50a7ce6423e1e8ef6cc39833902a68c06cbb166d399b7f093da1b0b743",
+      "bytes": 25380
+    }
+  ],
+  "binary_sha256": "3793943c467510beecaa59eb3568f4227282e07c49a846130e5364fc8889c1c1",
+  "public_scope": "source, tests, protocol, deployment templates; runtime records and private configuration excluded"
+}
